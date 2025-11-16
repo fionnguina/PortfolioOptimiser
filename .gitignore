@@ -1,0 +1,10 @@
+# Ignore build artefacts and large binaries
+*.exe
+*.pkg
+*.zip
+*.pyc
+build/
+dist/
+__pycache__/
+Exports/
+Portfolio_Report.pptx
