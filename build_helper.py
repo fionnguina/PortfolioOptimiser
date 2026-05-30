@@ -24,12 +24,15 @@ EXTRA_RUNTIME_DEPS = [
     "win32com", "win32com.client", "pythoncom", "pywintypes",
     # tkinter UI
     "tkinter", "tkinter.ttk", "tkinter.messagebox", "tkinter.constants",
+    # modern UI theming
+    "customtkinter", "darkdetect",
 ]
 
 # Data-heavy libs that need resources collected (DLLs, data files)
 COLLECT_ALL_LIBS = [
     "numpy", "pandas", "scipy", "statsmodels",
     "openpyxl", "xlwings", "yfinance",
+    "customtkinter",  # ships theme JSON + assets that must be bundled
 ]
 
 # Optional: modules to exclude to silence irrelevant warnings/size bloat
