@@ -8,3 +8,6 @@ dist/
 __pycache__/
 Exports/
 Portfolio_Report.pptx
+
+# Office lock files (~$Document.docx, ~$Workbook.xlsx, etc.)
+~$*
