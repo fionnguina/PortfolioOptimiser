@@ -4853,6 +4853,16 @@ if USE_XLWINGS:
                 portfolio_value_series = portfolio_value_series.copy()
                 
                 print(f"[pptx prep] PortfolioValue series computed for {len(valid_tickers)} securities.")
+                # Diagnostic: confirm the date range that downstream slides will anchor to.
+                # If this end date is much earlier than today, something upstream is
+                # truncating `prices` (yfinance cache, dropna, reindex, etc.).
+                try:
+                    _pv_idx = portfolio_value_series.dropna().index
+                    print(f"[pptx prep] portfolio_value_series spans "
+                          f"{_pv_idx.min().date()} -> {_pv_idx.max().date()} "
+                          f"({len(_pv_idx)} rows); prices.index.max()={prices.index.max().date()}")
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[pptx prep] Could not compute PortfolioValue: {e}")
          
@@ -5125,6 +5135,163 @@ if bool(globals().get("OPEN_AFTER_SAVE", True)) and OPEN_EXCEL_AFTER_SAVE:
 # --- BLOCK 9: PowerPoint Report Generator ---
 # =====================================================================
 # --- BLOCK 9: PowerPoint Report Generator ---
+
+# -----------------------------------------------------------------
+# PPTX helpers (module level so they're not redefined per export call)
+# -----------------------------------------------------------------
+def _nearest_on_or_before(idx, dt):
+    """Return the largest value in `idx` that is <= dt (best-effort)."""
+    if len(idx) == 0:
+        return None
+    dt = pd.to_datetime(dt)
+    pos = idx.searchsorted(dt, side="right") - 1
+    if pos < 0:
+        return idx[0]
+    return idx[min(pos, len(idx) - 1)]
+
+
+def _period_total_return(px, end_dt, months=None, years=None):
+    """Price-based total return over the lookback window ending at end_dt."""
+    s = pd.to_numeric(pd.Series(px), errors="coerce").dropna()
+    if s.empty:
+        return np.nan
+    end_dt = _nearest_on_or_before(s.index, end_dt)
+    if end_dt is None:
+        return np.nan
+    start_target = pd.to_datetime(end_dt)
+    if years:
+        start_target = start_target - relativedelta(years=int(years))
+    if months:
+        start_target = start_target - relativedelta(months=int(months))
+    start_dt = _nearest_on_or_before(s.index, start_target)
+    if start_dt is None:
+        return np.nan
+    v0 = float(s.loc[start_dt])
+    v1 = float(s.loc[end_dt])
+    if not np.isfinite(v0) or not np.isfinite(v1) or v0 == 0:
+        return np.nan
+    return (v1 / v0) - 1.0
+
+
+def _window_compound_total(r, end_dt, months=None, years=None):
+    """Returns-based compounded total return over the lookback window ending at end_dt."""
+    r = pd.to_numeric(pd.Series(r), errors="coerce").dropna()
+    if r.empty:
+        return np.nan
+    start_target = end_dt
+    if years:
+        start_target = start_target - relativedelta(years=years)
+    if months:
+        start_target = start_target - relativedelta(months=months)
+    start_dt = _nearest_on_or_before(r.index, start_target)
+    end_dt2 = _nearest_on_or_before(r.index, end_dt)
+    if start_dt is None or end_dt2 is None or start_dt >= end_dt2:
+        return np.nan
+    rr = r.loc[start_dt:end_dt2]
+    if rr.empty:
+        return np.nan
+    return float((1.0 + rr).prod() - 1.0)
+
+
+def _ppt_anchor(slide, layout, name, fb_left_cm, fb_top_cm, fb_w_cm, fb_h_cm):
+    """
+    Look up a named shape on the slide or its layout and return its
+    (left, top, width, height) in EMU. Falls back to the hardcoded
+    cm values when no shape with that name exists.
+
+    To customise positions: in PowerPoint, add a no-fill placeholder shape
+    on the slide layout (e.g. layout 20), open Selection Pane, and rename
+    the shape to match `name` (e.g. "chart_main", "table_perf").
+    """
+    for src in (slide, layout):
+        if src is None:
+            continue
+        try:
+            for shp in src.shapes:
+                if getattr(shp, "name", "") == name:
+                    return (shp.left, shp.top, shp.width, shp.height)
+        except Exception:
+            continue
+    return (Cm(fb_left_cm), Cm(fb_top_cm), Cm(fb_w_cm), Cm(fb_h_cm))
+
+
+def _autofit_table_width(table, df, total_width_cm=12.02):
+    """Auto-fit PPT table column widths from a DataFrame's content."""
+    def est_width(text):
+        return len(str(text)) * 0.22  # empirical avg for 9pt Calibri
+    est_widths = []
+    for col in df.columns:
+        header_w = est_width(col)
+        data_w = max(est_width(v) for v in df[col].astype(str)) if len(df) else header_w
+        width = max(header_w, data_w)
+        if col.lower() in ("target", "change"):
+            width = max(width, 1.85)
+        elif col.lower() == "security":
+            width = max(width, 1.778)
+        est_widths.append(width)
+    total_est = sum(est_widths)
+    scale = total_width_cm / total_est if total_est else 1.0
+    for j, est in enumerate(est_widths):
+        table.columns[j].width = Cm(est * scale)
+
+
+def _format_perf_value(v, fmt="pct2"):
+    """Format a numeric value for a perf-style table cell."""
+    if pd.isna(v):
+        return ""
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(fv):
+        return ""
+    if fmt == "pct2":
+        return f"{fv*100:.2f}%"
+    if fmt == "dec3":
+        return f"{fv:.3f}"
+    return str(fv)
+
+
+def _add_perf_table(slide, df_metrics, left, top, width, height,
+                    title=None, value_fmt="pct2", font_pt=11):
+    """Add a formatted PPT table from a DataFrame. Values formatted per `value_fmt`."""
+    rows = df_metrics.shape[0] + 1
+    cols = df_metrics.shape[1] + 1  # include row label column
+    shp = slide.shapes.add_table(rows, cols, left, top, width, height)
+    tbl = shp.table
+    tbl.cell(0, 0).text = str(title) if title else ""
+    for j, c in enumerate(df_metrics.columns, start=1):
+        tbl.cell(0, j).text = str(c)
+    for i, (idx, row) in enumerate(df_metrics.iterrows(), start=1):
+        tbl.cell(i, 0).text = str(idx)
+        for j, c in enumerate(df_metrics.columns, start=1):
+            tbl.cell(i, j).text = _format_perf_value(row[c], fmt=value_fmt)
+    for r in range(rows):
+        for c in range(cols):
+            for p in tbl.cell(r, c).text_frame.paragraphs:
+                p.font.size = Pt(font_pt)
+                p.font.bold = True
+                p.alignment = PP_ALIGN.CENTER
+    return tbl
+
+
+def _add_change_run(paragraph, val, font_pt=14):
+    """Add a coloured (+/-) change run after a number in a summary line."""
+    run = paragraph.add_run()
+    if val == 0:
+        run.text = ""
+        return
+    sign = "+" if val > 0 else ""
+    run.text = f" ({sign}{val:,.2f})"
+    run.font.size = Pt(font_pt)
+    if val > 0:
+        run.font.color.rgb = RGBColor(0, 128, 0)
+    elif val < 0:
+        run.font.color.rgb = RGBColor(192, 0, 0)
+    else:
+        run.font.color.rgb = RGBColor(80, 80, 80)
+
+
 def add_header_footer(slide, title_text: str, footer_text: str = ""):
     """Adds a consistent header and footer banner with text."""
     # Header banner
@@ -5168,70 +5335,6 @@ def export_to_ppt(results, trades, charts=None):
     """
     Generates a professional PowerPoint summary based on your custom template.
     """
-    def _nearest_on_or_before(idx, dt):
-        """Return index value <= dt (best-effort)."""
-        if len(idx) == 0:
-            return None
-        dt = pd.to_datetime(dt)
-        pos = idx.searchsorted(dt, side="right") - 1
-        if pos < 0:
-            return idx[0]
-        return idx[min(pos, len(idx)-1)]
-    
-    def _period_total_return(px: pd.Series, end_dt, months=None, years=None):
-        """Total return over the lookback window ending at end_dt."""
-        s = pd.to_numeric(px, errors="coerce").dropna()
-        if s.empty:
-            return np.nan
-        end_dt = _nearest_on_or_before(s.index, end_dt)
-        if end_dt is None:
-            return np.nan
-    
-        start_target = pd.to_datetime(end_dt)
-        if years:
-            start_target = start_target - relativedelta(years=int(years))
-        if months:
-            start_target = start_target - relativedelta(months=int(months))
-    
-        start_dt = _nearest_on_or_before(s.index, start_target)
-        if start_dt is None:
-            return np.nan
-    
-        v0 = float(s.loc[start_dt])
-        v1 = float(s.loc[end_dt])
-        if not np.isfinite(v0) or not np.isfinite(v1) or v0 == 0:
-            return np.nan
-        return (v1 / v0) - 1.0
-    
-    def _add_perf_table(slide, df_metrics: pd.DataFrame, left, top, width, height, title=None):
-        """Add a formatted PPT table from a DataFrame of returns (decimals)."""
-        rows = df_metrics.shape[0] + 1
-        cols = df_metrics.shape[1] + 1  # include row label column
-        shp = slide.shapes.add_table(rows, cols, left, top, width, height)
-        tbl = shp.table
-    
-        # header row
-        tbl.cell(0, 0).text = str(title) if title else ""
-        for j, c in enumerate(df_metrics.columns, start=1):
-            tbl.cell(0, j).text = str(c)
-    
-        # body
-        for i, (idx, row) in enumerate(df_metrics.iterrows(), start=1):
-            tbl.cell(i, 0).text = str(idx)
-            for j, c in enumerate(df_metrics.columns, start=1):
-                v = row[c]
-                txt = "" if pd.isna(v) else f"{float(v)*100:.2f}%"
-                tbl.cell(i, j).text = txt
-    
-        # light formatting
-        for r in range(rows):
-            for c in range(cols):
-                cell = tbl.cell(r, c)
-                for p in cell.text_frame.paragraphs:
-                    p.font.size = Pt(11)
-                    p.font.bold = True
-                    p.alignment = PP_ALIGN.CENTER
-
     APP_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
 
     # Template file (design only, never edited)
@@ -5353,34 +5456,6 @@ def export_to_ppt(results, trades, charts=None):
         table_sets = [df.iloc[:half]] if not split else [df.iloc[:half], df.iloc[half:]]
         left_positions = [Cm(1.1), Cm(11.5)] if split else [Cm(1.1)]
     
-        def autofit_table_width(table, df, total_width_Cm=12.02):
-            """
-            True auto-fit for PowerPoint tables with a small minimum width for narrow headers
-            (prevents wrapping for 'Target' and 'Change').
-            """        
-            def est_width(text):
-                return len(str(text)) * 0.22  # empirical average for 9pt Calibri text
-        
-            est_widths = []
-            for col in df.columns:
-                header_w = est_width(col)
-                data_w = max(est_width(v) for v in df[col].astype(str))
-                width = max(header_w, data_w)
-        
-                # Minimum width safeguard for narrow headers
-                if col.lower() in ("target", "change"):
-                    width = max(width, 1.85)  # 0.55 in -> 1.397 cm
-                elif col.lower() == "security":
-                    width = max(width, 1.778)  # 0.70 in -> 1.778 cm
-
-                est_widths.append(width)
-        
-            total_est = sum(est_widths)
-            scale = total_width_Cm / total_est
-        
-            for j, est in enumerate(est_widths):
-                table.columns[j].width = Cm(est * scale)
-
         # --- Draw tables ---
         for idx, subdf in enumerate(table_sets):
             top = Cm(4.0)
@@ -5402,7 +5477,7 @@ def export_to_ppt(results, trades, charts=None):
             ).table
         
             # Auto-fit widths
-            autofit_table_width(table, subdf, total_width_Cm=table_w)
+            _autofit_table_width(table, subdf, total_width_cm=table_w)
         
             # Disable wrapping
             for cell in table.iter_cells():
@@ -5454,46 +5529,30 @@ def export_to_ppt(results, trades, charts=None):
         portfolio_change = results.get("portfolio_change", 0)
         net_invested_change = results.get("net_invested_change", 0)
         
-        # --- Helper to format change text ---
-        def add_change_run(paragraph, val):
-            run = paragraph.add_run()
-            if val == 0:
-                run.text = ""
-                return
-            sign = "+" if val > 0 else ""
-            run.text = f" ({sign}{val:,.2f})"
-            run.font.size = Pt(14)
-            if val > 0:
-                run.font.color.rgb = RGBColor(0, 128, 0)  # green
-            elif val < 0:
-                run.font.color.rgb = RGBColor(192, 0, 0)  # red
-            else:
-                run.font.color.rgb = RGBColor(80, 80, 80)
-        
         # --- Main summary line ---
         p = tf.add_paragraph()
         p.font.size = Pt(14)
         p.font.bold = True
         p.alignment = PP_ALIGN.CENTER
-        
+
         # Text with separate runs for coloured numbers
         run1 = p.add_run()
         run1.text = f"Total Portfolio: ${total_portfolio:,.2f}"
         run1.font.size = Pt(14)
         run1.font.bold = True
-        add_change_run(p, portfolio_change)
-        
+        _add_change_run(p, portfolio_change)
+
         run2 = p.add_run()
         run2.text = f"     Total Brokerage: ${total_brokerage:,.2f}     "
         run2.font.size = Pt(14)
         run2.font.bold = True
         run2.font.color.rgb = RGBColor(0, 0, 0)
-        
+
         run3 = p.add_run()
         run3.text = f"Net Invested: ${net_invested:,.2f}"
         run3.font.size = Pt(14)
         run3.font.bold = True
-        add_change_run(p, net_invested_change)
+        _add_change_run(p, net_invested_change)
 
         # --- Slide 3: Portfolio vs Indices ---
         # --- Cash summary (derived from Trade Plan cash flows) ---
@@ -5635,7 +5694,11 @@ def export_to_ppt(results, trades, charts=None):
         plt.close(fig)
         
         # --- Insert chart in PowerPoint ---
-        slide.shapes.add_picture(chart_path, Cm(2.032), Cm(2.95), width=Cm(20.828), height=Cm(11.176))
+        chart_left, chart_top, chart_w, chart_h = _ppt_anchor(
+            slide, slide_layout, "chart_perf",
+            fb_left_cm=2.032, fb_top_cm=2.95, fb_w_cm=20.828, fb_h_cm=11.176,
+        )
+        slide.shapes.add_picture(chart_path, chart_left, chart_top, width=chart_w, height=chart_h)
 
         # --- Performance table (3m / 6m / 12m / 3y) under the chart ---
         try:
@@ -5726,14 +5789,14 @@ def export_to_ppt(results, trades, charts=None):
             perf_tbl = pd.DataFrame.from_dict(rows, orient="index", columns=metrics)
             name_map = {"^AORD": "ASX", "^GSPC": "S&P 500", "^IXIC": "NASDAQ"}
             perf_tbl = perf_tbl.rename(index=name_map)
+            tbl_left, tbl_top, tbl_w, tbl_h = _ppt_anchor(
+                slide, slide_layout, "table_perf",
+                fb_left_cm=2.032, fb_top_cm=13.85, fb_w_cm=20.828, fb_h_cm=2.40,
+            )
             _add_perf_table(
-                slide,
-                perf_tbl,
-                left=Cm(2.032),
-                top=Cm(13.85),
-                width=Cm(20.828),
-                height=Cm(2.40),
-                title="Return Summary"
+                slide, perf_tbl,
+                left=tbl_left, top=tbl_top, width=tbl_w, height=tbl_h,
+                title="Return Summary",
             )
         except Exception as e:
             print(f"[pptx] Slide 3 table skipped: {e}")
@@ -5809,50 +5872,46 @@ def export_to_ppt(results, trades, charts=None):
             fig.savefig(ff_chart_path, bbox_inches="tight")
             plt.close(fig)
             
-            slide4.shapes.add_picture(ff_chart_path, Cm(2.032), Cm(2.64), width=Cm(20.32), height=Cm(9.05))
+            chart_left, chart_top, chart_w, chart_h = _ppt_anchor(
+                slide4, slide_layout, "chart_ff",
+                fb_left_cm=2.032, fb_top_cm=3.05, fb_w_cm=20.32, fb_h_cm=8.65,
+            )
+            slide4.shapes.add_picture(ff_chart_path, chart_left, chart_top, width=chart_w, height=chart_h)
             
-            # Table: 3M/6M/12M/3Y (compounded) using available daily points
-            def _window_compound_total(r: pd.Series, end_dt: pd.Timestamp, months: int = None, years: int = None):
-                r = pd.to_numeric(r, errors="coerce").dropna()
-                if r.empty:
-                    return np.nan
-                start_target = end_dt
-                if years:
-                    start_target = start_target - relativedelta(years=years)
-                if months:
-                    start_target = start_target - relativedelta(months=months)
-            
-                # align start/end to available index values
-                start_dt = _nearest_on_or_before(r.index, start_target)
-                end_dt2 = _nearest_on_or_before(r.index, end_dt)
-                if start_dt is None or end_dt2 is None or start_dt >= end_dt2:
-                    return np.nan
-            
-                rr = r.loc[start_dt:end_dt2]
-                if rr.empty:
-                    return np.nan
-                return float((1.0 + rr).prod() - 1.0)
-            
+            # Table: 3M/6M/12M/3Y (compounded) using available daily points.
+            # FF factor rows are anchored to the FF data's last date (~1mo lag).
+            # The Portfolio row is anchored to the *live* portfolio end date
+            # (same anchor Slide 3 uses) so "3M" means the same window on both
+            # slides — see Task #8 in the pending-work memory.
+            end_dt_tbl = tbl_df.index.max()  # FF-data-capped end date for factor rows
+            portfolio_end_dt = port_px.dropna().index.max() if not port_px.dropna().empty else end_dt_tbl
             rows = {}
-            end_dt_tbl = tbl_df.index.max()
             for name in tbl_df.columns:
-                rr = tbl_df[name]
-                rows[name] = [
-                    _window_compound_total(rr, end_dt_tbl, months=3),
-                    _window_compound_total(rr, end_dt_tbl, months=6),
-                    _window_compound_total(rr, end_dt_tbl, months=12),
-                    _window_compound_total(rr, end_dt_tbl, years=3),
-                ]
-            
+                if name == "Portfolio":
+                    rows[name] = [
+                        _period_total_return(port_px, portfolio_end_dt, months=3),
+                        _period_total_return(port_px, portfolio_end_dt, months=6),
+                        _period_total_return(port_px, portfolio_end_dt, months=12),
+                        _period_total_return(port_px, portfolio_end_dt, years=3),
+                    ]
+                else:
+                    rr = tbl_df[name]
+                    rows[name] = [
+                        _window_compound_total(rr, end_dt_tbl, months=3),
+                        _window_compound_total(rr, end_dt_tbl, months=6),
+                        _window_compound_total(rr, end_dt_tbl, months=12),
+                        _window_compound_total(rr, end_dt_tbl, years=3),
+                    ]
+
             ff_tbl = pd.DataFrame.from_dict(rows, orient="index", columns=["3M", "6M", "12M", "3Y"])
+            tbl_left, tbl_top, tbl_w, tbl_h = _ppt_anchor(
+                slide4, slide_layout, "table_ff",
+                fb_left_cm=2.032, fb_top_cm=11.90, fb_w_cm=20.32, fb_h_cm=2.794,
+            )
             _add_perf_table(
-                slide4,
-                ff_tbl,
-                left=Cm(2.032),
-                top=Cm(11.90),
-                width=Cm(20.32),
-                height=Cm(2.794),
-                title="Return Summary"
+                slide4, ff_tbl,
+                left=tbl_left, top=tbl_top, width=tbl_w, height=tbl_h,
+                title="Return Summary",
             )
         except Exception as e:
             print(f"[pptx] Slide 4 skipped: {e}")
@@ -5895,53 +5954,30 @@ def export_to_ppt(results, trades, charts=None):
                     pass
             
             # Chart is OPTIONAL: only add if we actually have a valid file path
-            eff_path = None
-            if isinstance(charts, dict):
-                eff_path = charts.get("efficient_frontier_path", None)
-            
             if eff_path and os.path.exists(eff_path):
                 # chart on left
+                chart_left, chart_top, chart_w, chart_h = _ppt_anchor(
+                    slide5, slide_layout, "chart_frontier",
+                    fb_left_cm=1.52, fb_top_cm=3.56, fb_w_cm=14.50, fb_h_cm=11.50,
+                )
                 slide5.shapes.add_picture(
-                    eff_path,
-                    Cm(1.52),   # ~0.6"
-                    Cm(3.56),   # ~1.4"
-                    width=Cm(14.50),   # ~6.2"
-                    height=Cm(11.50)   # ~4.9"
+                    eff_path, chart_left, chart_top, width=chart_w, height=chart_h,
                 )
             
             # Points table (always add if we have data)
             if rows:
-                df_pts = pd.DataFrame(rows).set_index("Point")
-                df_fmt = pd.DataFrame({
-                    "Vol (ann.)": df_pts["Vol (ann.)"],
-                    "Return (ann.)": df_pts["Return (ann.)"],
-                })
-            
-                # Table position on right
-                shp = slide5.shapes.add_table(
-                    df_fmt.shape[0] + 1,
-                    3,
-                    Cm(16.50),  # Left
-                    Cm(4.06),   # Top
-                    Cm(7.72),   # Width
-                    Cm(4.32)    # Height
+                df_pts = pd.DataFrame(rows).set_index("Point").rename(
+                    columns={"Vol (ann.)": "Volatility", "Return (ann.)": "Return"}
                 )
-                tbl = shp.table
-                tbl.cell(0, 0).text = "Portfolio"
-                tbl.cell(0, 1).text = "Volatility"
-                tbl.cell(0, 2).text = "Return"
-            
-                for i, (idx, r) in enumerate(df_fmt.iterrows(), start=1):
-                    tbl.cell(i, 0).text = str(idx)
-                    tbl.cell(i, 1).text = f"{float(r['Vol (ann.)'])*100:.2f}%" if pd.notna(r["Vol (ann.)"]) else ""
-                    tbl.cell(i, 2).text = f"{float(r['Return (ann.)'])*100:.2f}%" if pd.notna(r["Return (ann.)"]) else ""
-            
-                for rr in range(df_fmt.shape[0] + 1):
-                    for cc in range(3):
-                        for p in tbl.cell(rr, cc).text_frame.paragraphs:
-                            p.font.size = Pt(11)
-                            p.font.bold = True
-                            p.alignment = PP_ALIGN.CENTER
+                tbl_left, tbl_top, tbl_w, tbl_h = _ppt_anchor(
+                    slide5, slide_layout, "table_frontier_points",
+                    fb_left_cm=16.50, fb_top_cm=4.06, fb_w_cm=7.72, fb_h_cm=4.32,
+                )
+                _add_perf_table(
+                    slide5, df_pts,
+                    left=tbl_left, top=tbl_top, width=tbl_w, height=tbl_h,
+                    title="Portfolio",
+                )
 
             # ---- Slide 5: Tilts table (With Tilts vs Without Tilts) ----
             try:
@@ -5970,18 +6006,15 @@ def export_to_ppt(results, trades, charts=None):
                     elif not required_cols.issubset(df_tilts.columns):
                         print(f"[pptx] Slide 5 tilts table skipped: missing required columns. Have {list(df_tilts.columns)}")
                     else:
-                        left2 = Cm(16.50)
-                        top2 = Cm(9.60)
-                        width2 = Cm(7.72)
-                        height2 = Cm(5.20)
+                        left2, top2, width2, height2 = _ppt_anchor(
+                            slide5, slide_layout, "table_tilts",
+                            fb_left_cm=16.50, fb_top_cm=9.60, fb_w_cm=7.72, fb_h_cm=5.20,
+                        )
 
                         shp2 = slide5.shapes.add_table(
                             df_tilts.shape[0] + 1,
                             df_tilts.shape[1],
-                            left2,
-                            top2,
-                            width2,
-                            height2
+                            left2, top2, width2, height2,
                         )
                         tbl2 = shp2.table
 
@@ -6001,13 +6034,13 @@ def export_to_ppt(results, trades, charts=None):
                                     txt = f"{float(val):.3f}" if np.isfinite(float(val)) else ""
                                 tbl2.cell(i, j).text = txt
 
-                        # Format
+                        # Format (uniform 11pt to match the frontier-points table above)
                         for rr in range(df_tilts.shape[0] + 1):
                             for cc in range(df_tilts.shape[1]):
                                 cell = tbl2.cell(rr, cc)
                                 cell.text_frame.word_wrap = False
                                 for p in cell.text_frame.paragraphs:
-                                    p.font.size = Pt(9 if rr == 0 else 8)
+                                    p.font.size = Pt(11)
                                     p.font.bold = True
                                     p.alignment = PP_ALIGN.CENTER
 
