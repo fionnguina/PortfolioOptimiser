@@ -5396,8 +5396,11 @@ def export_to_ppt(results, trades, charts=None):
     # Use the module-level APP_DIR rather than redefining from __file__:
     # under a PyInstaller frozen build, __file__ resolves to the _MEI* temp dir
     # where Portfolio_Optimiser.py is extracted, NOT where the template lives.
-    # Template file (design only, never edited)
-    template_path = os.path.join(str(APP_DIR), "PowerPoint_Template.pptx")
+    # Template lives in .assets/ (hidden subdir) — falls back to repo root for
+    # legacy installs where the move hasn't happened yet.
+    _new_template = os.path.join(str(APP_DIR), ".assets", "PowerPoint_Template.pptx")
+    _legacy_template = os.path.join(str(APP_DIR), "PowerPoint_Template.pptx")
+    template_path = _new_template if os.path.exists(_new_template) else _legacy_template
 
     # Output path â€” always overwrite this file
     ppt_path = str(EXPORT_DIR / "Portfolio_Report.pptx")

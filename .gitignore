@@ -8,6 +8,13 @@ dist/
 __pycache__/
 Exports/
 Portfolio_Report.pptx
+Portfolio_Report_*.pptx
+
+# Jupyter / PyInstaller / transient build state
+.ipynb_checkpoints/
+*.spec
+build_log.txt
+last_run_state.json
 
 # Office lock files (~$Document.docx, ~$Workbook.xlsx, etc.)
 ~$*

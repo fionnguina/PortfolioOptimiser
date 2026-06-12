@@ -1,7 +1,0 @@
-Factor,Target,Band,Use?
-Mkt-RF,1.018,0.2,True
-SMB,-0.153,0.2,True
-HML,0.037,0.2,True
-RMW,-0.071,0.2,True
-CMA,0.12,0.2,True
-MOM,-0.01,0.2,True
