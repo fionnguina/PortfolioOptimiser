@@ -608,10 +608,7 @@ print("[override] TILT_RECOMMENDATION_LOOKBACK_DAYS=63, TRADE_PLAN_MODE=", TRADE
 
 
 # =====================================================================
-# BLOCK 3 Downloading Prices
-# =====================================================================
-# =====================================================================
-# BLOCK 7: DATA DOWNLOAD â€” Prices, Factors, FX, Benchmarks
+# BLOCK 3: Data Download — Prices, Factors, FX, Benchmarks
 # =====================================================================
 
 # Constants for data processing
@@ -714,6 +711,10 @@ def _download_fx_series(ticker: str, period: str = FX_CACHE_PERIOD) -> pd.Series
             threads=False
         )
         fx = dl["Close"] if isinstance(dl, pd.DataFrame) else dl
+        # Newer yfinance returns Close as a 1-column DataFrame (MultiIndex columns) — squeeze to Series
+        # so pd.to_numeric doesn't reject it with "arg must be a list, tuple, 1-d array, or Series".
+        if isinstance(fx, pd.DataFrame):
+            fx = fx.squeeze("columns")
         return pd.to_numeric(fx, errors="coerce")
     except Exception as e:
         print(f"Warning: Failed to download {ticker}: {e}")
@@ -2241,6 +2242,15 @@ mu_frontier = mu_vec_opt.copy()
 mu_plus = mu_vec_opt.copy()
 cov_plus = Sigma_opt.copy()
 
+# Diagnostic: surface the highest and lowest annualized mu values so we can spot data corruption
+# (e.g. a 400%+ mu pointing at a stale split adjustment or short-history outlier).
+try:
+    _mu_sorted = pd.to_numeric(mu_vec_opt, errors="coerce").dropna().sort_values(ascending=False)
+    print(f"[diag] mu top 5 (annualized): {_mu_sorted.head(5).to_dict()}")
+    print(f"[diag] mu bottom 5 (annualized): {_mu_sorted.tail(5).to_dict()}")
+except Exception as _e_mu_diag:
+    print(f"[diag] mu summary skipped: {_e_mu_diag}")
+
 # Recommended tilts (if factor inputs are available)
 tilt_reco_achievable = pd.Series(dtype=float)
 w_tilt = None
@@ -2461,8 +2471,7 @@ def _build_frontier(
     Sigma_opt: pd.DataFrame,
     target_returns: list[float] | None = None,
     *,
-    n_points: int = 18,
-    max_excess_return: float = 0.40,
+    n_points: int = 24,
 ) -> tuple[pd.DataFrame, pd.DataFrame, float, float]:
     """
     Build long-only efficient frontier on realistic target returns.
@@ -2502,19 +2511,21 @@ def _build_frontier(
     R_mvp_ann = float(w_mvp @ mu_arr)
     mu_max = float(np.nanmax(mu_arr))
 
-    low_floor = float(rf_annual)
-    max_high_allowed = min(mu_max, low_floor + max_excess_return)
-
-    span_down = max(R_mvp_ann - low_floor, 0.0)
-    span_up = max(max_high_allowed - R_mvp_ann, 0.0)
-    span = min(span_down, span_up)
-
-    if span <= 0:
-        low = low_floor
-        high = max_high_allowed
+    # Size the frontier range by the dispersion of asset returns, not a hard cap.
+    # MAD-based robust SD is immune to a single outlier asset (e.g. a noisy 450% mu blowing up
+    # raw stdev); 1.4826 is the scaling factor that makes MAD comparable to SD under normality.
+    # Extending 2 robust SDs above MVP captures ~95% of typical asset-return spread.
+    # Capped at mu_max because a long-only sum=1 portfolio cannot exceed any single asset's return.
+    mu_finite = mu_arr[np.isfinite(mu_arr)]
+    if mu_finite.size:
+        mu_median = float(np.median(mu_finite))
+        mad = float(np.median(np.abs(mu_finite - mu_median)))
+        robust_sd = 1.4826 * mad if mad > 0 else float(np.std(mu_finite, ddof=0))
     else:
-        low = R_mvp_ann - span
-        high = R_mvp_ann + span
+        robust_sd = 0.05  # last-resort fallback
+
+    low = R_mvp_ann
+    high = min(mu_max, R_mvp_ann + 2.0 * robust_sd)
 
     if high <= low + 0.01:
         high = low + 0.06
@@ -2610,8 +2621,7 @@ W, stats_df, tan_ret, tan_vol = _build_frontier(
     mu_frontier,
     Sigma_frontier,
     target_returns=None,
-    n_points=20,
-    max_excess_return=0.95,
+    n_points=24,
 )
 
 
@@ -3175,7 +3185,7 @@ def _update_lots_after_trades(
 
 
 # ------------------------------
-# BLOCK 5 CODE GRAVEYARD
+# Parcel-matching helper (used by trade-plan + CGT audit)
 # ------------------------------
 def expand_with_lots(trade_df, lots_df, sale_date, method="FIFO"):
     """
@@ -3284,11 +3294,8 @@ lots_df = _read_lots_from_path(filename, "Lots")
 
 
 # =====================================================================
-# Block 7 Writing into the excel (i.e. formatting and building the actual sheet)
+# BLOCK 7: Writing into Excel (workbook builder)
 # =====================================================================
-# ------------------------------------------------------------
-# 10) WRITE TO EXCEL 
-# ------------------------------------------------------------
 def ensure_workbook(path):
     if os.path.exists(path):
         return
@@ -3304,9 +3311,55 @@ def ensure_workbook(path):
         wb.sheets["Lots"].range("A1").value = [["Security","AcqDate","Units","CostBaseAUD"]]
         wb.save(path); wb.close()
 
+def warn_if_workbook_locked(path):
+    """Print a clear warning if the workbook has an Office lock file (~$Name.xlsm) sibling.
+    A lock means Excel (or another process) has the file open — writes via xlwings will either
+    fall back to a read-only copy or trigger a 'File in Use' dialog. Non-fatal: we just surface it."""
+    try:
+        d, f = os.path.split(path)
+        lock = os.path.join(d, "~$" + f)
+        if os.path.exists(lock):
+            print(f"[warn] Workbook lock file detected: {lock}")
+            print("[warn] Close any open Excel windows for 'Stock Analysis.xlsm' (including stray "
+                  "EXCEL.EXE processes in Task Manager) before continuing — otherwise the script will "
+                  "either save to an _AUTO copy or you'll see a 'File in Use' dialog.")
+    except Exception:
+        pass
+
 # Call it right before Block 7 seed reads:
 ensure_workbook(filename)
+warn_if_workbook_locked(filename)
 print("[cfg] excel_path:", filename)
+
+# ----- xlwings sheet/format helpers (shared across the Excel builder) -----
+def get_or_clear_sheet(wb, name):
+    """Return sheet `name` (creating after the last sheet if absent), with contents cleared."""
+    try:
+        sht = wb.sheets[name]
+        try:
+            sht.used_range.clear_contents()
+        except Exception:
+            pass
+    except Exception:
+        sht = wb.sheets.add(name, after=wb.sheets[-1])
+    return sht
+
+def set_truefalse_validation(sht, a1_range):
+    """Apply TRUE/FALSE data validation to the given A1-style range; silent on failure."""
+    try:
+        val_rng = sht.range(a1_range).api
+        val_rng.Validation.Delete()
+        val_rng.Validation.Add(3, 1, 1, "TRUE,FALSE")
+    except Exception:
+        pass
+
+def set_number_formats(sht, fmt_by_range):
+    """Apply Excel NumberFormat strings to multiple ranges in one go. fmt_by_range: {a1_range: fmt}."""
+    try:
+        for rng, fmt in fmt_by_range.items():
+            sht.range(rng).api.NumberFormat = fmt
+    except Exception:
+        pass
 
 # Define path for saving portfolio state if not already defined
 state_path = os.path.join(os.path.dirname(filename), "portfolio_state.json")
@@ -3319,28 +3372,18 @@ OPEN_PPT_AFTER_SAVE = bool(globals().get("OPEN_PPT_AFTER_SAVE", CFG.get("open_pp
 # Writers (used by Block 7)
 # -------------------------------
 def _write_tilts_sheet(wb, tilts_df, sheet_name="Tilts"):
-    try:
-        sht = wb.sheets[sheet_name]
-    except Exception:
-        sht = wb.sheets.add(sheet_name, after=wb.sheets[-1])
-    try:
-        sht.used_range.clear_contents()
-    except Exception:
-        pass
+    sht = get_or_clear_sheet(wb, sheet_name)
 
     out = tilts_df.reset_index().rename(columns={"index": "Factor"})
     out = out[["Factor","Target","Band","Use?"]]
     sht.range("A1").value = [["Factor","Target","Band","Use?"]]
     sht.range("A2").options(index=False, header=False).value = out
     last_row = 1 + len(out)
-    try:
-        sht.range(f"B2:B{last_row}").api.NumberFormat = "0.000"
-        sht.range(f"C2:C{last_row}").api.NumberFormat = "0.000"
-        val_rng = sht.range(f"D2:D{last_row}").api
-        val_rng.Validation.Delete()
-        val_rng.Validation.Add(3, 1, 1, "TRUE,FALSE")
-    except Exception:
-        pass
+    set_number_formats(sht, {
+        f"B2:B{last_row}": "0.000",
+        f"C2:C{last_row}": "0.000",
+    })
+    set_truefalse_validation(sht, f"D2:D{last_row}")
     sht.autofit()
 
 
@@ -3371,19 +3414,11 @@ def _write_holdings_sheet(wb, prices, units, include_flags,
         })
     df = pd.DataFrame(rows)
 
-    try:
-        sht = wb.sheets[sheet_name]
-    except Exception:
-        sht = wb.sheets.add(sheet_name, after=wb.sheets[-1])
-    try:
-        sht.used_range.clear_contents()
-    except Exception:
-        pass
+    sht = get_or_clear_sheet(wb, sheet_name)
 
     sht.range('A1').value = [["Security","Units","Last Price","FX to AUD","Market Value","Weight","Include?"]]
     sht.range('A2').options(index=False, header=False).value = df
     n = len(df); last_row = 1 + n
-    last_row = 1 + len(df)
     if n >= 1:
         sht.range('E2').formula = "=B2*C2*D2"
         if n > 1:
@@ -3392,19 +3427,13 @@ def _write_holdings_sheet(wb, prices, units, include_flags,
         sht.range('F2').formula = f"=IF({sumif_den}=0,0,IF($G2,E2/{sumif_den},0))"
         if n > 1:
             sht.range(f"F2:F{last_row}").api.FillDown()
-        try:
-            val_rng = sht.range(f"G2:G{last_row}").api
-            val_rng.Validation.Delete()
-            val_rng.Validation.Add(3, 1, 1, "TRUE,FALSE")
-        except Exception:
-            pass
-        try:
-            sht.range(f"C2:C{last_row}").api.NumberFormat = "0.0000"
-            sht.range(f"D2:D{last_row}").api.NumberFormat = "0.0000"
-            sht.range(f"E2:E{last_row}").api.NumberFormat = "$0.00"
-            sht.range(f"F2:F{last_row}").api.NumberFormat = "0.00%"
-        except Exception:
-            pass
+        set_truefalse_validation(sht, f"G2:G{last_row}")
+        set_number_formats(sht, {
+            f"C2:C{last_row}": "0.0000",
+            f"D2:D{last_row}": "0.0000",
+            f"E2:E{last_row}": "$0.00",
+            f"F2:F{last_row}": "0.00%",
+        })
     sht.autofit()
 
 def update_efficient_frontier_chart(
@@ -3766,24 +3795,15 @@ if USE_XLWINGS:
 
 
             # 1) Cov sheet
-            try:
-                cov = wb.sheets['Cov']; cov.used_range.clear_contents()
-            except Exception:
-                cov = wb.sheets.add('Cov', after=wb.sheets[-1])
+            cov = get_or_clear_sheet(wb, 'Cov')
             cov.range('A1').options(pd.DataFrame, index=True, header=True).value = Sigma_opt
 
             # 2) Input sheet
-            try:
-                inp = wb.sheets['Input']; inp.used_range.clear_contents()
-            except Exception:
-                inp = wb.sheets.add('Input', after=wb.sheets[-1])
+            inp = get_or_clear_sheet(wb, 'Input')
             inp.range('A1').options(pd.DataFrame, index=False, header=True).value = df_melt
 
             # 3) OPT sheet
-            try:
-                opt = wb.sheets['OPT']; opt.used_range.clear_contents()
-            except Exception:
-                opt = wb.sheets.add('OPT', after=wb.sheets[-1])
+            opt = get_or_clear_sheet(wb, 'OPT')
 
             # Header
             opt.range('A1').value = 'Optimal Portfolio Theory (long-only where possible)'
@@ -3799,10 +3819,7 @@ if USE_XLWINGS:
             opt.range('A6').value = exp_ret_label
             opt.range('A7').options(pd.DataFrame, index=True, header=True).value = exp_ret_df
             n_rows = exp_ret_df.shape[0] + 1
-            try:
-                opt.range(f"B8:B{7+n_rows}").api.NumberFormat = "0.00%"
-            except Exception:
-                pass
+            set_number_formats(opt, {f"B8:B{7+n_rows}": "0.00%"})
 
             # Covariance (+ weight row/col)
             start_cov_row = 9 + n_rows
@@ -4356,12 +4373,7 @@ if USE_XLWINGS:
 
                     # === Write parcel-level audit sheet ===
                     try:
-                        try:
-                            sht_cgt = wb.sheets["CGT_Audit"]
-                        except Exception:
-                            sht_cgt = wb.sheets.add("CGT_Audit", after=wb.sheets[-1])
-
-                        sht_cgt.used_range.clear_contents()
+                        sht_cgt = get_or_clear_sheet(wb, "CGT_Audit")
                         sht_cgt.range("A1").value = [[
                             "Security",
                             "Qty",
@@ -4533,9 +4545,28 @@ if USE_XLWINGS:
             # ---------- Layout anchors (avoid overlaps) ----------
             anchor_row = start_s_row + stats_df.shape[0] + 4
             TP_COL, COST_COL, TILT_COL = "A", "J", "M"
+            # Pre-compute summary_row so the alt-plan block (which anchors below it) can reference it.
+            summary_row = anchor_row + trade_rec.shape[0] + 4
 
             # ---------- LEFT: Trade Plan ----------
             opt.range(f"{TP_COL}{anchor_row}").value = "Trade Plan (rounded units)"
+
+            # Write the main trade plan body. Clear formatting on destination first to avoid
+            # bold/currency carryover from prior runs (Excel preserves cell formats when only contents are cleared).
+            if isinstance(trade_rec, pd.DataFrame) and not trade_rec.empty:
+                tp_header = anchor_row + 1
+                tp_data_first = tp_header + 1
+                tp_data_last = tp_header + trade_rec.shape[0]
+                try:
+                    opt.range(f"{TP_COL}{tp_header}:G{tp_data_last+4}").api.ClearFormats()
+                except Exception:
+                    pass
+                opt.range(f"{TP_COL}{tp_header}").options(pd.DataFrame, index=False, header=True).value = trade_rec
+                set_number_formats(opt, {
+                    f"B{tp_data_first}:D{tp_data_last}": "0",
+                    f"E{tp_data_first}:G{tp_data_last}": "$0.00",
+                })
+
             # --- Write an Alternative Trade Plan block (full + aligned + with summaries) ---
             try:
                 # Identify which DF is the alternative one
@@ -4550,12 +4581,25 @@ if USE_XLWINGS:
                     if "Security" not in alt_df.columns:
                         alt_df.insert(0, "Security", alt_df.index.astype(str))
                     
-                    alt_df = alt_df.reindex(columns=trade_rec.columns)            
+                    alt_df = alt_df.reindex(columns=trade_rec.columns)
                     # Place BELOW the main trade plan summary (so nothing gets overwritten)
                     alt_anchor = summary_row + 4
-            
+                    alt_header = alt_anchor + 1
+                    alt_data_first = alt_header + 1
+                    alt_data_last = alt_header + alt_df.shape[0]
+
+                    # Clear formatting on destination to avoid carryover from prior runs (rows that
+                    # previously held the main plan inherit its $/bold formats otherwise).
+                    try:
+                        opt.range(f"{TP_COL}{alt_anchor}:G{alt_data_last+4}").api.ClearFormats()
+                    except Exception:
+                        pass
                     opt.range(f"{TP_COL}{alt_anchor}").value = "Alternative Trade Plan (rounded units)"
-                    opt.range(f"{TP_COL}{alt_anchor+1}").options(pd.DataFrame, index=False, header=True).value = alt_df
+                    opt.range(f"{TP_COL}{alt_header}").options(pd.DataFrame, index=False, header=True).value = alt_df
+                    set_number_formats(opt, {
+                        f"B{alt_data_first}:D{alt_data_last}": "0",
+                        f"E{alt_data_first}:G{alt_data_last}": "$0.00",
+                    })
             
                     # Compute alt costs (so you can show brokerage/CGT/total for the alt plan too)
                     alt_for_costs = alt_df.copy()
@@ -4640,7 +4684,7 @@ if USE_XLWINGS:
                     total_portfolio = net_invested + cash_balance
 
         
-            summary_row = anchor_row + trade_rec.shape[0] + 4
+            # summary_row was pre-computed above the trade-plan writes
             opt.range(f"{TP_COL}{summary_row}").value = [
                 ["Portfolio Value (Holdings)", net_invested],
                 ["Cash",                      cash_balance],
@@ -4727,19 +4771,12 @@ if USE_XLWINGS:
             except Exception: pass
 
             # 4) FF5F sheet (optional transparency)
-            try:
-                ff5s = wb.sheets['FF5F']; ff5s.used_range.clear_contents()
-            except Exception:
-                ff5s = wb.sheets.add('FF5F', after=wb.sheets[-1])
+            ff5s = get_or_clear_sheet(wb, 'FF5F')
             ff5s.range('A1').options(pd.DataFrame, index=True, header=True).value = ff_aud
 
             # ---- Update Lots and overwrite Holdings with target units (for next run) ----
             UPDATED_LOTS = _update_lots_after_trades(lots_df, trade_rec, pd.Timestamp(prices.index[-1]), fx_map_all)
-            try:
-                sht_lots = wb.sheets['Lots']
-            except Exception:
-                sht_lots = wb.sheets.add('Lots', after=wb.sheets[-1])
-            sht_lots.used_range.clear_contents()
+            sht_lots = get_or_clear_sheet(wb, 'Lots')
             sht_lots.range("A1").value = [["Security","AcqDate","Units","CostBaseAUD"]]
             sht_lots.range("A2").options(index=False, header=False).value = UPDATED_LOTS
             
@@ -5028,37 +5065,20 @@ try:
 
         _written = False
 
-        # First try xlwings so it can write when workbook is already open in Excel.
+        # Use a dedicated hidden xlwings App so Excel.exe terminates when the `with` exits.
+        # (Bare xw.Book(path) attaches to the default app, which then stays alive as a blank
+        # window after _book.close() — caused the spurious second Excel window.)
         try:
-            _book = xw.Book(_xl)
-            _ws = _book.sheets["OPT"] if "OPT" in [s.name for s in _book.sheets] else _book.sheets.add("OPT")
+            with xw.App(visible=False, add_book=False) as _app:
+                _book = _app.books.open(_xl, update_links=False, read_only=False)
+                _ws = _book.sheets["OPT"] if "OPT" in [s.name for s in _book.sheets] else _book.sheets.add("OPT")
 
-            _ws.range("W2").value = "Trade Plan Validation"
-            _ws.range("W3").value = _rows
-            _ws.range("X6:X7").api.NumberFormat = "0.000"
+                _ws.range("W2").value = "Trade Plan Validation"
+                _ws.range("W3").value = _rows
+                _ws.range("X6:X7").api.NumberFormat = "0.000"
 
-            # Re-write the alternative trade plan block reliably below the main plan.
-            _alt = globals().get("TRADEPLAN_DF_NO_TILTS", None)
-            if str(globals().get("TRADEPLAN_LABEL", "")).lower().strip() == "no_tilts":
-                _alt = globals().get("TRADEPLAN_DF_WITH_TILTS", None)
-
-            _main = globals().get("trade_rec", None)
-            if isinstance(_alt, pd.DataFrame) and not _alt.empty and isinstance(_main, pd.DataFrame) and not _main.empty:
-                _alt_df = _alt.copy()
-                if "Security" not in _alt_df.columns:
-                    _alt_df.insert(0, "Security", _alt_df.index.astype(str))
-                _alt_df = _alt_df.reindex(columns=_main.columns)
-
-                _start_s_row = int(globals().get("start_s_row", 1))
-                _stats_df = globals().get("stats_df", pd.DataFrame())
-                _stats_rows = int(_stats_df.shape[0]) if isinstance(_stats_df, pd.DataFrame) else 0
-                _anchor = _start_s_row + _stats_rows + 4
-                _alt_anchor = _anchor + _main.shape[0] + 8
-
-                _ws.range(f"A{_alt_anchor}").value = "Alternative Trade Plan (rounded units)"
-                _ws.range(f"A{_alt_anchor+1}").options(index=False, header=True).value = _alt_df
-
-            _book.save()
+                _book.save()
+                _book.close()
             _written = True
             print(f"[post] Wrote OPT validation + layout fixes to: {_xl}")
         except Exception as _e_xlw:
@@ -5672,6 +5692,15 @@ def export_to_ppt(results, trades, charts=None):
         
         # Optional: clip extreme outliers (prevents visual spikes)
         perf_df = perf_df.clip(lower=-0.2, upper=0.5)
+
+        # Diagnostic: confirm whether the chart is plotting through the most recent trading day,
+        # or whether some series is truncating the join. If max < today by more than a few days,
+        # check the benchmark fetch (yfinance lag) or the with-tilts series alignment.
+        try:
+            print(f"[chart] Slide 3 perf_df range: {perf_df.index.min().date()} -> "
+                  f"{perf_df.index.max().date()} ({len(perf_df)} rows)")
+        except Exception:
+            pass
 
         # --- Plot ---
         fig, ax = plt.subplots(figsize=(7, 4.5))
