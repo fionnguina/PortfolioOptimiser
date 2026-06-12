@@ -466,30 +466,113 @@ def _cached_read(url: str, build_df_fn, ttl_days: int = 7) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------------------
-# FF5 + Momentum Data Loaders
+# FF5 + Momentum Data Loaders (region-aware)
 # ---------------------------------------------------------------------
-FF5_DAILY_ZIP = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip"
-MOM_DAILY_ZIP = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_daily_CSV.zip"
+# Ken French publishes daily factor data for several regions. We use:
+#   US           — the canonical FF5 + MOM (also the "global" momentum series).
+#   AP_EX_JAPAN  — Asia-Pacific ex Japan. The closest daily series for ASX names.
+#                  Note: there is no AP-incl-Japan daily series; we use a 3-region
+#                  dispatch (US / AP-ex-Japan / Japan) to cover IJP.AX cleanly.
+#   JAPAN        — Japan FF5 + MOM, used for IJP.AX only.
+FF5_REGION_URLS = {
+    "US": (
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip",
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_daily_CSV.zip",
+    ),
+    "AP_EX_JAPAN": (
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Asia_Pacific_ex_Japan_5_Factors_Daily_CSV.zip",
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Asia_Pacific_ex_Japan_MOM_Factor_Daily_CSV.zip",
+    ),
+    "JAPAN": (
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Japan_5_Factors_Daily_CSV.zip",
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Japan_MOM_Factor_Daily_CSV.zip",
+    ),
+}
+# Backward-compat aliases (legacy code still references these).
+FF5_DAILY_ZIP = FF5_REGION_URLS["US"][0]
+MOM_DAILY_ZIP = FF5_REGION_URLS["US"][1]
 
-def get_mom_daily() -> pd.DataFrame:
-    """Get daily momentum factor data."""
-    def _builder() -> pd.DataFrame:
-        r = requests.get(MOM_DAILY_ZIP, timeout=60)
-        r.raise_for_status()
-        z = zipfile.ZipFile(io.BytesIO(r.content))
-        csv_file = next(n for n in z.namelist() if n.lower().endswith(".csv"))
-        raw = z.read(csv_file).decode("latin1", errors="ignore").splitlines()
-        num_rx = re.compile(r"^\s*\d{6,8}\s*[,\s]")
-        first = next(i for i, ln in enumerate(raw) if num_rx.match(ln))
-        header = "Date,MOM"
-        data = [header] + [ln.strip() for ln in raw[first:] if num_rx.match(ln)]
-        df = pd.read_csv(io.StringIO("\n".join(data)), sep=r"\s*,\s*", engine="python")
-        df["Date"] = pd.to_datetime(df["Date"], format="%Y%m%d", errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-        df["MOM"] = pd.to_numeric(df["MOM"], errors="coerce") / 100.0
-        return df[["MOM"]]
 
-    df = _cached_read(MOM_DAILY_ZIP, _builder, ttl_days=7)
+def region_for_ticker(ticker: str) -> str:
+    """Map a security ticker to its Ken French factor region.
+
+    IJP.AX is the iShares Japan ETF, so it gets the Japan factor set.
+    Any other .AX (ASX-listed) -> Asia-Pacific ex Japan. Everything else
+    (SPY, SMH, US-domiciled tickers) -> US.
+    """
+    t = str(ticker).upper().strip()
+    if t == "IJP.AX":
+        return "JAPAN"
+    if t.endswith(".AX"):
+        return "AP_EX_JAPAN"
+    return "US"
+
+
+def _download_mom_csv(url: str) -> pd.DataFrame:
+    """Parse a Ken French MOM zip at the given URL into a daily MOM DataFrame."""
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    csv_file = next(n for n in z.namelist() if n.lower().endswith(".csv"))
+    raw = z.read(csv_file).decode("latin1", errors="ignore").splitlines()
+    num_rx = re.compile(r"^\s*\d{6,8}\s*[,\s]")
+    first = next(i for i, ln in enumerate(raw) if num_rx.match(ln))
+    header = "Date,MOM"
+    data = [header] + [ln.strip() for ln in raw[first:] if num_rx.match(ln)]
+    df = pd.read_csv(io.StringIO("\n".join(data)), sep=r"\s*,\s*", engine="python")
+    df["Date"] = pd.to_datetime(df["Date"], format="%Y%m%d", errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    df["MOM"] = pd.to_numeric(df["MOM"], errors="coerce") / 100.0
+    return df[["MOM"]]
+
+
+def _download_ff5_csv(url: str) -> pd.DataFrame:
+    """Parse a Ken French FF5 zip at the given URL into a daily 5-factor DataFrame."""
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+
+    raw = zf.read(csv_name).decode("latin1", errors="ignore")
+    lines = raw.splitlines()
+
+    num_rx = re.compile(r"^\s*\d{6,8}\s*[,\s]")
+    first_data_idx = next(i for i, ln in enumerate(lines) if num_rx.match(ln))
+
+    header_idx = None
+    for i in range(max(0, first_data_idx - 5), first_data_idx + 1):
+        if re.search(r"\bdate\b", lines[i], flags=re.I) and "mkt" in lines[i].lower():
+            header_idx = i
+            break
+
+    header = lines[header_idx].strip() if header_idx is not None else "Date,Mkt-RF,SMB,HML,RMW,CMA,RF"
+    data_lines = [header]
+    for ln in lines[first_data_idx:]:
+        if not num_rx.match(ln):
+            break
+        data_lines.append(ln.strip())
+
+    df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s*,\s*", engine="python")
+    df.columns = [c.strip() for c in df.columns]
+    col_map = {c.lower().replace(" ", ""): c for c in df.columns}
+    ren = {}
+    for want in ["Date", "Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]:
+        key = want.lower().replace(" ", "")
+        if key in col_map:
+            ren[col_map[key]] = want
+    df = df.rename(columns=ren)
+
+    df["Date"] = pd.to_datetime(df["Date"], format="%Y%m%d", errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    factor_cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]
+    df[factor_cols] = df[factor_cols].apply(pd.to_numeric, errors="coerce") / 100.0
+    return df.dropna(subset=factor_cols)
+
+
+def get_mom_daily(region: str = "US") -> pd.DataFrame:
+    """Get daily momentum factor data for the given region."""
+    url = FF5_REGION_URLS[region][1]
+    df = _cached_read(url, lambda: _download_mom_csv(url), ttl_days=7)
     df = df.copy()
     if "MOM" not in df.columns:
         df["MOM"] = pd.to_numeric(df.iloc[:, 0], errors="coerce")
@@ -497,68 +580,23 @@ def get_mom_daily() -> pd.DataFrame:
     df.index = pd.to_datetime(df.index)
     return df.sort_index()
 
-def get_ff5_daily(cache_csv_path: str | None = None) -> pd.DataFrame:
-    """
-    Get Fama-French 5 factors daily data.
 
-    Args:
-        cache_csv_path: Optional path to save cache CSV.
-    """
-    def _builder() -> pd.DataFrame:
-        resp = requests.get(FF5_DAILY_ZIP, timeout=60)
-        resp.raise_for_status()
-        zf = zipfile.ZipFile(io.BytesIO(resp.content))
-        csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
-
-        raw = zf.read(csv_name).decode("latin1", errors="ignore")
-        lines = raw.splitlines()
-
-        num_rx = re.compile(r"^\s*\d{6,8}\s*[,\s]")
-        first_data_idx = next(i for i, ln in enumerate(lines) if num_rx.match(ln))
-
-        header_idx = None
-        for i in range(max(0, first_data_idx - 5), first_data_idx + 1):
-            if re.search(r"\bdate\b", lines[i], flags=re.I) and "mkt" in lines[i].lower():
-                header_idx = i
-                break
-
-        header = lines[header_idx].strip() if header_idx is not None else "Date,Mkt-RF,SMB,HML,RMW,CMA,RF"
-        data_lines = [header]
-        for ln in lines[first_data_idx:]:
-            if not num_rx.match(ln):
-                break
-            data_lines.append(ln.strip())
-
-        df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s*,\s*", engine="python")
-        df.columns = [c.strip() for c in df.columns]
-        col_map = {c.lower().replace(" ", ""): c for c in df.columns}
-        ren = {}
-        for want in ["Date", "Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]:
-            key = want.lower().replace(" ", "")
-            if key in col_map:
-                ren[col_map[key]] = want
-        df = df.rename(columns=ren)
-
-        df["Date"] = pd.to_datetime(df["Date"], format="%Y%m%d", errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-        factor_cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]
-        df[factor_cols] = df[factor_cols].apply(pd.to_numeric, errors="coerce") / 100.0
-        return df.dropna(subset=factor_cols)
-
-    df = _cached_read(FF5_DAILY_ZIP, _builder, ttl_days=7)
-
+def get_ff5_daily(region: str = "US", cache_csv_path: str | None = None) -> pd.DataFrame:
+    """Get daily Fama-French 5 factor data for the given region."""
+    url = FF5_REGION_URLS[region][0]
+    df = _cached_read(url, lambda: _download_ff5_csv(url), ttl_days=7)
     if cache_csv_path:
         try:
             df.to_csv(cache_csv_path, index=True)
         except Exception as e:
             print(f"[ff5] Could not write cache_csv_path: {e}")
-
     return df
 
-def get_ff5_mom_daily() -> pd.DataFrame:
-    """Get combined FF5 + MOM daily factors."""
-    ff5 = get_ff5_daily()
-    mom = get_mom_daily()
+
+def get_ff5_mom_daily(region: str = "US") -> pd.DataFrame:
+    """Get combined FF5 + MOM daily factors for the given region."""
+    ff5 = get_ff5_daily(region=region)
+    mom = get_mom_daily(region=region)
     out = ff5.join(mom, how="inner").sort_index()
     return out[["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM", "RF"]]
 
@@ -687,14 +725,42 @@ prices.index.name = "Date"
 prices = prices.loc[:, ~prices.columns.duplicated()]
 
 # =====================================================================
-# 3) Fama-French 5 Factors + Momentum
+# 3) Fama-French 5 Factors + Momentum (multi-region)
 # =====================================================================
-ff5_raw = get_ff5_mom_daily().loc[:, ~get_ff5_mom_daily().columns.duplicated()].copy()
-
-# Ensure expected columns
+# Load US (canonical, used everywhere downstream for factor moments / FF5F
+# sheet / FX-adjusted aggregate) plus AP-ex-Japan and Japan (used only for
+# per-security beta regressions via the regional dispatch — see Task #6).
 expected_cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM", "RF"]
-ff5_raw = ff5_raw.reindex(columns=expected_cols)
+
+def _safe_load_region(region: str) -> pd.DataFrame:
+    """Load a region's FF5+MOM with friendly fallback. On failure logs a warning
+    and returns the US series so downstream regressions degrade gracefully
+    rather than crashing the pipeline."""
+    try:
+        df = get_ff5_mom_daily(region=region)
+        return df.loc[:, ~df.columns.duplicated()].reindex(columns=expected_cols).copy()
+    except Exception as e:
+        print(f"[ff5] {region} factor download failed ({e}); falling back to US factors for this region")
+        df = get_ff5_mom_daily(region="US")
+        return df.loc[:, ~df.columns.duplicated()].reindex(columns=expected_cols).copy()
+
+ff5_raw = _safe_load_region("US")
 ff5_win_for_betas = ff5_raw.tail(FF5_BETA_WINDOW_DAYS)
+
+ff5_regional_raw = {
+    "US": ff5_raw,
+    "AP_EX_JAPAN": _safe_load_region("AP_EX_JAPAN"),
+    "JAPAN": _safe_load_region("JAPAN"),
+}
+ff5_regional_windows = {r: df.tail(FF5_BETA_WINDOW_DAYS) for r, df in ff5_regional_raw.items()}
+print(
+    "[ff5] region windows: "
+    + ", ".join(
+        f"{r}={ff5_regional_windows[r].shape[0]}d ({ff5_regional_windows[r].index.min().date()} → {ff5_regional_windows[r].index.max().date()})"
+        for r in ff5_regional_windows
+        if not ff5_regional_windows[r].empty
+    )
+)
 
 # =====================================================================
 # 4) FX Rates (AUD/USD for factor adjustment & USD/AUD for holdings)
@@ -1962,6 +2028,92 @@ def compute_ff5_betas(df_returns_wide: pd.DataFrame, ff5_returns: pd.DataFrame, 
     return B, alpha_daily, resid_var
 
 
+def compute_ff5_betas_multi_region(
+    df_returns_wide: pd.DataFrame,
+    regional_factors: dict,
+    region_map,
+    min_obs: int = 120,
+    n_lags: int = 1,
+    reference_region: str = "US",
+    standardise_factors: bool = True,
+):
+    """Compute FF5+MOM betas where each security is regressed against its home-region factor set.
+
+    Each security's beta vector lives in the canonical 6-factor space (Mkt-RF, SMB, HML, RMW,
+    CMA, MOM) but the underlying factors are the security's regional series — i.e. an ASX ETF's
+    "Mkt-RF" beta is its loading against the Asia-Pacific ex Japan market factor, not the US one.
+
+    When `standardise_factors` is True (default), each non-reference region's factor returns are
+    rescaled so their per-factor volatility matches the reference region (US by default). This
+    means a security's "Mkt-RF" beta is expressed in "units of US-Mkt-RF volatility" regardless of
+    home region, making cross-region aggregation Σ w_i × β_i^f mathematically clean. The reference
+    region's betas are unchanged — preserves backward continuity with the US-only model.
+
+    Args:
+        df_returns_wide: wide DataFrame of asset daily returns (one column per security).
+        regional_factors: {region_key: factor_df_with_RF}. Region keys must match `region_map` output.
+        region_map: callable taking a security column name and returning a region key.
+        reference_region: which region's factor vols define the common scale (default "US").
+        standardise_factors: when True, rescale non-reference regional factors to match the
+            reference region's per-factor volatility. See task #6 design notes.
+
+    Returns: (B, alpha_daily, resid_var) in the same shape as compute_ff5_betas.
+    """
+    securities = list(df_returns_wide.columns)
+    by_region: dict[str, list[str]] = {}
+    for sec in securities:
+        by_region.setdefault(region_map(sec), []).append(sec)
+
+    # Compute the per-factor scaling map ahead of the regression loop so we can log it.
+    factor_cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM"]
+    scaling: dict[str, dict[str, float]] = {}
+    if standardise_factors and reference_region in regional_factors:
+        ref_df = regional_factors[reference_region]
+        ref_vol = {f: float(ref_df[f].std()) for f in factor_cols if f in ref_df.columns}
+        for region, df_r in regional_factors.items():
+            if region == reference_region or df_r is None or df_r.empty:
+                continue
+            scaling[region] = {}
+            for f in factor_cols:
+                if f in df_r.columns and f in ref_vol:
+                    own = float(df_r[f].std())
+                    scaling[region][f] = (ref_vol[f] / own) if own > 0 else 1.0
+                else:
+                    scaling[region][f] = 1.0
+        if scaling:
+            print(
+                "[ff5] factor standardisation (vs " + reference_region + " vol): "
+                + "; ".join(
+                    f"{r}: " + ", ".join(f"{f}={s:.2f}x" for f, s in factors.items())
+                    for r, factors in scaling.items()
+                )
+            )
+
+    B_parts, alpha_parts, resid_parts = [], [], []
+    for region, secs in by_region.items():
+        ff = regional_factors.get(region)
+        if ff is None or ff.empty or not secs:
+            continue
+        if region in scaling:
+            ff = ff.copy()
+            for f, mult in scaling[region].items():
+                if f in ff.columns:
+                    ff[f] = ff[f] * mult
+        sub = df_returns_wide[secs]
+        B_r, alpha_r, resid_r = compute_ff5_betas(sub, ff, min_obs=min_obs, n_lags=n_lags)
+        if B_r is not None and not B_r.empty:
+            B_parts.append(B_r)
+        if alpha_r is not None:
+            alpha_parts.append(alpha_r)
+        if resid_r is not None:
+            resid_parts.append(resid_r)
+
+    B = pd.concat(B_parts).reindex(securities) if B_parts else None
+    alpha = pd.concat(alpha_parts).reindex(securities) if alpha_parts else None
+    resid = pd.concat(resid_parts).reindex(securities) if resid_parts else None
+    return B, alpha, resid
+
+
 def compute_factor_feasible_ranges(
     B: pd.DataFrame,
     include_flags: dict,
@@ -2213,11 +2365,24 @@ FACTOR_MU_RECENT_WEIGHT = 0.20     # weight on the recent window (0..1)
 
 USE_FF5 = True
 
-B, alpha_daily, resid_var = compute_ff5_betas(
+# Multi-region beta computation: each security regresses against its home-region
+# factor set (US / AP-ex-Japan / Japan). Aggregation across regions happens for
+# free via the tilt engine's portfolio-weighted sum — see Task #6 design notes.
+B, alpha_daily, resid_var = compute_ff5_betas_multi_region(
     df_cov_wide,
-    ff5_win_for_betas,
+    regional_factors=ff5_regional_windows,
+    region_map=region_for_ticker,
     min_obs=120,
 )
+# Surface which region each security got regressed against — useful for
+# spotting unexpected ticker classifications in run.log.
+if B is not None and not B.empty:
+    _reg_summary: dict[str, list[str]] = {}
+    for sec in B.index:
+        _reg_summary.setdefault(region_for_ticker(sec), []).append(sec)
+    print("[ff5] regional beta assignment:")
+    for r, secs in _reg_summary.items():
+        print(f"  {r}: {len(secs)} securities -> {secs}")
 
 f_mean_ann = pd.Series(dtype=float)
 Fcov_daily = pd.DataFrame()
@@ -2536,21 +2701,24 @@ def _build_frontier(
     R_mvp_ann = float(w_mvp @ mu_arr)
     mu_max = float(np.nanmax(mu_arr))
 
-    # Size the frontier range by the dispersion of asset returns, not a hard cap.
+    # Size the frontier range to cover the upper portion of the asset return distribution.
     # MAD-based robust SD is immune to a single outlier asset (e.g. a noisy 450% mu blowing up
     # raw stdev); 1.4826 is the scaling factor that makes MAD comparable to SD under normality.
-    # Extending 2 robust SDs above MVP captures ~95% of typical asset-return spread.
-    # Capped at mu_max because a long-only sum=1 portfolio cannot exceed any single asset's return.
+    # We extend to whichever is LARGER: MVP + 3 robust SDs (covers the dispersion-driven range)
+    # or the 90th percentile of asset μ (covers the high-return regime). Capped at mu_max
+    # because a long-only sum=1 portfolio cannot exceed any single asset's return.
     mu_finite = mu_arr[np.isfinite(mu_arr)]
     if mu_finite.size:
         mu_median = float(np.median(mu_finite))
         mad = float(np.median(np.abs(mu_finite - mu_median)))
         robust_sd = 1.4826 * mad if mad > 0 else float(np.std(mu_finite, ddof=0))
+        mu_p90 = float(np.percentile(mu_finite, 90))
     else:
         robust_sd = 0.05  # last-resort fallback
+        mu_p90 = 0.20
 
     low = R_mvp_ann
-    high = min(mu_max, R_mvp_ann + 2.0 * robust_sd)
+    high = min(mu_max, max(R_mvp_ann + 3.0 * robust_sd, mu_p90))
 
     if high <= low + 0.01:
         high = low + 0.06
@@ -4805,9 +4973,30 @@ if USE_XLWINGS:
             try: opt.autofit()
             except Exception: pass
 
-            # 4) FF5F sheet (optional transparency)
+            # 4) FF5F sheet (optional transparency) — AUD-adjusted aggregate (US factors)
+            # used downstream for factor moments / tilt-target μ + Σ.
             ff5s = get_or_clear_sheet(wb, 'FF5F')
             ff5s.range('A1').options(pd.DataFrame, index=True, header=True).value = ff_aud
+
+            # FF5F_Regional sheet (audit) — the actual factor matrices each
+            # security was regressed against. Stacked long-format with a Region
+            # marker column so you can sort/filter to see only one region.
+            try:
+                _ff5_regional = globals().get("ff5_regional_windows", None)
+                if isinstance(_ff5_regional, dict) and _ff5_regional:
+                    _parts = []
+                    for _region, _df_r in _ff5_regional.items():
+                        if _df_r is None or _df_r.empty:
+                            continue
+                        _tmp = _df_r.copy().reset_index().rename(columns={"index": "Date"})
+                        _tmp.insert(0, "Region", _region)
+                        _parts.append(_tmp)
+                    if _parts:
+                        _audit = pd.concat(_parts, ignore_index=True)
+                        ff5r = get_or_clear_sheet(wb, 'FF5F_Regional')
+                        ff5r.range('A1').options(pd.DataFrame, index=False, header=True).value = _audit
+            except Exception as _e_ff5_reg:
+                print(f"[excel] FF5F_Regional write skipped: {_e_ff5_reg}")
 
             # ---- Update Lots and overwrite Holdings with target units (for next run) ----
             UPDATED_LOTS = _update_lots_after_trades(lots_df, trade_rec, pd.Timestamp(prices.index[-1]), fx_map_all)
