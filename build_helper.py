@@ -1,6 +1,7 @@
 # build_helper.py
 import re
 import subprocess
+import sys
 import shutil
 from pathlib import Path
 
@@ -33,6 +34,10 @@ COLLECT_ALL_LIBS = [
     "numpy", "pandas", "scipy", "statsmodels",
     "openpyxl", "xlwings", "yfinance",
     "customtkinter",  # ships theme JSON + assets that must be bundled
+    # cvxpy + backend solvers ship compiled DLLs and data files that PyInstaller's
+    # default crawl misses (it bundles only the .py files). Without --collect-all
+    # the .exe crashes at `import cvxpy` with WinError 3 on the cvxpy data dir.
+    "cvxpy", "osqp", "scs", "clarabel",
 ]
 
 # Optional: modules to exclude to silence irrelevant warnings/size bloat
@@ -79,8 +84,11 @@ def build():
     detected = extract_top_level_imports(app_py)
     print("Detected top-level imports:", detected)
 
+    # Invoke PyInstaller via the active Python so we don't depend on the venv's Scripts/
+    # dir being on PATH. sys.executable resolves to the venv python when build_helper.py
+    # is launched as `./.venv/Scripts/python.exe build_helper.py`.
     cmd = [
-        "pyinstaller",
+        sys.executable, "-m", "PyInstaller",
         "--noconfirm",
         "--noconsole",
         "--onefile",

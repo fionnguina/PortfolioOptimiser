@@ -4100,7 +4100,9 @@ if USE_XLWINGS:
             charts = globals().get("charts", {}) or {}
 
             try:
-                APP_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+                # (Previously reassigned APP_DIR here from __file__ — removed because
+                # under a frozen exe that points at the PyInstaller _MEI* temp dir,
+                # which then corrupted the template lookup in export_to_ppt.)
                 eff_path = str((EXPORT_DIR / "efficient_frontier.png").resolve())
             
                 _x = pd.to_numeric(stats_df["Volatility (ann.)"], errors="coerce")
@@ -4662,9 +4664,11 @@ if USE_XLWINGS:
 
 
             # --- Add portfolio value & cash summary underneath the Trade Plan ---
+            # Hoisted from below so the override branch at line ~4680 can use it.
+            total_brokerage = float(costs_rec.get("brokerage", 0.0))
             net_invested = 0.0
             cash_balance = 0.0
-        
+
             if not trade_rec.empty:
                 # Value of target holdings
                 tgt_units = pd.to_numeric(trade_rec["Target Units"], errors="coerce").fillna(0.0)
@@ -5355,10 +5359,11 @@ def export_to_ppt(results, trades, charts=None):
     """
     Generates a professional PowerPoint summary based on your custom template.
     """
-    APP_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
-
+    # Use the module-level APP_DIR rather than redefining from __file__:
+    # under a PyInstaller frozen build, __file__ resolves to the _MEI* temp dir
+    # where Portfolio_Optimiser.py is extracted, NOT where the template lives.
     # Template file (design only, never edited)
-    template_path = os.path.join(APP_DIR, "PowerPoint_Template.pptx")
+    template_path = os.path.join(str(APP_DIR), "PowerPoint_Template.pptx")
 
     # Output path â€” always overwrite this file
     ppt_path = str(EXPORT_DIR / "Portfolio_Report.pptx")
@@ -5880,9 +5885,8 @@ def export_to_ppt(results, trades, charts=None):
             chart_df = pd.DataFrame({"Portfolio": port_r_chart}).join(ffd_chart[series_to_show], how="inner")
             tbl_df   = pd.DataFrame({"Portfolio": port_r_tbl}).join(ffd_tbl[series_to_show], how="inner")
             
-            # Chart 
-            APP_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
-            ff_chart_path = os.path.join(APP_DIR, "ff_benchmarks.png")
+            # Chart — use module-level APP_DIR (see note in export_to_ppt header).
+            ff_chart_path = os.path.join(str(APP_DIR), "ff_benchmarks.png")
             
             ret = ((1.0 + chart_df.fillna(0.0)).cumprod() - 1.0) * 100.0
             fig, ax = plt.subplots(figsize=(7.5, 4.8))
