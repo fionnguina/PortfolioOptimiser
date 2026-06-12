@@ -750,6 +750,24 @@ prices_aud = prices.copy()
 if usd_tickers:
     prices_aud[usd_tickers] = prices[usd_tickers].mul(fx_usdaud, axis=0)
 
+# Defensive filter: ETF daily returns >|30%| are almost always yfinance data
+# errors (missed split/consolidation adjustments — e.g. BBUS.AX on 2025-12-01
+# where price jumped $2.84 -> $28.70 because the consolidation factor was not
+# back-applied to history). Drop the bad row from the return inputs so a
+# single bogus print can't dominate the annualised mean / covariance.
+RETURN_OUTLIER_THRESHOLD = 0.30
+
+def _drop_return_outliers(d: pd.DataFrame, *, verbose: bool) -> pd.DataFrame:
+    """NaN out rows where |Return| > RETURN_OUTLIER_THRESHOLD. Mutates and returns d."""
+    mask = d["Return"].abs() > RETURN_OUTLIER_THRESHOLD
+    if mask.any():
+        if verbose:
+            print(f"[data] Dropped {int(mask.sum())} return outlier(s) (|r| > {RETURN_OUTLIER_THRESHOLD:.0%}):")
+            for _, row in d.loc[mask].iterrows():
+                print(f"  {row['Security']}  {pd.Timestamp(row['Date']).date()}  ret={float(row['Return']):+.4f}")
+        d.loc[mask, "Return"] = np.nan
+    return d
+
 # Compute returns
 df_returns = (
     prices_aud.reset_index()
@@ -757,6 +775,7 @@ df_returns = (
     .sort_values(["Security", "Date"])
 )
 df_returns["Return"] = df_returns.groupby("Security", sort=False)["Close"].pct_change()
+df_returns = _drop_return_outliers(df_returns, verbose=True)
 df_returns = df_returns.dropna()
 
 # FX map for holdings sheet last-price conversion
@@ -1824,9 +1843,13 @@ df_cov_wide = (
 )
 Sigma_daily = df_cov_wide.cov()
 
-# Optional sanity check that Sigma was built from AUD-converted prices
+# Optional sanity check that Sigma was built from AUD-converted prices.
+# Apply the same return-outlier filter as the canonical df_returns build so
+# the cross-check compares apples-to-apples; otherwise the diagnostic falsely
+# reports "Using FX-adjusted returns?: False" whenever an outlier was dropped
+# upstream.
 try:
-    Sigma_from_aud = (
+    _sigma_check = (
         pd.melt(
             prices_aud_for_returns.reset_index(),
             id_vars="Date",
@@ -1834,9 +1857,11 @@ try:
             value_name="Close",
         )
         .sort_values(["Security", "Date"])
-        .assign(Return=lambda d: d.groupby("Security")["Close"].pct_change(fill_method=None))
-        .pivot(index="Date", columns="Security", values="Return")
-        .cov()
+    )
+    _sigma_check["Return"] = _sigma_check.groupby("Security")["Close"].pct_change(fill_method=None)
+    _sigma_check = _drop_return_outliers(_sigma_check, verbose=False)
+    Sigma_from_aud = (
+        _sigma_check.pivot(index="Date", columns="Security", values="Return").cov()
     ).reindex(index=Sigma_daily.index, columns=Sigma_daily.columns)
 
     diff = (Sigma_daily - Sigma_from_aud).abs().to_numpy()
@@ -3678,6 +3703,9 @@ def _rebuild_core_from_prices(prices, fx_ticker="USDAUD=X", period="5y"):
          .sort_values(["Security", "Date"]))
 
     d["Return"] = d.groupby("Security", sort=False)["Close"].pct_change(fill_method=None)
+    # Same outlier guard as the canonical df_returns build (see top-of-file helper).
+    # Silent here to avoid double-logging — the canonical path already printed.
+    d = _drop_return_outliers(d, verbose=False)
     d = d.dropna()
 
     df_cov_wide = d.pivot(index="Date", columns="Security", values="Return").sort_index()
@@ -4143,9 +4171,15 @@ if USE_XLWINGS:
                         textcoords="offset points",
                         fontsize=9
                     )
+                if no_tilt_point:
+                    ax.scatter(
+                        [float(no_tilt_point[0])], [float(no_tilt_point[1])],
+                        s=80, marker="o", facecolors="none", edgecolors="purple",
+                        linewidths=1.8, label="Optimised", zorder=5,
+                    )
                 if target_point:
                     ax.scatter([float(target_point[0])], [float(target_point[1])], s=70, marker="+", label="Target")
-            
+
                 ax.legend()
                 fig.savefig(eff_path, bbox_inches="tight")
                 plt.close(fig)
