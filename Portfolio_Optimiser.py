@@ -4128,11 +4128,6 @@ if USE_XLWINGS:
             charts = globals().get("charts", {}) or {}
 
             try:
-                # (Previously reassigned APP_DIR here from __file__ — removed because
-                # under a frozen exe that points at the PyInstaller _MEI* temp dir,
-                # which then corrupted the template lookup in export_to_ppt.)
-                eff_path = str((EXPORT_DIR / "efficient_frontier.png").resolve())
-            
                 _x = pd.to_numeric(stats_df["Volatility (ann.)"], errors="coerce")
                 _y = pd.to_numeric(stats_df["Achieved Return"], errors="coerce")
             
@@ -4181,10 +4176,12 @@ if USE_XLWINGS:
                     ax.scatter([float(target_point[0])], [float(target_point[1])], s=70, marker="+", label="Target")
 
                 ax.legend()
-                fig.savefig(eff_path, bbox_inches="tight")
+                _eff_buf = io.BytesIO()
+                fig.savefig(_eff_buf, format="png", bbox_inches="tight")
                 plt.close(fig)
-            
-                charts["efficient_frontier_path"] = str(eff_path)
+                _eff_buf.seek(0)
+
+                charts["efficient_frontier_image"] = _eff_buf
                 charts["frontier_points"] = {
                     "Current": current_point,
                     "Previous": previous_point,
@@ -5760,16 +5757,17 @@ def export_to_ppt(results, trades, charts=None):
         ax.legend(loc="upper left", frameon=False)
         ax.grid(True, linestyle="--", alpha=0.4)
         
-        chart_path = os.path.join(APP_DIR, "perf_vs_indices.png")
-        fig.savefig(chart_path, bbox_inches="tight")
+        _perf_buf = io.BytesIO()
+        fig.savefig(_perf_buf, format="png", bbox_inches="tight")
         plt.close(fig)
-        
+        _perf_buf.seek(0)
+
         # --- Insert chart in PowerPoint ---
         chart_left, chart_top, chart_w, chart_h = _ppt_anchor(
             slide, slide_layout, "chart_perf",
             fb_left_cm=2.032, fb_top_cm=2.95, fb_w_cm=20.828, fb_h_cm=11.176,
         )
-        slide.shapes.add_picture(chart_path, chart_left, chart_top, width=chart_w, height=chart_h)
+        slide.shapes.add_picture(_perf_buf, chart_left, chart_top, width=chart_w, height=chart_h)
 
         # --- Performance table (3m / 6m / 12m / 3y) under the chart ---
         try:
@@ -5922,13 +5920,10 @@ def export_to_ppt(results, trades, charts=None):
             chart_df = pd.DataFrame({"Portfolio": port_r_chart}).join(ffd_chart[series_to_show], how="inner")
             tbl_df   = pd.DataFrame({"Portfolio": port_r_tbl}).join(ffd_tbl[series_to_show], how="inner")
             
-            # Chart — use module-level APP_DIR (see note in export_to_ppt header).
-            ff_chart_path = os.path.join(str(APP_DIR), "ff_benchmarks.png")
-            
             ret = ((1.0 + chart_df.fillna(0.0)).cumprod() - 1.0) * 100.0
             fig, ax = plt.subplots(figsize=(7.5, 4.8))
             ret.plot(ax=ax, linewidth=1.4)
-            
+
             # Make room inside the figure on the right for the legend
             fig.subplots_adjust(right=0.78)
             ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=9)
@@ -5939,14 +5934,16 @@ def export_to_ppt(results, trades, charts=None):
             ax.margins(x=0)
             if not ret.empty:
                 ax.set_xlim(ret.index.min(), ret.index.max())
-            fig.savefig(ff_chart_path, bbox_inches="tight")
+            _ff_buf = io.BytesIO()
+            fig.savefig(_ff_buf, format="png", bbox_inches="tight")
             plt.close(fig)
-            
+            _ff_buf.seek(0)
+
             chart_left, chart_top, chart_w, chart_h = _ppt_anchor(
                 slide4, slide_layout, "chart_ff",
                 fb_left_cm=2.032, fb_top_cm=3.05, fb_w_cm=20.32, fb_h_cm=8.65,
             )
-            slide4.shapes.add_picture(ff_chart_path, chart_left, chart_top, width=chart_w, height=chart_h)
+            slide4.shapes.add_picture(_ff_buf, chart_left, chart_top, width=chart_w, height=chart_h)
             
             # Table: 3M/6M/12M/3Y (compounded) using available daily points.
             # FF factor rows are anchored to the FF data's last date (~1mo lag).
@@ -6002,15 +5999,15 @@ def export_to_ppt(results, trades, charts=None):
             if slide5.shapes.title:
                 slide5.shapes.title.text = "Efficient Frontier"
         
-            eff_path = None
+            eff_image = None
             if isinstance(charts, dict):
-                eff_path = charts.get("efficient_frontier_path", None)
-        
+                eff_image = charts.get("efficient_frontier_image", None)
+
             # Always build rows for the points table (even if the chart image is missing)
             pts = {}
             if isinstance(charts, dict):
                 pts = charts.get("frontier_points", {}) or {}
-            
+
             rows = []
             for k in ["Current", "Previous", "Optimised", "With Tilts", "Target"]: #Change these for the names
                 v = pts.get(k, None)
@@ -6022,16 +6019,19 @@ def export_to_ppt(results, trades, charts=None):
                         rows.append({"Point": k, "Vol (ann.)": vol, "Return (ann.)": ret})
                 except Exception:
                     pass
-            
-            # Chart is OPTIONAL: only add if we actually have a valid file path
-            if eff_path and os.path.exists(eff_path):
-                # chart on left
+
+            # Chart is OPTIONAL: only add if a buffer is present.
+            if eff_image is not None:
+                try:
+                    eff_image.seek(0)  # defensive — in case anyone read from it earlier
+                except Exception:
+                    pass
                 chart_left, chart_top, chart_w, chart_h = _ppt_anchor(
                     slide5, slide_layout, "chart_frontier",
                     fb_left_cm=1.52, fb_top_cm=3.56, fb_w_cm=14.50, fb_h_cm=11.50,
                 )
                 slide5.shapes.add_picture(
-                    eff_path, chart_left, chart_top, width=chart_w, height=chart_h,
+                    eff_image, chart_left, chart_top, width=chart_w, height=chart_h,
                 )
             
             # Points table (always add if we have data)
