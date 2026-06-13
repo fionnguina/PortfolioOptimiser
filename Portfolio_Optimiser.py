@@ -487,25 +487,150 @@ FF5_REGION_URLS = {
         "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Japan_5_Factors_Daily_CSV.zip",
         "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Japan_MOM_Factor_Daily_CSV.zip",
     ),
+    "EUROPE": (
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Europe_5_Factors_Daily_CSV.zip",
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Europe_MOM_Factor_Daily_CSV.zip",
+    ),
+    # NOTE: Emerging Markets daily factors are NOT published by Ken French (only
+    # monthly), so VGE.AX and any other EM tracker stays bucketed into AP_EX_JAPAN
+    # by the heuristic. The R² will be lower than for pure-AP names — that's a
+    # known limitation, not a bug. Documented 2026-06-12.
 }
+
+# yfinance exchange suffixes for the European region. Used by the heuristic
+# in region_for_ticker to classify natively-listed European stocks.
+EUROPEAN_EXCHANGE_SUFFIXES = (
+    ".L",   # London
+    ".PA",  # Euronext Paris
+    ".DE",  # XETRA / Frankfurt
+    ".AS",  # Euronext Amsterdam
+    ".MI",  # Borsa Italiana
+    ".SW",  # SIX Swiss Exchange
+    ".MC",  # Bolsa de Madrid
+    ".BR",  # Euronext Brussels
+    ".HE",  # Helsinki
+    ".ST",  # Stockholm
+    ".CO",  # Copenhagen
+    ".OL",  # Oslo
+    ".LS",  # Lisbon
+    ".VI",  # Vienna
+    ".IR",  # Euronext Dublin
+    ".AT",  # Athens
+)
 # Backward-compat aliases (legacy code still references these).
 FF5_DAILY_ZIP = FF5_REGION_URLS["US"][0]
 MOM_DAILY_ZIP = FF5_REGION_URLS["US"][1]
 
 
+# Hardcoded ticker -> factor region overrides. Use these for securities whose
+# correct factor region differs from what the .AX suffix would suggest — e.g.
+# ASX-listed ETFs that track US/global indices have their *underlying exposure*
+# in the US, not Asia-Pacific. Without these overrides, the FF5 regression
+# uses the wrong factor set and R² collapses (see 2026-06-12 diagnostics:
+# IVV.AX had R² 0.32 against AP-Mkt vs SPY 0.81 against US-Mkt, same underlying).
+#
+# Runtime override path: a `Region` column in the Holdings sheet takes
+# precedence over this dict, letting the user reclassify any ticker without
+# editing source. Build order: Holdings column > TICKER_REGION_OVERRIDES > heuristic.
+TICKER_REGION_OVERRIDES: dict[str, str] = {
+    # ASX-listed ETFs whose underlying AND trading microstructure align with US.
+    # Empirically validated by R² improvement when classified as US (vs AP-ex-Japan)
+    # in the 2026-06-12 diagnostics — see Regression_Diagnostics sheet.
+    "IVV.AX": "US",         # iShares S&P 500           (R² 0.32 -> 0.49)
+    "IOO.AX": "US",         # iShares S&P Global 100    (R² 0.32 -> 0.47)
+    "VGS.AX": "US",         # Vanguard MSCI World ex Aus (R² 0.37 -> 0.48)
+    "QUAL.AX": "US",        # VanEck MSCI World Quality (R² 0.27 -> 0.40)
+    "VLUE.AX": "US",        # iShares Edge MSCI Value   (R² 0.33 -> 0.36)
+    "VVLU.AX": "US",        # Vanguard Global Value     (R² 0.30 -> 0.57)
+    # ASX-listed European tracker -> Europe (Ken French daily Europe factors now loaded).
+    "IEU.AX": "EUROPE",     # iShares Europe ETF
+    # MTUM.AX (global momentum, ASX-listed) was tried as US but R² dropped
+    # 0.49 -> 0.26. Trading-microstructure synchroneity with AP markets
+    # dominates the underlying-region consideration at daily frequency. Left
+    # out of the dict so it defaults to AP_EX_JAPAN via the .AX heuristic.
+    # Australian broad-market benchmark
+    "^AORD": "AP_EX_JAPAN",
+}
+
+# Runtime user overrides loaded from Holdings sheet (Region column, if present).
+# Populated by `_load_user_region_overrides` early in the pipeline; falls back
+# to empty dict so region_for_ticker keeps working in legacy / fresh installs.
+USER_REGION_OVERRIDES: dict[str, str] = {}
+
+
 def region_for_ticker(ticker: str) -> str:
     """Map a security ticker to its Ken French factor region.
 
-    IJP.AX is the iShares Japan ETF, so it gets the Japan factor set.
-    Any other .AX (ASX-listed) -> Asia-Pacific ex Japan. Everything else
-    (SPY, SMH, US-domiciled tickers) -> US.
+    Resolution order:
+      1. USER_REGION_OVERRIDES (Holdings sheet `Region` column) — runtime user override.
+      2. TICKER_REGION_OVERRIDES (hardcoded above) — known classification corrections.
+      3. Heuristic by yfinance exchange suffix:
+         - .T                              -> Japan
+         - .AX (and special case IJP.AX)   -> AP_EX_JAPAN (Japan if IJP)
+         - any European exchange suffix    -> Europe
+         - else (US-listed)                -> US
     """
     t = str(ticker).upper().strip()
+    if t in USER_REGION_OVERRIDES:
+        return USER_REGION_OVERRIDES[t]
+    if t in TICKER_REGION_OVERRIDES:
+        return TICKER_REGION_OVERRIDES[t]
     if t == "IJP.AX":
+        return "JAPAN"
+    if t.endswith(".T"):  # Tokyo Stock Exchange
         return "JAPAN"
     if t.endswith(".AX"):
         return "AP_EX_JAPAN"
+    for _sfx in EUROPEAN_EXCHANGE_SUFFIXES:
+        if t.endswith(_sfx.upper()):
+            return "EUROPE"
     return "US"
+
+
+# User region overrides live in regions.json beside the workbook — kept out
+# of Excel entirely so the Holdings sheet stays focused on positions, and out
+# of source so user choices survive code-level changes to TICKER_REGION_OVERRIDES.
+REGIONS_JSON_PATH = APP_DIR / "regions.json"
+
+
+def _load_regions_json() -> dict[str, str]:
+    """Load ticker -> region map from regions.json. Silently returns {} if missing.
+
+    Validates regions against FF5_REGION_URLS — silently drops unknown values
+    (e.g. an outdated entry for a region the code no longer supports).
+    """
+    if not REGIONS_JSON_PATH.exists():
+        return {}
+    try:
+        with REGIONS_JSON_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[region] regions.json load failed ({e}); starting fresh.")
+        return {}
+    valid = set(FF5_REGION_URLS.keys())
+    out: dict[str, str] = {}
+    for k, v in (data or {}).items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        ticker = k.upper().strip()
+        region = v.upper().strip()
+        if ticker and region in valid:
+            out[ticker] = region
+    return out
+
+
+def _save_regions_json(mapping: dict[str, str]) -> bool:
+    """Atomically write the ticker -> region map back to regions.json."""
+    try:
+        REGIONS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = REGIONS_JSON_PATH.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2, sort_keys=True)
+        tmp.replace(REGIONS_JSON_PATH)
+        return True
+    except Exception as e:
+        print(f"[region] regions.json save failed: {e}")
+        return False
 
 
 def _download_mom_csv(url: str) -> pd.DataFrame:
@@ -695,6 +820,14 @@ tickers = _build_ticker_universe(tickers_from_sheet, STATIC_STARTERS)
 print(f"XL_PATH = {_XL_PATH}")
 print(f"Tickers loaded from sheet: {tickers_from_sheet}")
 
+# Load user region overrides from regions.json. Populated entries take
+# precedence over TICKER_REGION_OVERRIDES and the suffix heuristic. Users
+# pick a region per-ticker via the add-ticker dialog dropdown; the JSON
+# is the persistence layer for those choices.
+USER_REGION_OVERRIDES.update(_load_regions_json())
+if USER_REGION_OVERRIDES:
+    print(f"[region] User overrides from regions.json: {USER_REGION_OVERRIDES}")
+
 # =====================================================================
 # 2) Download Prices
 # =====================================================================
@@ -747,11 +880,17 @@ def _safe_load_region(region: str) -> pd.DataFrame:
 ff5_raw = _safe_load_region("US")
 ff5_win_for_betas = ff5_raw.tail(FF5_BETA_WINDOW_DAYS)
 
-ff5_regional_raw = {
-    "US": ff5_raw,
-    "AP_EX_JAPAN": _safe_load_region("AP_EX_JAPAN"),
-    "JAPAN": _safe_load_region("JAPAN"),
-}
+# Conditional download: only fetch regions actually used by the current ticker
+# universe. US is always loaded (it's the reference for factor standardisation),
+# regardless of whether any US tickers exist. Saves ~1 HTTP round-trip per
+# unused region — small per-run but cumulative across daily runs.
+_used_regions = {"US"} | {region_for_ticker(t) for t in tickers}
+_used_regions = _used_regions & set(FF5_REGION_URLS.keys())
+print(f"[ff5] regions required by universe: {sorted(_used_regions)}")
+
+ff5_regional_raw = {"US": ff5_raw}
+for _region in sorted(_used_regions - {"US"}):
+    ff5_regional_raw[_region] = _safe_load_region(_region)
 ff5_regional_windows = {r: df.tail(FF5_BETA_WINDOW_DAYS) for r, df in ff5_regional_raw.items()}
 print(
     "[ff5] region windows: "
@@ -1627,11 +1766,13 @@ def _edit_holdings_dialog_ctk(
 
     _sync_units_state()
 
-    # Add-holding box
+    # Add-holding box (includes factor-region selector so the user picks the
+    # correct Ken French region at add-time — IEU.AX style ASX-listed-but-
+    # foreign-tracking cases can't be inferred from the suffix).
     add_box = _ctk.CTkFrame(left)
     add_box.pack(fill="x", padx=14, pady=(4, 12))
     _ctk.CTkLabel(add_box, text="Add holding", font=title_font).grid(
-        row=0, column=0, columnspan=5, sticky="w", padx=8, pady=(8, 4)
+        row=0, column=0, columnspan=6, sticky="w", padx=8, pady=(8, 4)
     )
     _ctk.CTkLabel(add_box, text="Ticker").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=(0, 8))
     ent_new_ticker = _ctk.CTkEntry(add_box, width=140)
@@ -1639,8 +1780,25 @@ def _edit_holdings_dialog_ctk(
     _ctk.CTkLabel(add_box, text="Units").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(0, 8))
     ent_new_units = _ctk.CTkEntry(add_box, width=110)
     ent_new_units.grid(row=1, column=3, sticky="w", padx=(0, 12), pady=(0, 8))
+    _ctk.CTkLabel(add_box, text="Region").grid(row=1, column=4, sticky="w", padx=(0, 4), pady=(0, 8))
+    region_options = list(FF5_REGION_URLS.keys())
+    region_var = _tk.StringVar(master=root, value=region_options[0])
+    region_menu = _ctk.CTkOptionMenu(add_box, values=region_options, variable=region_var, width=140)
+    region_menu.grid(row=1, column=5, sticky="w", padx=(0, 12), pady=(0, 8))
     btn_add = _ctk.CTkButton(add_box, text="Add", width=80)
-    btn_add.grid(row=1, column=4, sticky="w", padx=(0, 8), pady=(0, 8))
+    btn_add.grid(row=1, column=6, sticky="w", padx=(0, 8), pady=(0, 8))
+
+    def _auto_region_from_ticker(_event=None):
+        """Update the Region dropdown to the heuristic guess as the user types."""
+        try:
+            t = ent_new_ticker.get().strip().upper()
+            if t:
+                region_var.set(region_for_ticker(t))
+        except Exception:
+            pass
+
+    ent_new_ticker.bind("<KeyRelease>", _auto_region_from_ticker)
+    ent_new_ticker.bind("<FocusOut>", _auto_region_from_ticker)
 
     def _do_add():
         t = ent_new_ticker.get().strip().upper()
@@ -1663,11 +1821,28 @@ def _edit_holdings_dialog_ctk(
         except ValueError:
             _mb.showwarning("Add holding", "Units must be numeric.")
             return
+        # Persist the region choice into regions.json so the next pipeline run
+        # uses it. Skips if the user-selected region matches what region_for_ticker
+        # would have guessed anyway (no override needed for the heuristic case).
+        try:
+            picked = region_var.get().strip().upper()
+            heuristic = region_for_ticker(t)
+            if picked and picked in FF5_REGION_URLS and picked != heuristic:
+                current = _load_regions_json()
+                current[t] = picked
+                _save_regions_json(current)
+                USER_REGION_OVERRIDES[t] = picked
+                print(f"[region] Saved override: {t} -> {picked}")
+        except Exception as _e_save:
+            print(f"[region] Could not persist region choice for {t}: {_e_save}")
+
         _add_row(t, units_default=u, include_default=True, disabled=(t in exclude))
         _sync_units_state()
         added_tickers.append(t)
         ent_new_ticker.delete(0, "end")
         ent_new_units.delete(0, "end")
+        # Reset region picker to default
+        region_var.set(region_options[0])
 
     btn_add.configure(command=_do_add)
 
@@ -1967,7 +2142,13 @@ mu_vec_all = mu_vec_all.reindex(valid_all)
 # ------------------------------------------------------------
 # 5) FF5 helper functions
 # ------------------------------------------------------------
-def compute_ff5_betas(df_returns_wide: pd.DataFrame, ff5_returns: pd.DataFrame, min_obs: int = 120, n_lags: int = 1):
+def compute_ff5_betas(
+    df_returns_wide: pd.DataFrame,
+    ff5_returns: pd.DataFrame,
+    min_obs: int = 120,
+    n_lags: int = 1,
+    return_stats: bool = False,
+):
     """
     Estimate FF5+MOM betas per security via OLS with a Dimson (1979) correction for
     non-synchronous trading.
@@ -1978,11 +2159,17 @@ def compute_ff5_betas(df_returns_wide: pd.DataFrame, ff5_returns: pd.DataFrame, 
     ASX-listed ETFs close ~16h before the US market, so their same-day beta to US
     factors is spuriously near zero while the lagged term carries the real loading.
 
-    Returns: B (Dimson betas), alpha_daily, resid_var
+    When `return_stats=True`, also returns a per-security DataFrame of diagnostic stats
+    (n_obs, R², adj R², per-factor contemporaneous t-stats, alpha t-stat, residual σ).
+
+    Returns:
+        (B, alpha_daily, resid_var)                 when return_stats=False
+        (B, alpha_daily, resid_var, stats_df)       when return_stats=True
     """
     joined = df_returns_wide.join(ff5_returns, how="inner").dropna(how="any").sort_index()
     if joined.empty:
-        return None, None, None
+        empty_stats = pd.DataFrame() if return_stats else None
+        return (None, None, None, empty_stats) if return_stats else (None, None, None)
 
     securities = list(df_returns_wide.columns)
     factors = [c for c in ff5_returns.columns if c != "RF"]
@@ -2002,6 +2189,9 @@ def compute_ff5_betas(df_returns_wide: pd.DataFrame, ff5_returns: pd.DataFrame, 
     B = pd.DataFrame(index=securities, columns=factors, dtype=float)
     alpha_daily = pd.Series(index=securities, dtype=float)
     resid_var = pd.Series(index=securities, dtype=float)
+
+    # Diagnostic columns: filled per security when return_stats=True.
+    stats_rows = [] if return_stats else None
 
     for sec in securities:
         y = pd.to_numeric(joined[sec], errors="coerce")
@@ -2025,6 +2215,26 @@ def compute_ff5_betas(df_returns_wide: pd.DataFrame, ff5_returns: pd.DataFrame, 
                 beta_f += float(model.params.get(col, 0.0))
             B.loc[sec, f] = beta_f
 
+        if return_stats:
+            # tvalues is indexed by parameter name. Contemporaneous t-stat per factor
+            # is the right "is this factor significant?" sniff test even though the
+            # reported beta is the Dimson sum (contemporaneous + lags).
+            row = {
+                "Security": sec,
+                "N obs": int(model.nobs),
+                "R^2": float(model.rsquared),
+                "R^2 adj": float(model.rsquared_adj),
+                "alpha_daily": float(model.params.get("const", np.nan)),
+                "alpha_t": float(model.tvalues.get("const", np.nan)),
+                "resid_std_daily": float(np.sqrt(resid_var.loc[sec])) if pd.notna(resid_var.loc[sec]) else np.nan,
+            }
+            for f in factors:
+                row[f"{f}_t"] = float(model.tvalues.get(f, np.nan))
+            stats_rows.append(row)
+
+    if return_stats:
+        stats_df = pd.DataFrame(stats_rows).set_index("Security") if stats_rows else pd.DataFrame()
+        return B, alpha_daily, resid_var, stats_df
     return B, alpha_daily, resid_var
 
 
@@ -2036,6 +2246,7 @@ def compute_ff5_betas_multi_region(
     n_lags: int = 1,
     reference_region: str = "US",
     standardise_factors: bool = True,
+    return_stats: bool = False,
 ):
     """Compute FF5+MOM betas where each security is regressed against its home-region factor set.
 
@@ -2089,7 +2300,7 @@ def compute_ff5_betas_multi_region(
                 )
             )
 
-    B_parts, alpha_parts, resid_parts = [], [], []
+    B_parts, alpha_parts, resid_parts, stats_parts = [], [], [], []
     for region, secs in by_region.items():
         ff = regional_factors.get(region)
         if ff is None or ff.empty or not secs:
@@ -2100,17 +2311,34 @@ def compute_ff5_betas_multi_region(
                 if f in ff.columns:
                     ff[f] = ff[f] * mult
         sub = df_returns_wide[secs]
-        B_r, alpha_r, resid_r = compute_ff5_betas(sub, ff, min_obs=min_obs, n_lags=n_lags)
+        result = compute_ff5_betas(
+            sub, ff, min_obs=min_obs, n_lags=n_lags, return_stats=return_stats,
+        )
+        if return_stats:
+            B_r, alpha_r, resid_r, stats_r = result
+        else:
+            B_r, alpha_r, resid_r = result
+            stats_r = None
         if B_r is not None and not B_r.empty:
             B_parts.append(B_r)
         if alpha_r is not None:
             alpha_parts.append(alpha_r)
         if resid_r is not None:
             resid_parts.append(resid_r)
+        if return_stats and stats_r is not None and not stats_r.empty:
+            # Tag each row with the region it was regressed against — and whether
+            # this region's factors were rescaled to the reference vol.
+            stats_r = stats_r.copy()
+            stats_r.insert(0, "Region", region)
+            stats_r.insert(1, "Standardised", region in scaling)
+            stats_parts.append(stats_r)
 
     B = pd.concat(B_parts).reindex(securities) if B_parts else None
     alpha = pd.concat(alpha_parts).reindex(securities) if alpha_parts else None
     resid = pd.concat(resid_parts).reindex(securities) if resid_parts else None
+    if return_stats:
+        stats_df = pd.concat(stats_parts).reindex(securities) if stats_parts else pd.DataFrame()
+        return B, alpha, resid, stats_df
     return B, alpha, resid
 
 
@@ -2368,11 +2596,14 @@ USE_FF5 = True
 # Multi-region beta computation: each security regresses against its home-region
 # factor set (US / AP-ex-Japan / Japan). Aggregation across regions happens for
 # free via the tilt engine's portfolio-weighted sum — see Task #6 design notes.
-B, alpha_daily, resid_var = compute_ff5_betas_multi_region(
+# return_stats=True also captures per-security R², t-stats, alpha t, residual σ
+# for the Regression_Diagnostics Excel sheet (Task #7 Part A).
+B, alpha_daily, resid_var, ff5_regression_stats = compute_ff5_betas_multi_region(
     df_cov_wide,
     regional_factors=ff5_regional_windows,
     region_map=region_for_ticker,
     min_obs=120,
+    return_stats=True,
 )
 # Surface which region each security got regressed against — useful for
 # spotting unexpected ticker classifications in run.log.
@@ -3587,9 +3818,9 @@ def _write_holdings_sheet(wb, prices, units, include_flags,
         fx_to_aud_map = fx_to_aud_for_tickers(prices.columns, usd_aud)
 
     tickers_all = [
-        t for t in prices.columns 
+        t for t in prices.columns
         if t != "PortfolioValue"
-    ]    
+    ]
     last_px = prices.ffill().iloc[-1]
     rows = []
     units_s = pd.Series(units)
@@ -3603,7 +3834,7 @@ def _write_holdings_sheet(wb, prices, units, include_flags,
             "FX to AUD": float(pd.Series(fx_to_aud_map).get(t, 1.0)),
             "Market Value": 0.0,
             "Weight": 0.0,
-            "Include?": inc
+            "Include?": inc,
         })
     df = pd.DataFrame(rows)
 
@@ -4998,6 +5229,51 @@ if USE_XLWINGS:
             except Exception as _e_ff5_reg:
                 print(f"[excel] FF5F_Regional write skipped: {_e_ff5_reg}")
 
+            # Regression_Diagnostics sheet — per-security FF5+MOM regression stats
+            # for the user to sanity-check fit quality. Annualised alpha and resid σ
+            # are added for human-readable comparison against the asset μ values.
+            try:
+                _stats = globals().get("ff5_regression_stats", None)
+                if isinstance(_stats, pd.DataFrame) and not _stats.empty:
+                    _stats_out = _stats.copy()
+                    # Annualise the daily figures (compounding ignored — small-return regime).
+                    if "alpha_daily" in _stats_out.columns:
+                        _stats_out["alpha_annual"] = _stats_out["alpha_daily"] * TRADING_DAYS
+                    if "resid_std_daily" in _stats_out.columns:
+                        _stats_out["resid_std_annual"] = _stats_out["resid_std_daily"] * np.sqrt(TRADING_DAYS)
+                    # Friendly column order: bookkeeping first, fit quality, then per-factor t-stats,
+                    # then alpha block, then residual block.
+                    _factor_t_cols = [c for c in _stats_out.columns if c.endswith("_t") and c != "alpha_t"]
+                    _front = [c for c in ["Region", "Standardised", "N obs", "R^2", "R^2 adj"] if c in _stats_out.columns]
+                    _alpha_block = [c for c in ["alpha_daily", "alpha_annual", "alpha_t"] if c in _stats_out.columns]
+                    _resid_block = [c for c in ["resid_std_daily", "resid_std_annual"] if c in _stats_out.columns]
+                    _ordered = _front + _factor_t_cols + _alpha_block + _resid_block
+                    _stats_out = _stats_out[[c for c in _ordered if c in _stats_out.columns]]
+
+                    diag = get_or_clear_sheet(wb, 'Regression_Diagnostics')
+                    diag.range('A1').options(pd.DataFrame, index=True, header=True).value = _stats_out
+                    # Number formats: ratios 3dp, t-stats 2dp, alphas 2dp/2dp%.
+                    n_rows = _stats_out.shape[0] + 1  # +1 for header row
+                    _fmts = {}
+                    for col_name in ["R^2", "R^2 adj"]:
+                        if col_name in _stats_out.columns:
+                            col_letter = chr(ord("B") + list(_stats_out.columns).index(col_name))
+                            _fmts[f"{col_letter}2:{col_letter}{n_rows}"] = "0.000"
+                    for col_name in _factor_t_cols + (["alpha_t"] if "alpha_t" in _stats_out.columns else []):
+                        col_letter = chr(ord("B") + list(_stats_out.columns).index(col_name))
+                        _fmts[f"{col_letter}2:{col_letter}{n_rows}"] = "0.00"
+                    if "alpha_annual" in _stats_out.columns:
+                        col_letter = chr(ord("B") + list(_stats_out.columns).index("alpha_annual"))
+                        _fmts[f"{col_letter}2:{col_letter}{n_rows}"] = "0.00%"
+                    if "resid_std_annual" in _stats_out.columns:
+                        col_letter = chr(ord("B") + list(_stats_out.columns).index("resid_std_annual"))
+                        _fmts[f"{col_letter}2:{col_letter}{n_rows}"] = "0.00%"
+                    set_number_formats(diag, _fmts)
+                    diag.autofit()
+                    print(f"[excel] Regression_Diagnostics: {len(_stats_out)} securities written")
+            except Exception as _e_diag:
+                print(f"[excel] Regression_Diagnostics write skipped: {_e_diag}")
+
             # ---- Update Lots and overwrite Holdings with target units (for next run) ----
             UPDATED_LOTS = _update_lots_after_trades(lots_df, trade_rec, pd.Timestamp(prices.index[-1]), fx_map_all)
             sht_lots = get_or_clear_sheet(wb, 'Lots')
@@ -5496,6 +5772,27 @@ def _format_perf_value(v, fmt="pct2"):
     return str(fv)
 
 
+def _add_date_callout(slide, start_dt, end_dt, prefix: str = "Data"):
+    """Add a left-aligned white callout under the slide title showing the data window.
+    Makes it impossible to mis-read the chart's date range — Slide 3 anchors to live
+    portfolio end, Slide 4 anchors to FF data end, and these may differ by ~1 month."""
+    try:
+        tb = slide.shapes.add_textbox(Cm(2.032), Cm(1.92), Cm(21.5), Cm(0.7))
+        tf = tb.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        p.text = (
+            f"{prefix}: {pd.Timestamp(start_dt).strftime('%d %b %Y')}"
+            f"  →  {pd.Timestamp(end_dt).strftime('%d %b %Y')}"
+        )
+        p.font.size = Pt(11)
+        p.font.italic = True
+        p.font.color.rgb = RGBColor(255, 255, 255)
+        p.alignment = PP_ALIGN.LEFT
+    except Exception as _e:
+        print(f"[pptx] Date callout skipped: {_e}")
+
+
 def _add_perf_table(slide, df_metrics, left, top, width, height,
                     title=None, value_fmt="pct2", font_pt=11):
     """Add a formatted PPT table from a DataFrame. Values formatted per `value_fmt`."""
@@ -5822,13 +6119,14 @@ def export_to_ppt(results, trades, charts=None):
 
         slide_layout = prs.slide_layouts[20]  # clean layout from your master
         slide = prs.slides.add_slide(slide_layout)
-        
+
         # Title
         if slide.shapes.title:
             slide.shapes.title.text = "Portfolio Performance"
-        
+
         # --- Get 3-month portfolio + benchmarks ---
         lookback_days = 90
+        slide3 = slide  # alias for clarity in the callout call below
         
         # Use the portfolio value series as the date anchor (NOT prices)
         pval_src = globals().get("portfolio_value_series", None)
@@ -5841,7 +6139,10 @@ def export_to_ppt(results, trades, charts=None):
         
         end_dt = pval_all.index.max()
         start_dt = end_dt - pd.Timedelta(days=lookback_days)
-        
+
+        # Date callout under the slide title — Slide 3 anchors to LIVE portfolio end.
+        _add_date_callout(slide3, start_dt, end_dt, prefix="Data")
+
         pval = pval_all.loc[start_dt:end_dt].copy()
         pval = pval.ffill().bfill()
         
@@ -5933,14 +6234,20 @@ def export_to_ppt(results, trades, charts=None):
         # --- Plot ---
         fig, ax = plt.subplots(figsize=(7, 4.5))
         perf_df.mul(100).plot(ax=ax, linewidth=1.8)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
-        ax.tick_params(axis="x", labelsize=8, rotation=30)
-        for lbl in ax.get_xticklabels():
-            lbl.set_rotation(90)
-            lbl.set_ha("center")
-            lbl.set_va("top")
-        fig.subplots_adjust(bottom=0.25)
-        
+        # Lock the x-axis to the actual data range so callout date and chart
+        # x-axis agree. Without this, matplotlib's auto date-locator picks
+        # ticks that don't reflect the real data span.
+        ax.set_xlim(perf_df.index.min(), perf_df.index.max())
+        # Monthly major ticks + a couple of minor ticks per month — fewer
+        # labels, but each one is unambiguous.
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_minor_locator(mdates.DayLocator(bymonthday=(15,)))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+        ax.xaxis.set_minor_formatter(mdates.DateFormatter("%d"))
+        ax.tick_params(axis="x", which="major", labelsize=9, rotation=0)
+        ax.tick_params(axis="x", which="minor", labelsize=7, rotation=0, colors="#888888")
+        fig.subplots_adjust(bottom=0.22)
+
         ax.set_title("Portfolio vs ASX, S&P 500, NASDAQ (3-Month Performance)")
         ax.set_ylabel("Return (%)")
         ax.legend(loc="upper left", frameon=False)
@@ -6097,6 +6404,10 @@ def export_to_ppt(results, trades, charts=None):
             window_start_chart = common_end - relativedelta(months=3, days=10)
             ffd_chart = ffd.loc[window_start_chart:common_end]
             port_r_chart = port_r.loc[window_start_chart:common_end]
+
+            # Date callout under the slide title — Slide 4 anchors to the FF data end
+            # (~1mo behind live), so everything on this slide should reference common_end.
+            _add_date_callout(slide4, window_start_chart, common_end, prefix="Data (FF-anchored)")
             
             # Choose a small set to chart (readable)
             series_to_show = []
@@ -6123,6 +6434,20 @@ def export_to_ppt(results, trades, charts=None):
             ax.margins(x=0)
             if not ret.empty:
                 ax.set_xlim(ret.index.min(), ret.index.max())
+
+            # Explicit end-date annotation in the chart bottom-right so the FF lag
+            # (~1 month behind live) is impossible to miss.
+            try:
+                ax.annotate(
+                    f"End: {pd.Timestamp(common_end).strftime('%d %b %Y')}",
+                    xy=(0.99, 0.02), xycoords="axes fraction",
+                    ha="right", va="bottom",
+                    fontsize=9, color="#404040", style="italic",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                              edgecolor="#bbbbbb", alpha=0.85),
+                )
+            except Exception:
+                pass
             _ff_buf = io.BytesIO()
             fig.savefig(_ff_buf, format="png", bbox_inches="tight")
             plt.close(fig)
@@ -6135,20 +6460,21 @@ def export_to_ppt(results, trades, charts=None):
             slide4.shapes.add_picture(_ff_buf, chart_left, chart_top, width=chart_w, height=chart_h)
             
             # Table: 3M/6M/12M/3Y (compounded) using available daily points.
-            # FF factor rows are anchored to the FF data's last date (~1mo lag).
-            # The Portfolio row is anchored to the *live* portfolio end date
-            # (same anchor Slide 3 uses) so "3M" means the same window on both
-            # slides — see Task #8 in the pending-work memory.
-            end_dt_tbl = tbl_df.index.max()  # FF-data-capped end date for factor rows
-            portfolio_end_dt = port_px.dropna().index.max() if not port_px.dropna().empty else end_dt_tbl
+            # ALL rows — including Portfolio — anchor to the FF data end so the
+            # table is internally consistent with the FF-anchored chart above.
+            # Previously the Portfolio row used the live end date and the factor
+            # rows used the FF end, which made values incomparable (e.g. 9.43%
+            # Portfolio 3M against 3.09% Mkt-RF 3M because they covered different
+            # 90-day windows). Slide 3 still reports live-end performance.
+            end_dt_tbl = tbl_df.index.max()
             rows = {}
             for name in tbl_df.columns:
                 if name == "Portfolio":
                     rows[name] = [
-                        _period_total_return(port_px, portfolio_end_dt, months=3),
-                        _period_total_return(port_px, portfolio_end_dt, months=6),
-                        _period_total_return(port_px, portfolio_end_dt, months=12),
-                        _period_total_return(port_px, portfolio_end_dt, years=3),
+                        _period_total_return(port_px, end_dt_tbl, months=3),
+                        _period_total_return(port_px, end_dt_tbl, months=6),
+                        _period_total_return(port_px, end_dt_tbl, months=12),
+                        _period_total_return(port_px, end_dt_tbl, years=3),
                     ]
                 else:
                     rr = tbl_df[name]
