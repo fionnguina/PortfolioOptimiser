@@ -132,6 +132,10 @@ _DEFAULTS = {
     "use_xlwings": True,
     "open_excel_after_save": True,
     "open_ppt_after_save": True,
+    # OOS validation: walk-forward backtest + roadshow slide. Default ON so
+    # every build refreshes the OOS_Validation sheet and the executive-summary
+    # slide. Set to False in config.json to skip (saves ~5–10s per run).
+    "oos_validation": True,
 }
 
 # ---------------------------------------------------------------------
@@ -207,33 +211,375 @@ user_opts = {}
 # ---------------------------------------------------------------------
 
 # Constants
-TRADE_PLAN_MODE = "ask"  # Options: "ask", "auto", "no_tilts", "with_tilts"
+TRADE_PLAN_MODE = "ask"  # Options: "ask", "auto", "no_tilts", "with_tilts", "ensemble"
 VALIDATION_LOOKBACK_DAYS = 252  # 1 year of daily data
 ANNUAL_TRADING_DAYS = 252  # For Sharpe calculation
 
 
+# ============================================================================
+# BROKER TRANSACTION COST MODEL
+# ----------------------------------------------------------------------------
+# Each profile carries BOTH the OOS-backtest cost model (flat fee + spread bps
+# + FX bps) AND the live trade-plan brokerage model (min_fee + % rate). Switch
+# brokers by changing ACTIVE_BROKER_PROFILE — backtest and live stay in sync.
+# All bps values are in basis points (5 = 5 bps = 0.05% = 0.0005 fraction).
+# All AUD fee values are in dollars.
+# ============================================================================
+BROKER_PROFILES = {
+    "cmc_markets": {
+        "name":            "CMC Markets",
+        # OOS backtest cost model
+        "au_flat_fee_aud": 11.0,    # CMC: $11 min on AU equity / ETF
+        "us_flat_fee_aud":  0.0,    # CMC: $0 fixed on US (FX is separate)
+        "au_spread_bps":   5.0,
+        "us_spread_bps":   5.0,
+        "fx_spread_bps":  10.0,     # CMC AUD↔USD conversion
+        # Live trade-plan brokerage
+        "live_asx_min_fee":               11.0,
+        "live_asx_rate":                  0.0010,   # 0.10%
+        "live_asx_first_buy_free_thresh": 1000.0,   # CMC <$1k first-buy promo
+        "live_us_min_fee":                 0.0,
+        "live_us_rate":                    0.0,
+    },
+    "ibkr_pro_au": {
+        "name":            "Interactive Brokers (Pro AU)",
+        # OOS backtest cost model
+        # IBKR Tiered: AU 0.08% min AUD 5.00; US USD 0.0035/share min USD 1.00
+        "au_flat_fee_aud":  5.0,    # min binds for trades <~AUD 6.25k
+        "us_flat_fee_aud":  1.5,    # USD $1 min ≈ AUD $1.50 (conservative)
+        "au_spread_bps":    3.0,    # Smart order routing tighter than retail
+        "us_spread_bps":    3.0,
+        "fx_spread_bps":    0.5,    # IDEALPRO ~0.2 bps + USD $2 min commission
+        # Live trade-plan brokerage
+        "live_asx_min_fee":               5.0,
+        "live_asx_rate":                  0.0008,   # 0.08% IBKR Tiered
+        "live_asx_first_buy_free_thresh": 0.0,      # No free-trade promo
+        "live_us_min_fee":                1.5,
+        "live_us_rate":                   0.0002,   # ~2 bps avg (USD 0.0035/share, ETF universe)
+    },
+}
+
+# Switch broker here. BROKER_CONFIG + downstream BROKERAGE follow automatically.
+ACTIVE_BROKER_PROFILE = "ibkr_pro_au"
+BROKER_CONFIG = BROKER_PROFILES[ACTIVE_BROKER_PROFILE].copy()
+
+
+# ============================================================================
+# CAPITAL GAINS TAX MODEL (Australian rules)
+# ----------------------------------------------------------------------------
+# Used by the OOS backtest to produce NET-of-tax returns. When the user's
+# marginal tax bracket changes, or AU budget passes new CGT legislation,
+# update THIS BLOCK only — everything downstream picks it up.
+#
+# Current AU rules applied:
+#   • Marginal tax rate (MTR) applies to net taxable capital gain
+#   • 50% discount on gains from assets held >= 365 days
+#   • Within-rebalance loss offset (ST losses offset ST gains first, then
+#     spill over to LT gains, and vice versa)
+#   • Carry-forward losses NOT modelled here (within-rebalance only) — TODO
+#
+# Future budget changes can be modelled by editing fields below (e.g. if the
+# 50% discount is reduced to 40%, set lt_discount_rate = 0.40).
+# ============================================================================
+CGT_PROFILES = {
+    "personal_30pc": {
+        "marginal_tax_rate":   0.30,
+        "medicare_levy":       0.02,
+        "include_medicare":    True,
+        "lt_discount_rate":    0.50,
+        "lt_holding_days":     365,
+        "description":         "Personal name, 30% MTR + 2% Medicare (user's current bracket)",
+    },
+    "personal_45pc": {
+        "marginal_tax_rate":   0.45,
+        "medicare_levy":       0.02,
+        "include_medicare":    True,
+        "lt_discount_rate":    0.50,
+        "lt_holding_days":     365,
+        "description":         "Personal name, top AU bracket + Medicare",
+    },
+    "trust_30pc": {
+        "marginal_tax_rate":   0.30,
+        "medicare_levy":       0.02,
+        "include_medicare":    True,
+        "lt_discount_rate":    0.50,
+        "lt_holding_days":     365,
+        "description":         "Family trust, distributed to single 30% bracket beneficiary",
+    },
+    "trust_split": {
+        # Assumes optimal distribution across multiple lower-bracket beneficiaries
+        # (e.g. spouse on 19%, kids on 0% up to threshold). Effective avg ~20%.
+        "marginal_tax_rate":   0.20,
+        "medicare_levy":       0.02,
+        "include_medicare":    True,
+        "lt_discount_rate":    0.50,
+        "lt_holding_days":     365,
+        "description":         "Family trust, optimally split across beneficiaries (~20% avg MTR)",
+    },
+}
+
+# Switch profile here. CGT_CONFIG follows automatically.
+ACTIVE_CGT_PROFILE = "personal_30pc"
+CGT_CONFIG = CGT_PROFILES[ACTIVE_CGT_PROFILE].copy()
+
+
+# ============================================================================
+# REBALANCE FREQUENCY
+# ----------------------------------------------------------------------------
+# Drives how often the OOS engine (and live recommendation cadence) rebalances.
+# Use pandas freq aliases:
+#   "MS"  = month start  → 12 rebalances/year (default)
+#   "QS"  = quarter start →  4 rebalances/year (more LT discount eligibility)
+#   "6W"  = every 6 weeks →  ~8.7 rebalances/year (split-the-difference)
+#   "YS"  = year start   →  1 rebalance/year (most tax efficient, least responsive)
+# Lower frequency = lower brokerage + more LT-eligible CGT discount, but slower
+# regime adaptation (misses fast events like 2020 COVID).
+# ============================================================================
+REBALANCE_FREQ = "6W"
+REBALANCES_PER_YEAR = {"MS": 12, "QS": 4, "6W": 8.67, "YS": 1}.get(REBALANCE_FREQ, 12)
+
+
+# ============================================================================
+# CONDITIONAL REBALANCING (Q2)
+# ----------------------------------------------------------------------------
+# Layered on top of the scheduled REBALANCE_FREQ cadence to reduce turnover-
+# driven CGT drag (currently ~250 bps/yr at 6W cadence) without sacrificing
+# regime responsiveness.
+#
+#   SKIP_REBAL_DELTA          Skip a scheduled rebalance if the target weight
+#                             change |Δw|.sum() < this threshold. Saves the
+#                             cost of tiny re-trims that don't move the needle.
+#                             Set to 0.0 to disable.
+#
+#   EARLY_TRIGGER_DD_DEEPEN   Force an early rebalance between scheduled dates
+#                             when SPY drawdown deepens by more than this from
+#                             the last executed rebalance. Set to 0.0 to disable.
+#
+#   EARLY_TRIGGER_MIN_DAYS    Minimum gap (calendar days) between an executed
+#                             rebalance and an early-trigger insertion — avoids
+#                             noise-driven trigger stacking.
+# ============================================================================
+SKIP_REBAL_DELTA          = 0.03   # 3% summed |Δw|
+EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
+EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
+
+
+def _effective_cgt_rate(short_term: bool = True, cfg: dict | None = None) -> float:
+    """Effective tax rate on a $1 of capital gain.
+    Short-term: full MTR (+ medicare if enabled).
+    Long-term:  full rate × (1 - discount).
+    """
+    if cfg is None:
+        cfg = CGT_CONFIG
+    base = float(cfg["marginal_tax_rate"])
+    if cfg.get("include_medicare", True):
+        base += float(cfg["medicare_levy"])
+    if short_term:
+        return base
+    return base * (1.0 - float(cfg["lt_discount_rate"]))
+
+
+class LotBook:
+    """Tracks FIFO lots per ticker for CGT calculation.
+
+    Each lot stores: acquisition date, units, cost basis per unit.
+    On sell: matches oldest lots first (FIFO), classifies each parcel as
+    short-term (< 365 days) or long-term, and returns realised gains/losses
+    broken down by category. On buy: appends a new lot.
+    """
+    def __init__(self):
+        self.lots: dict[str, list[dict]] = {}
+
+    def buy(self, ticker: str, units: float, date, price: float) -> None:
+        if units <= 0 or not np.isfinite(units):
+            return
+        self.lots.setdefault(ticker, []).append({
+            "date": pd.Timestamp(date),
+            "units": float(units),
+            "cost_basis_per_unit": float(price),
+        })
+
+    def sell(self, ticker: str, units: float, date, price: float,
+             cfg: dict | None = None) -> dict:
+        """FIFO sale. Returns dict with ST/LT realised gain & loss components."""
+        if cfg is None:
+            cfg = CGT_CONFIG
+        lt_threshold = int(cfg["lt_holding_days"])
+        out = {"st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0}
+        if ticker not in self.lots or not self.lots[ticker] or units <= 0:
+            return out
+
+        sale_date = pd.Timestamp(date)
+        remaining = float(units)
+        new_lots = []
+        for lot in self.lots[ticker]:
+            if remaining <= 1e-9:
+                new_lots.append(lot)
+                continue
+            qty = min(lot["units"], remaining)
+            proceeds = qty * float(price)
+            cost_base = qty * lot["cost_basis_per_unit"]
+            gain = proceeds - cost_base
+            hold_days = (sale_date - lot["date"]).days
+            is_lt = hold_days >= lt_threshold
+
+            if gain >= 0:
+                if is_lt:
+                    out["lt_gain"] += gain
+                else:
+                    out["st_gain"] += gain
+            else:
+                if is_lt:
+                    out["lt_loss"] += -gain
+                else:
+                    out["st_loss"] += -gain
+
+            remaining -= qty
+            if qty < lot["units"]:
+                new_lots.append({
+                    "date": lot["date"],
+                    "units": lot["units"] - qty,
+                    "cost_basis_per_unit": lot["cost_basis_per_unit"],
+                })
+
+        self.lots[ticker] = new_lots
+        return out
+
+    def units(self, ticker: str) -> float:
+        """Current units held."""
+        return float(sum(lot["units"] for lot in self.lots.get(ticker, [])))
+
+
+def compute_cgt_for_rebalance(realised: dict, cfg: dict | None = None) -> float:
+    """Tax owed on a single rebalance's realised gains, with within-rebalance
+    loss offset. Long-term gains discounted before tax. Returns AUD tax.
+    """
+    if cfg is None:
+        cfg = CGT_CONFIG
+    st_gain = float(realised.get("st_gain", 0.0))
+    lt_gain = float(realised.get("lt_gain", 0.0))
+    st_loss = float(realised.get("st_loss", 0.0))
+    lt_loss = float(realised.get("lt_loss", 0.0))
+
+    # 1) Net within each category
+    st_net = st_gain - st_loss   # may be negative
+    lt_net = lt_gain - lt_loss
+
+    # 2) Cross-offset: if one side is negative (net loss), it can reduce the
+    #    other side's positive gain. This is the AU rule for the same FY.
+    if st_net < 0 and lt_net > 0:
+        offset = min(lt_net, -st_net)
+        lt_net -= offset
+        st_net += offset
+    if lt_net < 0 and st_net > 0:
+        offset = min(st_net, -lt_net)
+        st_net -= offset
+        lt_net += offset
+
+    # 3) Apply rates to remaining positive net gains
+    tax = 0.0
+    if st_net > 0:
+        tax += st_net * _effective_cgt_rate(short_term=True, cfg=cfg)
+    if lt_net > 0:
+        tax += lt_net * _effective_cgt_rate(short_term=False, cfg=cfg)
+    return float(tax)
+
+
+def _is_us_ticker(t) -> bool:
+    """A US-listed security: no '.AX' suffix and not an index symbol."""
+    s = str(t)
+    return not s.endswith(".AX") and not s.startswith("^")
+
+
+def estimate_rebalance_cost_fraction(
+    w_old: pd.Series,
+    w_new: pd.Series,
+    portfolio_value_aud: float = 1_000_000.0,
+    broker_cfg: dict | None = None,
+) -> float:
+    """Total cost of rebalancing from w_old to w_new, as a FRACTION of NAV.
+
+    Returns e.g. 0.0023 for a 23-bps drag. Subtract this from the realised
+    return on the rebalance day to model net-of-cost performance.
+
+    Components:
+      1. Fixed per-trade fees (AU $11 etc.) — scaled by NAV (small trades hurt
+         small portfolios more, become negligible at scale)
+      2. Bid/ask spread cost — bps × trade value (delta weight × NAV)
+      3. FX one-way conversion cost — bps × US trade value
+    """
+    if broker_cfg is None:
+        broker_cfg = BROKER_CONFIG
+
+    tickers = sorted(set(w_old.index).union(w_new.index))
+    delta = (w_new.reindex(tickers).fillna(0.0) -
+             w_old.reindex(tickers).fillna(0.0)).abs()
+
+    n_au_trades = int(sum(1 for t in tickers if delta[t] > 1e-6 and not _is_us_ticker(t)))
+    n_us_trades = int(sum(1 for t in tickers if delta[t] > 1e-6 and     _is_us_ticker(t)))
+    au_turnover = float(sum(delta[t] for t in tickers if not _is_us_ticker(t)))
+    us_turnover = float(sum(delta[t] for t in tickers if     _is_us_ticker(t)))
+
+    # 1. Fixed fees (AUD) as fraction of portfolio
+    fixed_cost = (n_au_trades * float(broker_cfg["au_flat_fee_aud"]) +
+                  n_us_trades * float(broker_cfg["us_flat_fee_aud"])
+                  ) / max(float(portfolio_value_aud), 1.0)
+
+    # 2. Spread costs (decimal)
+    spread_cost = (au_turnover * float(broker_cfg["au_spread_bps"]) / 10_000.0 +
+                   us_turnover * float(broker_cfg["us_spread_bps"]) / 10_000.0)
+
+    # 3. FX cost (decimal, one-way per US trade)
+    fx_cost = us_turnover * float(broker_cfg["fx_spread_bps"]) / 10_000.0
+
+    return float(fixed_cost + spread_cost + fx_cost)
+
+
 def ask_tradeplan_portfolio_choice() -> str:
     """
-    Prompt user to choose between 'with_tilts' or 'no_tilts' portfolio.
+    Prompt user to choose between 'ensemble', 'with_tilts' or 'no_tilts'.
 
     Returns:
-        str: "with_tilts" or "no_tilts"
+        str: "ensemble", "with_tilts" or "no_tilts"
     """
     try:
         import tkinter as tk
-        from tkinter import messagebox as mb
         root = tk.Tk()
-        root.withdraw()
-        use_tilts = mb.askyesno(
-            "Trade Plan Portfolio",
-            "Use WITH TILTS portfolio for the trade plan?\n\n"
-            "Yes = With Tilts\n"
-            "No  = Optimised (No Tilts)"
-        )
-        root.destroy()
-        return "with_tilts" if use_tilts else "no_tilts"
+        root.title("Trade Plan Portfolio")
+        # Centre and size the dialog
+        root.geometry("420x230")
+        root.resizable(False, False)
+        choice = {"value": "ensemble"}
+
+        tk.Label(root,
+                 text="Which portfolio drives the trade plan?",
+                 font=("Arial", 11, "bold")).pack(pady=(18, 8))
+        tk.Label(root,
+                 text="Ensemble — regime-adaptive blend (recommended)\n"
+                      "With Tilts — factor-target portfolio\n"
+                      "Optimised — pure max-Sharpe tangency",
+                 font=("Arial", 9), justify="left").pack(pady=(0, 12))
+
+        btn = tk.Frame(root)
+        btn.pack(pady=4)
+
+        def _pick(val):
+            choice["value"] = val
+            root.quit()
+            root.destroy()
+
+        tk.Button(btn, text="Ensemble", width=12, default="active",
+                  command=lambda: _pick("ensemble")).pack(side="left", padx=4)
+        tk.Button(btn, text="With Tilts", width=12,
+                  command=lambda: _pick("with_tilts")).pack(side="left", padx=4)
+        tk.Button(btn, text="Optimised", width=12,
+                  command=lambda: _pick("no_tilts")).pack(side="left", padx=4)
+
+        root.protocol("WM_DELETE_WINDOW", lambda: _pick("ensemble"))
+        root.mainloop()
+        return choice["value"]
     except Exception:
-        return "no_tilts"  # Safe fallback
+        return "ensemble"  # Safe fallback — ensemble is the recommended live engine
 
 
 def build_trade_plan_from_units(
@@ -355,10 +701,13 @@ def choose_portfolio_for_tradeplan(
     w_no_tilts: pd.Series,
     w_with_tilts: pd.Series,
     rf_annual: float,
-    lookback_days: int = VALIDATION_LOOKBACK_DAYS
+    lookback_days: int = VALIDATION_LOOKBACK_DAYS,
+    w_ensemble: pd.Series | None = None,
 ) -> tuple[str, pd.Series, dict]:
     """
     Choose portfolio based on Sharpe ratio over lookback period.
+    With w_ensemble provided, compares THREE candidates and picks the highest
+    Sharpe — typically the ensemble wins because it's regime-adaptive.
 
     Returns:
         (choice, weights, diagnostics)
@@ -367,24 +716,44 @@ def choose_portfolio_for_tradeplan(
 
     w0 = w_no_tilts.reindex(r.columns).fillna(0.0)
     w1 = w_with_tilts.reindex(r.columns).fillna(0.0)
+    we = (w_ensemble.reindex(r.columns).fillna(0.0)
+          if isinstance(w_ensemble, pd.Series) and not w_ensemble.empty
+          else None)
 
     # Normalize weights
     for w in [w0, w1]:
         w_sum = w.sum()
         if w_sum != 0:
             w /= w_sum
+    if we is not None:
+        we_sum = we.sum()
+        if we_sum != 0:
+            we /= we_sum
 
     p0 = (r @ w0).dropna()
     p1 = (r @ w1).dropna()
+    pe = (r @ we).dropna() if we is not None else pd.Series(dtype=float)
 
     sh0 = _annualized_sharpe(p0, rf_annual)
     sh1 = _annualized_sharpe(p1, rf_annual)
+    she = _annualized_sharpe(pe, rf_annual) if not pe.empty else np.nan
 
-    diag = {"sharpe_no_tilts": sh0, "sharpe_with_tilts": sh1}
+    diag = {"sharpe_no_tilts": sh0, "sharpe_with_tilts": sh1, "sharpe_ensemble": she}
 
-    if np.isfinite(sh1) and (not np.isfinite(sh0) or sh1 > sh0):
-        return "with_tilts", w1, diag
-    return "no_tilts", w0, diag
+    candidates = []
+    if np.isfinite(she) and we is not None:
+        candidates.append(("ensemble", we, she))
+    if np.isfinite(sh1):
+        candidates.append(("with_tilts", w1, sh1))
+    if np.isfinite(sh0):
+        candidates.append(("no_tilts", w0, sh0))
+
+    if not candidates:
+        return "no_tilts", w0, diag
+    # Stable sort: highest Sharpe wins, ties broken by entry order (ensemble first).
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    choice, w_chosen, _ = candidates[0]
+    return choice, w_chosen, diag
 
 # ---------------------------------------------------------------------
 # Main Configuration Binding
@@ -736,15 +1105,19 @@ def _last_numeric(series: pd.Series) -> float:
     return float(v)
 
 def get_usd_aud_fx(default: float = 1.50) -> float:
-    """Get latest USD/AUD FX rate from global 'fx' series."""
+    """Get latest USD/AUD FX rate from the live `fx_usdaud` series.
+
+    Reads the most recent valid value from the global FX series built at
+    startup (line ~1309). Falls back to `default` only if that series is
+    missing or empty (e.g. yfinance fetch failed). Previously read from a
+    non-existent global named `fx`, so this always returned the default.
+    """
     try:
-        if "fx" in globals():
-            series = globals()["fx"]
-            if isinstance(series, pd.DataFrame):
-                s = series.iloc[:, 0]
-            else:
-                s = series
-            s = pd.to_numeric(s, errors="coerce").dropna()
+        series = globals().get("fx_usdaud")
+        if isinstance(series, pd.DataFrame):
+            series = series.iloc[:, 0]
+        if isinstance(series, pd.Series):
+            s = pd.to_numeric(series, errors="coerce").dropna()
             if not s.empty:
                 last = _last_numeric(s)
                 if last > 0:
@@ -1563,15 +1936,20 @@ def _edit_holdings_dialog_ttk(
         globals()["OPEN_EXCEL_AFTER_SAVE"] = bool(open_excel_var.get())
         globals()["OPEN_PPT_AFTER_SAVE"] = bool(open_ppt_var.get())
 
-        # Trade-plan portfolio choice.
-        # In Jupyter, modal messageboxes can freeze some kernels, so use deterministic fallback.
-        if "ipykernel" in sys.modules:
-            globals()["TRADE_PLAN_MODE"] = "with_tilts"
+        # Trade-plan portfolio choice. Respect an existing "auto" override
+        # (set at file top) — that means the user wants the engine to decide
+        # via Sharpe each run, not to be re-prompted here.
+        _existing_mode = str(globals().get("TRADE_PLAN_MODE", "")).lower().strip()
+        if _existing_mode == "auto":
+            pass  # leave as-is; downstream auto-picker handles selection
+        elif "ipykernel" in sys.modules:
+            # Jupyter: modal messageboxes can freeze some kernels — use safe default.
+            globals()["TRADE_PLAN_MODE"] = "ensemble"
         else:
             if "ask_tradeplan_portfolio_choice" in globals():
                 globals()["TRADE_PLAN_MODE"] = ask_tradeplan_portfolio_choice()
             else:
-                globals()["TRADE_PLAN_MODE"] = "with_tilts"
+                globals()["TRADE_PLAN_MODE"] = "ensemble"
 
         portfolio_value_override = None
         if bool(use_portfolio_value.get()):
@@ -1962,13 +2340,17 @@ def _edit_holdings_dialog_ctk(
         globals()["OPEN_EXCEL_AFTER_SAVE"] = bool(open_excel_var.get())
         globals()["OPEN_PPT_AFTER_SAVE"] = bool(open_ppt_var.get())
 
-        if "ipykernel" in sys.modules:
-            globals()["TRADE_PLAN_MODE"] = "with_tilts"
+        # Respect "auto" override — same logic as the other save handler.
+        _existing_mode = str(globals().get("TRADE_PLAN_MODE", "")).lower().strip()
+        if _existing_mode == "auto":
+            pass
+        elif "ipykernel" in sys.modules:
+            globals()["TRADE_PLAN_MODE"] = "ensemble"
         else:
             if "ask_tradeplan_portfolio_choice" in globals():
                 globals()["TRADE_PLAN_MODE"] = ask_tradeplan_portfolio_choice()
             else:
-                globals()["TRADE_PLAN_MODE"] = "with_tilts"
+                globals()["TRADE_PLAN_MODE"] = "ensemble"
 
         portfolio_value_override = None
         if bool(use_portfolio_value.get()):
@@ -2694,6 +3076,141 @@ cov_plus.iloc[:n_opt, :n_opt] = Sigma_opt.values
 exp_ret_df = mu_vec_opt.rename(exp_ret_label).to_frame()
 
 
+def _refresh_ff5_universe_after_dialog(new_prices: pd.DataFrame) -> None:
+    """Re-run FF5 regression + Sigma_opt build when the dialog added new tickers.
+
+    Called from the post-dialog handler when `prices.columns` has expanded
+    beyond the original FF5 universe (e.g. user added NDQ.AX via the dialog).
+    Updates module-level globals so downstream OPT / trade-plan / Excel / PPT
+    paths see one consistent universe — the dialog is now the source of truth.
+
+    Idempotent: if no new tickers detected vs current B.index, returns early.
+    """
+    g = globals()
+    px_cols = [c for c in new_prices.columns if c != "PortfolioValue"]
+    existing_B = g.get("B", pd.DataFrame())
+    existing_idx = set(existing_B.index) if isinstance(existing_B, pd.DataFrame) else set()
+    new_tickers = sorted(set(px_cols) - existing_idx)
+    if not new_tickers:
+        return
+
+    print(f"[ff5-refresh] Dialog added new tickers: {new_tickers}. "
+          f"Re-running FF5 regression + universe build.")
+
+    # 1) Rebuild df_cov_wide on the expanded prices (FX-adjust USD tickers to AUD).
+    px = new_prices.copy()
+    px = px.drop(columns=[c for c in ["PortfolioValue"] if c in px.columns], errors="ignore")
+    _fx_aud = g.get("fx_audusd")
+    if isinstance(_fx_aud, pd.Series) and not _fx_aud.empty:
+        usd_cols = [c for c in px.columns
+                    if not str(c).endswith(".AX") and not str(c).startswith("^")]
+        fx_reidx = _fx_aud.reindex(px.index).ffill()
+        if usd_cols:
+            px.update(px.loc[:, usd_cols].mul(fx_reidx, axis=0))
+    px = px.ffill().bfill()
+    rets_w = px.pct_change()
+    rets_w = rets_w.where(rets_w.abs() <= RETURN_OUTLIER_THRESHOLD).dropna(how="any")
+    df_cov_wide_new = rets_w
+
+    # 2) Ensure ff5_regional_windows has data for every region required.
+    ff5_rw = dict(g.get("ff5_regional_windows", {}))
+    for t in new_tickers:
+        r = region_for_ticker(t)
+        if r and r not in ff5_rw and r in FF5_REGION_URLS:
+            try:
+                raw_r = _safe_load_region(r)
+                ff5_rw[r] = raw_r.tail(FF5_BETA_WINDOW_DAYS)
+                print(f"[ff5-refresh] Loaded factor window for region '{r}'.")
+            except Exception as _e:
+                print(f"[ff5-refresh] Could not load region '{r}': {_e}")
+    g["ff5_regional_windows"] = ff5_rw
+
+    # 3) Re-run FF5 regression on the expanded universe.
+    B_new, alpha_daily_new, resid_var_new, ff5_stats_new = compute_ff5_betas_multi_region(
+        df_cov_wide_new,
+        regional_factors=ff5_rw,
+        region_map=region_for_ticker,
+        min_obs=120,
+        return_stats=True,
+    )
+    if B_new is None or B_new.empty:
+        print("[ff5-refresh] FF5 regression yielded no betas; keeping original universe.")
+        return
+
+    # 4) Rebuild factor-implied Σ + μ — mirrors the module-level FF5 block recipe.
+    ff_aud_new = get_ff5_mom_aud(g.get("ff5_raw"), g.get("fx_ret"))
+    ff5_win = ff_aud_new.tail(WINDOW)
+    fac_cols = [c for c in ff5_win.columns if c != "RF"]
+
+    Fcov_daily_new = ff5_win[fac_cols].cov()
+    _mu_long = ff_aud_new[fac_cols].tail(FACTOR_MU_LONG_DAYS).mean() * TRADING_DAYS
+    _mu_recent = ff_aud_new[fac_cols].tail(FACTOR_MU_RECENT_DAYS).mean() * TRADING_DAYS
+    f_mean_ann_new = (1.0 - FACTOR_MU_RECENT_WEIGHT) * _mu_long + FACTOR_MU_RECENT_WEIGHT * _mu_recent
+
+    alpha_ann_new = pd.to_numeric(alpha_daily_new, errors="coerce").fillna(0.0) * TRADING_DAYS
+    B_aligned_new = B_new.reindex(columns=fac_cols)
+    mu_ff_ann_new = (
+        alpha_ann_new.reindex(B_aligned_new.index).fillna(0.0)
+        + (B_aligned_new @ f_mean_ann_new).fillna(0.0)
+        + float(rf_annual)
+    )
+    securities_opt_new = [t for t in B_aligned_new.index if t not in EXCLUDE_FROM_OPT]
+
+    F_np = Fcov_daily_new.to_numpy(dtype=float)
+    Bmat_np = B_aligned_new.fillna(0.0).to_numpy(dtype=float)
+    resid_diag_np = np.diag(
+        pd.to_numeric(resid_var_new.reindex(B_aligned_new.index), errors="coerce")
+          .clip(lower=0).fillna(0.0).to_numpy(dtype=float)
+    )
+    Sigma_ff_np = Bmat_np @ F_np @ Bmat_np.T + resid_diag_np
+    Sigma_ff_daily_new = pd.DataFrame(Sigma_ff_np,
+                                      index=B_aligned_new.index,
+                                      columns=B_aligned_new.index)
+
+    Sigma_opt_new = Sigma_ff_daily_new.loc[securities_opt_new, securities_opt_new].copy()
+    mu_vec_opt_new = mu_ff_ann_new.reindex(securities_opt_new).copy()
+
+    if "PortfolioValue" in Sigma_opt_new.index:
+        Sigma_opt_new = Sigma_opt_new.drop(index="PortfolioValue",
+                                           columns="PortfolioValue", errors="ignore")
+    if "PortfolioValue" in mu_vec_opt_new.index:
+        mu_vec_opt_new = mu_vec_opt_new.drop(index="PortfolioValue", errors="ignore")
+
+    # 5) Rebuild cov_plus + exp_ret_df.
+    n_opt_new = len(Sigma_opt_new.index)
+    cov_plus_new = pd.DataFrame(0.0,
+                                index=list(Sigma_opt_new.index) + ["w"],
+                                columns=list(Sigma_opt_new.index) + ["w"])
+    cov_plus_new.iloc[:n_opt_new, :n_opt_new] = Sigma_opt_new.values
+    exp_ret_df_new = mu_vec_opt_new.rename(
+        g.get("exp_ret_label", "Expected Return (annual, FF5 AUD-adjusted)")
+    ).to_frame()
+
+    # 6) Publish to globals.
+    g["prices"] = new_prices
+    g["df_cov_wide"] = df_cov_wide_new
+    g["B"] = B_new
+    g["alpha_daily"] = alpha_daily_new
+    g["resid_var"] = resid_var_new
+    g["ff5_regression_stats"] = ff5_stats_new
+    g["ff_aud"] = ff_aud_new
+    g["Fcov_daily"] = Fcov_daily_new
+    g["f_mean_ann"] = f_mean_ann_new
+    g["Sigma_ff_daily"] = Sigma_ff_daily_new
+    g["securities_opt"] = securities_opt_new
+    g["Sigma_opt"] = Sigma_opt_new
+    g["mu_vec_opt"] = mu_vec_opt_new
+    g["Sigma_frontier"] = Sigma_opt_new.copy()
+    g["mu_frontier"] = mu_vec_opt_new.copy()
+    g["mu_plus"] = mu_vec_opt_new.copy()
+    g["cov_plus"] = cov_plus_new
+    g["exp_ret_df"] = exp_ret_df_new
+
+    print(f"[ff5-refresh] Universe rebuilt → {len(securities_opt_new)} securities "
+          f"(was {len(existing_idx)}). FF5 now covers: "
+          f"{sorted(set(B_new.index) - existing_idx)}")
+
+
 # ------------------------------------------------------------
 # 8) OPTIMISATION UTILITIES (unconstrained + tilt-constrained)
 # ------------------------------------------------------------
@@ -3188,10 +3705,17 @@ if not f_mean_ann.empty:
 # =====================================================================
 # BLOCK 6 Transaction costs
 # =====================================================================
-# --- Brokerage & CGT config (edit these to suit) ---
+# --- Live trade-plan brokerage (auto-derived from ACTIVE_BROKER_PROFILE) ---
 BROKERAGE = {
-    "ASX": {"first_buy_free_threshold": 1000.0, "min_fee": 11.0, "rate": 0.001},
-    "US": {"min_fee": 0.0, "rate": 0.0},
+    "ASX": {
+        "first_buy_free_threshold": float(BROKER_CONFIG["live_asx_first_buy_free_thresh"]),
+        "min_fee":                  float(BROKER_CONFIG["live_asx_min_fee"]),
+        "rate":                     float(BROKER_CONFIG["live_asx_rate"]),
+    },
+    "US": {
+        "min_fee": float(BROKER_CONFIG["live_us_min_fee"]),
+        "rate":    float(BROKER_CONFIG["live_us_rate"]),
+    },
 }
 
 MIN_TRADE_VALUE = 11.0
@@ -4065,8 +4589,30 @@ else:
     else:
         units, last_px_hold, prices, include_flags, tilt_df = res
         portfolio_value_override = None
-            
-    current_holdings_units = units.copy() 
+
+    current_holdings_units = units.copy()
+
+    # If the dialog added new tickers (e.g. NDQ.AX, QQQ), re-run FF5 regression
+    # so they enter Sigma_opt / mu_vec_opt / B alongside the sheet-loaded set.
+    # The dialog is the canonical interaction surface — sheet vs dialog should
+    # behave identically downstream.
+    try:
+        _refresh_ff5_universe_after_dialog(prices)
+        # Pick up the refreshed globals into module-level names that subsequent
+        # code reads. (At module scope a global rebind would just propagate, but
+        # being explicit makes the data flow easier to follow.)
+        Sigma_opt = globals()["Sigma_opt"]
+        mu_vec_opt = globals()["mu_vec_opt"]
+        B = globals()["B"]
+        ff5_regression_stats = globals().get("ff5_regression_stats", ff5_regression_stats)
+        Sigma_frontier = globals().get("Sigma_frontier", Sigma_frontier)
+        mu_frontier = globals().get("mu_frontier", mu_frontier)
+        mu_plus = globals().get("mu_plus", mu_plus)
+        cov_plus = globals().get("cov_plus", cov_plus)
+        exp_ret_df = globals().get("exp_ret_df", exp_ret_df)
+    except Exception as _e_ff5_refresh:
+        print(f"[ff5-refresh] Failed to refresh universe after dialog: {_e_ff5_refresh}. "
+              f"Continuing with original FF5 universe.")
 
 # ---- Make optimiser globals available ----
 current_holdings_units = units
@@ -4118,9 +4664,1137 @@ def _rebuild_core_from_prices(prices, fx_ticker="USDAUD=X", period="5y"):
     return prices_aud, d, df_cov_wide, Sigma_daily, mu_ann_geo
 
 
+def run_oos_walk_forward(
+    prices_aud: pd.DataFrame,
+    train_window_months: int = 24,
+    rebalance: str = "MS",
+    oos_start=None,
+    oos_end=None,
+    objective: str = "beat_benchmark",
+    benchmark_ticker: str = "SPY",
+    beat_premium: float = 0.02,
+) -> tuple[pd.Series, pd.DataFrame]:
+    """Walk-forward out-of-sample backtest of the long-only max-Sharpe strategy.
+
+    At each rebalance date t we fit mu (annualised geometric) and Sigma (daily
+    cov) on the trailing `train_window_months` of AUD-adjusted prices, solve the
+    same long-only tangency portfolio used live (max_sharpe_long_only), then hold
+    those weights through the next rebalance, accumulating realised daily returns.
+
+    Mirrors the live recipe (geometric mu, daily Sigma, outlier guard) so the
+    OOS curve is comparable to the live optimisation rather than a different
+    statistical estimator.
+
+    Returns (daily_strategy_returns, weights_history) where weights_history is
+    indexed by rebalance date and columns are tickers.
+    """
+    px = prices_aud.copy()
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    # PortfolioValue is a derived column — exclude from the asset universe.
+    px = px.drop(columns=[c for c in ["PortfolioValue"] if c in px.columns], errors="ignore")
+
+    if oos_end is None:
+        oos_end = px.index.max()
+    oos_end = pd.Timestamp(oos_end)
+    lead = pd.DateOffset(months=train_window_months)
+    if oos_start is None:
+        oos_start = px.index.min() + lead
+    else:
+        oos_start = max(pd.Timestamp(oos_start), px.index.min() + lead)
+
+    # Pre-compute daily returns once, with the same outlier guard as the live pipeline.
+    daily_rets = px.pct_change()
+    daily_rets = daily_rets.where(daily_rets.abs() <= RETURN_OUTLIER_THRESHOLD)
+
+    # Rebalance schedule: first trading day on/after each calendar month-start.
+    cal_dates = pd.date_range(start=oos_start, end=oos_end, freq=rebalance)
+    rebal_dates = []
+    for d in cal_dates:
+        loc = px.index.searchsorted(d, side="left")
+        if loc < len(px.index):
+            rebal_dates.append(px.index[loc])
+    rebal_dates = pd.DatetimeIndex(sorted(set(rebal_dates)))
+    if len(rebal_dates) == 0:
+        return pd.Series(dtype=float), pd.DataFrame()
+
+    weights_history: dict[pd.Timestamp, pd.Series] = {}
+    segments: list[pd.Series] = []
+
+    for i, t in enumerate(rebal_dates):
+        train_px = px.loc[t - lead : t]
+        if len(train_px) < 60:
+            continue
+        train_rets = train_px.pct_change()
+        train_rets = train_rets.where(train_rets.abs() <= RETURN_OUTLIER_THRESHOLD)
+
+        # Coverage filter: keep tickers with >= 80% non-NaN obs in the window.
+        coverage = train_rets.notna().sum() / max(len(train_rets), 1)
+        good_cols = coverage[coverage >= 0.8].index.tolist()
+        if len(good_cols) < 3:
+            continue
+        train_rets = train_rets[good_cols].dropna(how="any")
+        if len(train_rets) < 60:
+            continue
+
+        log_ret = np.log1p(train_rets)
+        mu = pd.Series(np.expm1(log_ret.mean() * 252.0), index=train_rets.columns)
+        Sigma = train_rets.cov()
+
+        w = pd.Series(dtype=float)
+        if objective == "beat_benchmark" and benchmark_ticker in mu.index:
+            # Min-vol s.t. E[r] >= benchmark_mu + premium. This delivers SPY-style
+            # return targets while clipping variance — the actual fund pitch.
+            target_ret = float(mu[benchmark_ticker]) + float(beat_premium)
+            # Never target below the max-Sharpe expected return — otherwise the
+            # constraint binds nowhere and the optimiser collapses to min-variance.
+            tangency_w = max_sharpe_long_only(mu, Sigma, rf=0.0)
+            if tangency_w is not None and not tangency_w.empty:
+                tangency_mu = float((mu.reindex(tangency_w.index).fillna(0.0) * tangency_w).sum())
+                target_ret = max(target_ret, tangency_mu)
+            try:
+                w_arr, ok, _note = solve_frontier_point_cvxpy(mu, Sigma, target_ret,
+                                                              use_inequality=True)
+                if ok and w_arr is not None and len(w_arr) > 0 and np.isfinite(w_arr).all():
+                    w = pd.Series(w_arr, index=Sigma.index)
+            except Exception:
+                pass
+
+        if w.empty:
+            # Fallback (or default objective == "max_sharpe"): pure tangency
+            try:
+                w = max_sharpe_long_only(mu, Sigma, rf=0.0)
+            except Exception:
+                continue
+
+        if w is None or w.empty:
+            continue
+        w = w[w > 1e-6]
+        if w.empty:
+            continue
+        # Renormalise after clipping
+        w = w / w.sum()
+        weights_history[t] = w
+
+        # Realised window: held from day after t until the day of the next rebalance.
+        if i + 1 < len(rebal_dates):
+            seg_end = rebal_dates[i + 1]
+        else:
+            seg_end = oos_end + pd.Timedelta(days=1)
+        held = daily_rets.loc[t:seg_end, w.index].fillna(0.0)
+        if len(held) > 0 and held.index[0] == t:
+            held = held.iloc[1:]
+        if held.empty:
+            continue
+        seg = (held * w.reindex(held.columns).fillna(0.0)).sum(axis=1)
+        segments.append(seg)
+
+    if not segments:
+        return pd.Series(dtype=float), pd.DataFrame()
+
+    oos_returns = pd.concat(segments).sort_index()
+    # If rebalance dates produce a duplicate boundary day, keep the later (post-rebalance) value.
+    oos_returns = oos_returns[~oos_returns.index.duplicated(keep="last")]
+    oos_weights = pd.DataFrame.from_dict(weights_history, orient="index").fillna(0.0)
+    return oos_returns, oos_weights
+
+
+# --- Strategy ensemble (regime-aware multi-objective blend) ---
+
+# Canonical 5-slot menu. Each slot specifies a return-floor premium over the
+# benchmark's training-window mu (None = pure tangency, no floor).
+# Slots span an upside-tilted aggression range — the goal is to BEAT SPY, not
+# to defend versus it. Inverse-ETF / hedge ballast (BBUS/BEAR/GOLD/AGVT) is
+# still available to the solver inside every slot when the optimiser deems
+# it worthwhile; it just isn't structurally anchored by a Defensive bucket
+# whose return target undershoots SPY.
+ENSEMBLE_SLOTS: tuple[tuple[str, float | None], ...] = (
+    # Modest now serves as the low-end fallback — solver hits SPY's expected
+    # return at lower-vol weights when the regime signal is risk-off.
+    ("Modest (SPY+0%)",       0.00),
+    ("Aggressive (SPY+5%)",   0.05),
+    ("Bold (SPY+10%)",        0.10),
+    ("Maximum (SPY+15%)",     0.15),
+    # Stretch at SPY+25%: forces concentration into the top-mu assets (SMH,
+    # VLUE, VVLU, IOO, etc.) when feasible. Falls back to Maximum if infeasible.
+    # This is the slot that actually competes with SPY's tech-driven runs.
+    ("Stretch (SPY+25%)",     0.25),
+)
+ENSEMBLE_SLOT_NAMES: tuple[str, ...] = tuple(name for name, _ in ENSEMBLE_SLOTS)
+
+
+def solve_candidate_portfolios(
+    mu: pd.Series,
+    Sigma: pd.DataFrame,
+    spy_mu: float | None,
+    slots: tuple[tuple[str, float | None], ...] = ENSEMBLE_SLOTS,
+) -> dict[str, pd.Series]:
+    """Solve all 5 candidate portfolios for a single rebalance.
+
+    Returns {slot_name: weights}. If a return-floor slot is infeasible (target
+    too high for the universe), that slot falls back to the next-most-aggressive
+    feasible slot, then ultimately to tangency. This means in unfavourable
+    universes the ensemble degenerates gracefully toward defensive — exactly
+    when defensive is appropriate.
+    """
+    out: dict[str, pd.Series] = {}
+    tangency = max_sharpe_long_only(mu, Sigma, rf=0.0)
+    if tangency is None or tangency.empty:
+        # Cannot solve anything — return empty for all slots.
+        return {name: pd.Series(dtype=float) for name, _ in slots}
+    tangency_mu = float((mu.reindex(tangency.index).fillna(0.0) * tangency).sum())
+
+    for name, premium in slots:
+        if premium is None:
+            out[name] = tangency.copy()
+            continue
+        if spy_mu is None or not np.isfinite(spy_mu):
+            # No benchmark anchor → fall back to tangency for that slot.
+            out[name] = tangency.copy()
+            continue
+        target_ret = float(spy_mu) + float(premium)
+        # Tangency floor applies ONLY to positive-premium slots. (Kept as a
+        # guard against premium <= 0 ever being added back in — Modest at +0%
+        # bypasses the floor and is allowed to undershoot tangency if needed.)
+        if float(premium) > 0:
+            target_ret = max(target_ret, tangency_mu)
+        try:
+            w_arr, ok, _note = solve_frontier_point_cvxpy(
+                mu, Sigma, target_ret, use_inequality=True
+            )
+            if ok and w_arr is not None and len(w_arr) > 0 and np.isfinite(w_arr).all():
+                w = pd.Series(w_arr, index=Sigma.index)
+                w = w[w > 1e-6]
+                if not w.empty and w.sum() > 0:
+                    out[name] = w / w.sum()
+                    continue
+        except Exception:
+            pass
+        # Infeasible — defer to the most recently solved candidate (or tangency).
+        out[name] = out[ENSEMBLE_SLOT_NAMES[max(0, list(ENSEMBLE_SLOT_NAMES).index(name) - 1)]].copy() if out else tangency.copy()
+    return out
+
+
+def compute_forward_regime_signal(
+    benchmark_prices: pd.Series,
+    as_of_date: pd.Timestamp,
+    slot_names: tuple[str, ...] = ENSEMBLE_SLOT_NAMES,
+    dd_pct_floor: float = 0.20,
+    gaussian_width: float = 0.40,
+) -> pd.Series:
+    """Forward-looking regime preference, independent of past candidate scores.
+
+    Returns a probability distribution over slot_names. Aggressive end gets
+    more weight in bullish conditions, lower-aggression end gets more weight
+    in risk-off conditions.
+
+    Inputs (both derivable from benchmark price history alone):
+      1. Drawdown from 52-week high (deeper DD → favour low-aggression slot)
+      2. 20-day SMA vs 50-day SMA cross (20d > 50d → bullish, else bearish)
+
+    The 20d/50d cross replaced the prior 200-day MA test because the 200-day
+    signal lags 4-6 months out of a crash — the engine was staying defensive
+    well past the actual SPY recovery (visible in 2020 H2 and 2022 H2 of the
+    regime strip). 20d/50d flips bullish within ~3-5 weeks of a true recovery
+    while the drawdown component still provides the deep-crash protection.
+
+    These are blended 50/50 to a [0, 1] regime intensity score, which is then
+    mapped to slot preferences via a Gaussian centred on the matching aggression
+    level. Wider gaussian_width spreads weight; narrower concentrates it.
+
+    Warm-up: if benchmark has < 50 days of data before as_of_date, returns
+    uniform weights.
+    """
+    n = len(slot_names)
+    eq = pd.Series(1.0 / n, index=list(slot_names))
+    if benchmark_prices is None or len(benchmark_prices) == 0:
+        return eq
+
+    px = pd.to_numeric(pd.Series(benchmark_prices), errors="coerce").dropna()
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index()
+    as_of_date = pd.Timestamp(as_of_date)
+    px = px[px.index <= as_of_date]
+    if len(px) < 50:
+        return eq
+
+    px_last = float(px.iloc[-1])
+    # 52-week (252-day) trailing high — drawdown reference point.
+    rolling_max_52w = float(px.tail(252).max()) if len(px) >= 252 else float(px.max())
+    dd_pct = (px_last - rolling_max_52w) / rolling_max_52w if rolling_max_52w > 0 else 0.0
+    # 20-day vs 50-day SMA cross — fast trend reference point (replaces 200d MA).
+    ma_20 = float(px.tail(20).mean())
+    ma_50 = float(px.tail(50).mean())
+    above_ma = 1.0 if ma_20 > ma_50 else 0.0
+
+    # Drawdown signal: 1.0 at peak, linearly decreasing to 0.0 at -dd_pct_floor.
+    dd_signal = max(0.0, 1.0 + dd_pct / dd_pct_floor)  # dd_pct is <= 0
+    regime_intensity = 0.5 * dd_signal + 0.5 * above_ma  # in [0, 1]
+
+    # Map slots onto an aggression axis: Modest=0.0 .. Stretch=1.0
+    aggressions = np.linspace(0.0, 1.0, n)
+    # Gaussian preference peaked at regime_intensity.
+    prefs = np.exp(-((aggressions - regime_intensity) ** 2) /
+                   (2.0 * float(gaussian_width) ** 2))
+    s = float(prefs.sum())
+    if s <= 0 or not np.isfinite(s):
+        return eq
+    return pd.Series(prefs / s, index=list(slot_names))
+
+
+def blend_ensemble_signals(
+    backward_weights: pd.Series,
+    forward_weights: pd.Series,
+    backward_alpha: float = 0.7,
+) -> pd.Series:
+    """Linearly blend two probability distributions over the same slot index.
+
+    backward_alpha controls how much weight goes on the EWMA-Sortino signal
+    vs the forward regime signal (default 0.7 = 70% backward, 30% forward).
+    The result is renormalised to sum to 1.
+
+    Why blend distributions (not raw scores)? They're already on the same
+    [0, 1] scale and sum to 1 — addition is well-defined and the result is
+    still a probability distribution. Avoids the rescaling pitfalls of
+    blending raw Sortinos (range ~[-3, +5]) with preferences (range [0, 1]).
+    """
+    if backward_weights is None or backward_weights.empty:
+        return forward_weights.copy() if forward_weights is not None else pd.Series(dtype=float)
+    if forward_weights is None or forward_weights.empty:
+        return backward_weights.copy()
+
+    # Align on the union of indices, fill missing with 0.
+    idx = list(backward_weights.index.union(forward_weights.index))
+    bw = backward_weights.reindex(idx).fillna(0.0)
+    fw = forward_weights.reindex(idx).fillna(0.0)
+    a = float(np.clip(backward_alpha, 0.0, 1.0))
+    blended = a * bw + (1.0 - a) * fw
+    s = float(blended.sum())
+    if s <= 0:
+        # Fall back to equal weights if both signals collapsed.
+        return pd.Series(1.0 / max(len(idx), 1), index=idx)
+    return blended / s
+
+
+def softmax_ensemble_weights(
+    per_candidate_returns: pd.DataFrame,
+    lookback_days: int = 252,
+    lambda_temp: float = 2.0,
+    halflife_days: int = 60,
+    benchmark_returns: pd.Series | None = None,
+) -> pd.Series:
+    """Softmax weight each candidate by its EWMA Information Ratio vs SPY.
+
+    Replaces the prior EWMA Sortino with EWMA IR-vs-benchmark. The Sortino
+    formula had a pathological failure mode: a Defensive slot with consistently
+    small negative returns (e.g. SPY-25% target heavily allocating to inverse
+    ETFs) has tiny downside semi-deviation, which inflates its Sortino ratio
+    despite genuinely losing money. The softmax then over-weights it.
+
+    Information Ratio penalises UNDERPERFORMANCE vs benchmark directly:
+        IR = EWMA_mean(strat_ret - spy_ret) / EWMA_std(strat_ret - spy_ret)
+    A candidate that systematically lags SPY gets a very negative IR no matter
+    how low its absolute volatility is. Defensive slots only score competitively
+    when they're actually beating SPY (i.e. during drawdowns) — which is when
+    we want them activated.
+
+    Falls back to absolute EWMA Sharpe (return / total vol) if no benchmark is
+    provided — better than nothing but not the recommended path.
+
+    Warm-up: equal weights until we have at least 60 daily observations.
+    """
+    candidates = list(per_candidate_returns.columns)
+    n = len(candidates)
+    if n == 0:
+        return pd.Series(dtype=float)
+    eq = pd.Series(1.0 / n, index=candidates)
+
+    if per_candidate_returns.empty or len(per_candidate_returns) < 60:
+        return eq
+
+    win = per_candidate_returns.tail(lookback_days)
+    if len(win) < 60:
+        return eq
+
+    # Align benchmark to the candidate window's index (use same dates only).
+    bench_aligned = None
+    if benchmark_returns is not None and not benchmark_returns.empty:
+        bench_aligned = pd.to_numeric(benchmark_returns, errors="coerce")
+        bench_aligned.index = pd.to_datetime(bench_aligned.index).tz_localize(None)
+        bench_aligned = bench_aligned.sort_index().reindex(win.index)
+
+    scores = {}
+    for c in candidates:
+        r = pd.to_numeric(win[c], errors="coerce").dropna()
+        if len(r) < 60:
+            scores[c] = np.nan
+            continue
+        if bench_aligned is not None:
+            # Active return = strategy - benchmark, dropping any unaligned rows.
+            pair = pd.concat([r, bench_aligned.reindex(r.index)], axis=1).dropna()
+            if len(pair) < 60:
+                scores[c] = np.nan
+                continue
+            active = pair.iloc[:, 0] - pair.iloc[:, 1]
+            ewma_mean = float(active.ewm(halflife=halflife_days, adjust=False).mean().iloc[-1])
+            # EWMA variance via EWMA of squared deviations
+            active_demeaned = active - active.ewm(halflife=halflife_days, adjust=False).mean()
+            ewma_var = float((active_demeaned ** 2).ewm(halflife=halflife_days, adjust=False).mean().iloc[-1])
+            ewma_std = float(np.sqrt(ewma_var))
+            if ewma_std > 0 and np.isfinite(ewma_std):
+                # Information Ratio (annualised)
+                scores[c] = (ewma_mean * ANNUAL_TRADING_DAYS /
+                             (ewma_std * np.sqrt(ANNUAL_TRADING_DAYS)))
+            else:
+                scores[c] = np.nan
+        else:
+            # No benchmark → fall back to absolute Sharpe-style ratio
+            ewma_mean = float(r.ewm(halflife=halflife_days, adjust=False).mean().iloc[-1])
+            r_demeaned = r - r.ewm(halflife=halflife_days, adjust=False).mean()
+            ewma_var = float((r_demeaned ** 2).ewm(halflife=halflife_days, adjust=False).mean().iloc[-1])
+            ewma_std = float(np.sqrt(ewma_var))
+            if ewma_std > 0 and np.isfinite(ewma_std):
+                scores[c] = (ewma_mean * ANNUAL_TRADING_DAYS /
+                             (ewma_std * np.sqrt(ANNUAL_TRADING_DAYS)))
+            else:
+                scores[c] = np.nan
+
+    s = pd.Series(scores)
+    if s.isna().all():
+        return eq
+    s_filled = s.fillna(s.min(skipna=True))
+    z = float(lambda_temp) * s_filled.to_numpy(dtype=float)
+    z = z - np.max(z)
+    e = np.exp(z)
+    w = e / e.sum() if e.sum() > 0 else np.full(n, 1.0 / n)
+    return pd.Series(w, index=candidates)
+
+
+def run_oos_ensemble_walk_forward(
+    prices_aud: pd.DataFrame,
+    train_window_months: int = 24,
+    rebalance: str = "MS",
+    benchmark_ticker: str = "SPY",
+    score_lookback_days: int = 252,
+    lambda_temp: float = 2.0,
+    sortino_halflife_days: int = 60,
+    forward_signal_alpha: float = 0.5,
+) -> dict:
+    """Ensemble walk-forward: solve 5 candidates per rebalance, softmax-blend
+    by rolling 12M Sortino, hold the blended portfolio for 1 month.
+
+    Returns a dict with:
+        blended_returns       Series of daily blended strategy returns
+        per_candidate_returns DataFrame of daily per-candidate returns
+        softmax_history       DataFrame of softmax weights (rows=rebal dates)
+        blended_weights       DataFrame of blended ticker weights per rebal date
+        per_candidate_weights dict[slot_name -> DataFrame of weights per rebal date]
+    """
+    px = prices_aud.copy()
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    px = px.drop(columns=[c for c in ["PortfolioValue"] if c in px.columns], errors="ignore")
+
+    oos_end = px.index.max()
+    lead = pd.DateOffset(months=train_window_months)
+    oos_start = px.index.min() + lead
+
+    daily_rets_all = px.pct_change()
+    daily_rets_all = daily_rets_all.where(daily_rets_all.abs() <= RETURN_OUTLIER_THRESHOLD)
+
+    cal_dates = pd.date_range(start=oos_start, end=oos_end, freq=rebalance)
+    scheduled_dates = []
+    for d in cal_dates:
+        loc = px.index.searchsorted(d, side="left")
+        if loc < len(px.index):
+            scheduled_dates.append(px.index[loc])
+    scheduled_dates = sorted(set(scheduled_dates))
+
+    # --- Conditional rebalancing: insert early-trigger dates between scheduled
+    # ones whenever SPY drawdown deepens by more than EARLY_TRIGGER_DD_DEEPEN
+    # since the prior scheduled rebal. Catches fast regime shifts at 6W cadence.
+    augmented_dates = list(scheduled_dates)
+    n_early_triggered = 0
+    if (benchmark_ticker in px.columns
+            and EARLY_TRIGGER_DD_DEEPEN > 0
+            and len(scheduled_dates) > 1):
+        spy = px[benchmark_ticker].sort_index()
+        for k in range(len(scheduled_dates) - 1):
+            t0 = scheduled_dates[k]
+            t1 = scheduled_dates[k + 1]
+            window = spy.loc[t0:t1]
+            if len(window) < 2:
+                continue
+            peak = window.cummax()
+            dd = (window / peak) - 1.0
+            dd_at_t0 = float(dd.iloc[0])
+            trigger_mask = ((dd - dd_at_t0) <= -EARLY_TRIGGER_DD_DEEPEN)
+            trigger_mask &= (window.index >= t0 + pd.Timedelta(days=EARLY_TRIGGER_MIN_DAYS))
+            trigger_dates = window.index[trigger_mask]
+            if len(trigger_dates) > 0:
+                augmented_dates.append(trigger_dates[0])
+                n_early_triggered += 1
+
+    rebal_dates = pd.DatetimeIndex(sorted(set(augmented_dates)))
+    n_scheduled = len(scheduled_dates)
+    if len(rebal_dates) == 0:
+        return {"blended_returns": pd.Series(dtype=float),
+                "per_candidate_returns": pd.DataFrame(),
+                "softmax_history": pd.DataFrame(),
+                "blended_weights": pd.DataFrame(),
+                "per_candidate_weights": {n: pd.DataFrame() for n in ENSEMBLE_SLOT_NAMES}}
+
+    per_candidate_weights: dict[str, dict[pd.Timestamp, pd.Series]] = {
+        n: {} for n in ENSEMBLE_SLOT_NAMES
+    }
+    blended_weights: dict[pd.Timestamp, pd.Series] = {}
+    softmax_rows: dict[pd.Timestamp, pd.Series] = {}
+    per_candidate_segments: dict[str, list[pd.Series]] = {n: [] for n in ENSEMBLE_SLOT_NAMES}
+    blended_segments: list[pd.Series] = []
+    # NET-of-cost tracking: running NAV + previous-rebalance weights so we can
+    # apply realistic transaction costs on each rebalance day.
+    rebalance_costs: dict[pd.Timestamp, float] = {}
+    rebalance_taxes: dict[pd.Timestamp, float] = {}
+    _prev_blend_w = pd.Series(dtype=float)
+    _running_nav = 1_000_000.0  # AUD; flat-fee impact scales with portfolio size
+    # Conditional rebalancing diagnostics
+    n_skipped = 0
+    n_executed = 0
+    # Lot book for CGT modelling — tracks acquisition dates + cost basis FIFO.
+    _lot_book = LotBook()
+    # FY accumulators: AU financial year runs 1 Jul – 30 Jun. Gains/losses
+    # accumulate through the year; tax applied at FY-end with cross-offset +
+    # loss carry-forward (the real AU rule, vastly more favourable than the
+    # per-rebalance approximation).
+    _fy_buckets = {"st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0}
+    _carried_losses = {"st_loss": 0.0, "lt_loss": 0.0}
+    _current_fy_end: pd.Timestamp | None = None
+
+    def _fy_end_for(date: pd.Timestamp) -> pd.Timestamp:
+        d = pd.Timestamp(date)
+        # AU FY ends 30 June. If date is Jul–Dec, FY-end is 30 Jun next year.
+        if d.month >= 7:
+            return pd.Timestamp(year=d.year + 1, month=6, day=30)
+        return pd.Timestamp(year=d.year, month=6, day=30)
+
+    def _apply_fy_tax(buckets: dict, carried: dict, nav: float) -> tuple[float, dict]:
+        """Compute tax owed on prior FY with full netting + carry-forward.
+        Returns (tax_fraction_of_nav, new_carried_losses)."""
+        st_gain = buckets["st_gain"]
+        lt_gain = buckets["lt_gain"]
+        st_loss = buckets["st_loss"] + carried["st_loss"]
+        lt_loss = buckets["lt_loss"] + carried["lt_loss"]
+        # 1) Within-category netting
+        st_net = st_gain - st_loss
+        lt_net = lt_gain - lt_loss
+        # 2) Cross-category offset (losses can reduce other-category gains)
+        if st_net < 0 and lt_net > 0:
+            offset = min(lt_net, -st_net)
+            lt_net -= offset; st_net += offset
+        if lt_net < 0 and st_net > 0:
+            offset = min(st_net, -lt_net)
+            st_net -= offset; lt_net += offset
+        # 3) Tax on positive net gains; carry forward leftover losses
+        tax_aud = 0.0
+        if st_net > 0:
+            tax_aud += st_net * _effective_cgt_rate(short_term=True)
+        if lt_net > 0:
+            tax_aud += lt_net * _effective_cgt_rate(short_term=False)
+        new_carried = {
+            "st_loss": max(0.0, -st_net),
+            "lt_loss": max(0.0, -lt_net),
+        }
+        return tax_aud / max(nav, 1.0), new_carried
+
+    for i, t in enumerate(rebal_dates):
+        train_px = px.loc[t - lead : t]
+        if len(train_px) < 60:
+            continue
+        train_rets = train_px.pct_change()
+        train_rets = train_rets.where(train_rets.abs() <= RETURN_OUTLIER_THRESHOLD)
+        coverage = train_rets.notna().sum() / max(len(train_rets), 1)
+        good_cols = coverage[coverage >= 0.8].index.tolist()
+        if len(good_cols) < 3:
+            continue
+        train_rets = train_rets[good_cols].dropna(how="any")
+        if len(train_rets) < 60:
+            continue
+
+        log_ret = np.log1p(train_rets)
+        mu = pd.Series(np.expm1(log_ret.mean() * 252.0), index=train_rets.columns)
+        Sigma = train_rets.cov()
+        spy_mu = float(mu[benchmark_ticker]) if benchmark_ticker in mu.index else None
+
+        candidates = solve_candidate_portfolios(mu, Sigma, spy_mu)
+        # All candidates must be solvable to participate; otherwise skip rebalance.
+        if all(w.empty for w in candidates.values()):
+            continue
+
+        # Score: rolling Sortino over prior per-candidate daily returns.
+        prior_panel = pd.DataFrame()
+        if all(per_candidate_segments[n] for n in ENSEMBLE_SLOT_NAMES):
+            cand_series = {n: pd.concat(per_candidate_segments[n]).sort_index()
+                           for n in ENSEMBLE_SLOT_NAMES}
+            prior_panel = pd.DataFrame(cand_series)
+            prior_panel = prior_panel[~prior_panel.index.duplicated(keep="last")]
+        # Benchmark daily returns up to (but not including) t — for IR scoring.
+        bench_rets_for_score = None
+        if benchmark_ticker in px.columns:
+            _bench_px = px[benchmark_ticker].loc[:t]
+            bench_rets_for_score = _bench_px.pct_change().dropna()
+        soft_w = softmax_ensemble_weights(prior_panel,
+                                          lookback_days=score_lookback_days,
+                                          lambda_temp=lambda_temp,
+                                          halflife_days=sortino_halflife_days,
+                                          benchmark_returns=bench_rets_for_score)
+        # Blend with forward-looking regime signal (benchmark drawdown + 200d MA).
+        # This reduces whipsaws by anchoring the ensemble to market conviction
+        # rather than relying purely on past per-candidate performance.
+        if benchmark_ticker in px.columns:
+            fwd_w = compute_forward_regime_signal(
+                benchmark_prices=px[benchmark_ticker],
+                as_of_date=t,
+            )
+            soft_w = blend_ensemble_signals(
+                backward_weights=soft_w,
+                forward_weights=fwd_w,
+                backward_alpha=forward_signal_alpha,
+            )
+        softmax_rows[t] = soft_w
+
+        # Save per-candidate weights at this rebal.
+        for n in ENSEMBLE_SLOT_NAMES:
+            if not candidates[n].empty:
+                per_candidate_weights[n][t] = candidates[n]
+
+        # Realised holding window
+        seg_end = rebal_dates[i + 1] if i + 1 < len(rebal_dates) else oos_end + pd.Timedelta(days=1)
+
+        # Per-candidate realised returns (for next iteration's scoring) using
+        # only THIS candidate's weights — independent of softmax.
+        for n in ENSEMBLE_SLOT_NAMES:
+            w_cand = candidates[n]
+            if w_cand.empty:
+                continue
+            held = daily_rets_all.loc[t:seg_end, w_cand.index].fillna(0.0)
+            if len(held) > 0 and held.index[0] == t:
+                held = held.iloc[1:]
+            if held.empty:
+                continue
+            seg = (held * w_cand.reindex(held.columns).fillna(0.0)).sum(axis=1)
+            per_candidate_segments[n].append(seg)
+
+        # Blended portfolio weights = sum_i (soft_w_i * candidate_i_weights),
+        # then renormalise (in case some candidates didn't cover all tickers).
+        ticker_idx = sorted(set().union(*[set(c.index) for c in candidates.values() if not c.empty]))
+        if not ticker_idx:
+            continue
+        w_blend = pd.Series(0.0, index=ticker_idx)
+        for n in ENSEMBLE_SLOT_NAMES:
+            if candidates[n].empty or soft_w.get(n, 0.0) <= 0:
+                continue
+            w_blend = w_blend.add(candidates[n].reindex(ticker_idx).fillna(0.0) * float(soft_w[n]),
+                                  fill_value=0.0)
+        w_blend = w_blend[w_blend > 1e-6]
+        if w_blend.empty or w_blend.sum() <= 0:
+            continue
+        w_blend = w_blend / w_blend.sum()
+
+        # --- Conditional skip: if target weight change is tiny, hold prior
+        # weights — saves brokerage + CGT realisation on no-op re-trims.
+        skip_rebal = False
+        if not _prev_blend_w.empty and SKIP_REBAL_DELTA > 0:
+            union_idx = sorted(set(_prev_blend_w.index).union(w_blend.index))
+            delta_sum = float(
+                (w_blend.reindex(union_idx).fillna(0.0)
+                 - _prev_blend_w.reindex(union_idx).fillna(0.0)).abs().sum()
+            )
+            if delta_sum < SKIP_REBAL_DELTA:
+                skip_rebal = True
+                w_blend = _prev_blend_w.copy()
+
+        if skip_rebal:
+            n_skipped += 1
+        else:
+            n_executed += 1
+        blended_weights[t] = w_blend
+
+        # Blended realised return segment (gross, before transaction costs)
+        held_b = daily_rets_all.loc[t:seg_end, w_blend.index].fillna(0.0)
+        if len(held_b) > 0 and held_b.index[0] == t:
+            held_b = held_b.iloc[1:]
+        if held_b.empty:
+            continue
+        seg_b = (held_b * w_blend.reindex(held_b.columns).fillna(0.0)).sum(axis=1)
+
+        # NET-of-cost adjustment: charge the rebalance cost on the FIRST day
+        # of the holding window. Skipped rebalances incur no cost.
+        if skip_rebal:
+            cost_frac = 0.0
+        else:
+            cost_frac = estimate_rebalance_cost_fraction(
+                w_old=_prev_blend_w,
+                w_new=w_blend,
+                portfolio_value_aud=_running_nav,
+            )
+        rebalance_costs[t] = cost_frac
+
+        # CGT: realise lot-level gains/losses at this rebalance and accumulate
+        # them into the running FINANCIAL-YEAR buckets. Tax is NOT applied per
+        # rebalance — that overestimates because it ignores intra-FY loss
+        # offsetting. Tax is applied at FY-end (below) on net taxable.
+        # Skipped rebalances do NOT update the lot book (no trades occurred).
+        if not skip_rebal:
+            try:
+                px_at_t = px.loc[:t].iloc[-1]
+                tickers_traded = sorted(set(_prev_blend_w.index).union(w_blend.index))
+                for tkr in tickers_traded:
+                    p = float(px_at_t.get(tkr, np.nan))
+                    if not np.isfinite(p) or p <= 0:
+                        continue
+                    cur_units = _lot_book.units(tkr)
+                    w_new_t = float(w_blend.get(tkr, 0.0))
+                    target_units = (w_new_t * _running_nav) / p
+                    delta_units = target_units - cur_units
+                    if delta_units > 1e-9:
+                        _lot_book.buy(tkr, delta_units, t, p)
+                    elif delta_units < -1e-9:
+                        out = _lot_book.sell(tkr, -delta_units, t, p)
+                        for k in _fy_buckets:
+                            _fy_buckets[k] += out[k]
+            except Exception:
+                pass
+
+        # FY-end tax check: if this rebalance falls in a NEW financial year
+        # compared to the prior one, settle the prior FY's tax bill now.
+        tax_frac = 0.0
+        new_fy_end = _fy_end_for(t)
+        if _current_fy_end is not None and new_fy_end > _current_fy_end:
+            tax_frac, _carried_losses = _apply_fy_tax(_fy_buckets, _carried_losses, _running_nav)
+            _fy_buckets = {"st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0}
+        _current_fy_end = new_fy_end
+        rebalance_taxes[t] = tax_frac
+
+        # Apply BOTH brokerage cost and (FY-end) tax to the first realised day
+        # of the holding window. Brokerage hits every rebalance; tax hits only
+        # at the first rebalance of a new FY.
+        total_drag = cost_frac + tax_frac
+        if len(seg_b) > 0 and total_drag > 0:
+            seg_b.iloc[0] = float(seg_b.iloc[0]) - total_drag
+        # Update running NAV for the next iteration (compound the net segment).
+        _running_nav = float(_running_nav * float((1.0 + seg_b).prod()))
+        _prev_blend_w = w_blend.copy()
+
+        blended_segments.append(seg_b)
+
+    if not blended_segments:
+        return {"blended_returns": pd.Series(dtype=float),
+                "per_candidate_returns": pd.DataFrame(),
+                "softmax_history": pd.DataFrame(),
+                "blended_weights": pd.DataFrame(),
+                "per_candidate_weights": {n: pd.DataFrame() for n in ENSEMBLE_SLOT_NAMES}}
+
+    blended_returns = pd.concat(blended_segments).sort_index()
+    blended_returns = blended_returns[~blended_returns.index.duplicated(keep="last")]
+
+    per_cand_rets_df = pd.DataFrame({
+        n: (pd.concat(per_candidate_segments[n]).sort_index()
+            if per_candidate_segments[n] else pd.Series(dtype=float))
+        for n in ENSEMBLE_SLOT_NAMES
+    })
+    per_cand_rets_df = per_cand_rets_df[~per_cand_rets_df.index.duplicated(keep="last")]
+
+    softmax_history = pd.DataFrame.from_dict(softmax_rows, orient="index").fillna(0.0)
+    softmax_history = softmax_history.reindex(columns=ENSEMBLE_SLOT_NAMES, fill_value=0.0)
+    blended_weights_df = pd.DataFrame.from_dict(blended_weights, orient="index").fillna(0.0)
+    per_cand_weights_dfs = {n: pd.DataFrame.from_dict(per_candidate_weights[n], orient="index").fillna(0.0)
+                            for n in ENSEMBLE_SLOT_NAMES}
+
+    rebalance_costs_ser = pd.Series(rebalance_costs).sort_index() if rebalance_costs else pd.Series(dtype=float)
+    rebalance_taxes_ser = pd.Series(rebalance_taxes).sort_index() if rebalance_taxes else pd.Series(dtype=float)
+    return {
+        "blended_returns": blended_returns,
+        "per_candidate_returns": per_cand_rets_df,
+        "softmax_history": softmax_history,
+        "blended_weights": blended_weights_df,
+        "per_candidate_weights": per_cand_weights_dfs,
+        "rebalance_costs": rebalance_costs_ser,
+        "rebalance_taxes": rebalance_taxes_ser,
+        "n_scheduled": n_scheduled,
+        "n_early_triggered": n_early_triggered,
+        "n_skipped": n_skipped,
+        "n_executed": n_executed,
+    }
+
+
+# --- OOS metrics helpers (Phase 2) ---
+
+def _series_metrics(ret: pd.Series, rf_annual: float = 0.0) -> dict:
+    r = pd.to_numeric(ret, errors="coerce").dropna()
+    if r.empty:
+        return {"Cumulative Return": np.nan, "Annualised Return": np.nan,
+                "Annualised Volatility": np.nan, "Sharpe Ratio": np.nan,
+                "Sortino Ratio": np.nan, "Max Drawdown": np.nan}
+    cum = (1.0 + r).cumprod()
+    total = float(cum.iloc[-1] - 1.0)
+    n_years = len(r) / ANNUAL_TRADING_DAYS
+    ann_ret = (1.0 + total) ** (1.0 / n_years) - 1.0 if n_years > 0 else np.nan
+    ann_vol = float(r.std(ddof=1) * np.sqrt(ANNUAL_TRADING_DAYS))
+    sharpe = _annualized_sharpe(r, rf_annual)
+
+    # Sortino: penalise only downside vol (MAR = 0). Annualised mean / annualised
+    # downside semi-deviation. Uses sqrt(mean(min(r,0)^2)) so flat days don't
+    # inflate the denominator.
+    rf_daily = (1.0 + rf_annual) ** (1.0 / ANNUAL_TRADING_DAYS) - 1.0
+    excess = r - rf_daily
+    downside = np.minimum(excess, 0.0)
+    dd_dev = float(np.sqrt(np.mean(downside ** 2)))
+    if dd_dev > 0 and np.isfinite(dd_dev):
+        sortino = float(excess.mean() * ANNUAL_TRADING_DAYS / (dd_dev * np.sqrt(ANNUAL_TRADING_DAYS)))
+    else:
+        sortino = np.nan
+
+    dd = (cum / cum.cummax()) - 1.0
+    return {"Cumulative Return": total, "Annualised Return": float(ann_ret),
+            "Annualised Volatility": ann_vol, "Sharpe Ratio": float(sharpe),
+            "Sortino Ratio": sortino, "Max Drawdown": float(dd.min())}
+
+
+def _ir_vs_bench(strat: pd.Series, bench: pd.Series) -> float:
+    pair = pd.concat([strat.rename("s"), bench.rename("b")], axis=1).dropna()
+    if pair.empty:
+        return np.nan
+    diff = pair["s"] - pair["b"]
+    sigma = float(diff.std(ddof=1) * np.sqrt(ANNUAL_TRADING_DAYS))
+    return float(diff.mean() * ANNUAL_TRADING_DAYS / sigma) if sigma > 0 else np.nan
+
+
+def _capm_alpha_beta(strat: pd.Series, bench: pd.Series) -> tuple[float, float]:
+    pair = pd.concat([strat.rename("s"), bench.rename("b")], axis=1).dropna()
+    if len(pair) < 30:
+        return np.nan, np.nan
+    X = np.column_stack([np.ones(len(pair)), pair["b"].to_numpy()])
+    y = pair["s"].to_numpy()
+    try:
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        return float(coef[0]) * ANNUAL_TRADING_DAYS, float(coef[1])
+    except Exception:
+        return np.nan, np.nan
+
+
+def _ff5_alpha(strat: pd.Series, ff5: pd.DataFrame) -> float:
+    if ff5 is None or ff5.empty:
+        return np.nan
+    cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM", "RF"]
+    if not all(c in ff5.columns for c in cols):
+        return np.nan
+    fac = ff5[cols].copy()
+    fac.index = pd.to_datetime(fac.index).tz_localize(None)
+    pair = pd.concat([strat.rename("s"), fac], axis=1).dropna()
+    if len(pair) < 60:
+        return np.nan
+    y = (pair["s"] - pair["RF"]).to_numpy()
+    X = np.column_stack([np.ones(len(pair)),
+                         pair["Mkt-RF"].to_numpy(), pair["SMB"].to_numpy(),
+                         pair["HML"].to_numpy(), pair["RMW"].to_numpy(),
+                         pair["CMA"].to_numpy(), pair["MOM"].to_numpy()])
+    try:
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        return float(coef[0]) * ANNUAL_TRADING_DAYS
+    except Exception:
+        return np.nan
+
+
+def _annual_turnover(weights_history: pd.DataFrame, start_dt, end_dt) -> float:
+    if weights_history is None or weights_history.empty:
+        return np.nan
+    w = weights_history.copy()
+    w.index = pd.to_datetime(w.index).tz_localize(None)
+    w = w.sort_index()
+    mask = (w.index >= pd.Timestamp(start_dt)) & (w.index <= pd.Timestamp(end_dt))
+    w = w[mask]
+    if len(w) < 2:
+        return np.nan
+    # |w_t - w_{t-1}|, summed across tickers per rebalance, averaged, scaled to
+    # actual rebalance frequency (12/yr monthly, 4/yr quarterly, etc.)
+    dw = w.diff().abs().sum(axis=1).iloc[1:]
+    return float(dw.mean() * float(globals().get("REBALANCES_PER_YEAR", 12)))
+
+
+def compute_oos_metrics(strat_returns: pd.Series,
+                        spy_returns: pd.Series,
+                        aord_returns: pd.Series,
+                        ff5_factors: pd.DataFrame | None = None,
+                        weights_history: pd.DataFrame | None = None,
+                        horizons_years: tuple[int, ...] = (3, 5, 10)) -> pd.DataFrame:
+    """Build a (metric × [horizon, series]) MultiIndex DataFrame of OOS stats."""
+    if strat_returns is None or strat_returns.empty:
+        return pd.DataFrame()
+    # Defensively normalise the indices (sort + tz-strip) so .loc slicing and
+    # reindexing don't blow up on duplicated or non-monotonic data.
+    strat_returns = strat_returns.copy()
+    strat_returns.index = pd.to_datetime(strat_returns.index).tz_localize(None)
+    strat_returns = strat_returns.sort_index()
+    strat_returns = strat_returns[~strat_returns.index.duplicated(keep="last")]
+    spy_returns = spy_returns.copy() if spy_returns is not None else pd.Series(dtype=float)
+    if not spy_returns.empty:
+        spy_returns.index = pd.to_datetime(spy_returns.index).tz_localize(None)
+        spy_returns = spy_returns.sort_index()
+        spy_returns = spy_returns[~spy_returns.index.duplicated(keep="last")]
+    aord_returns = aord_returns.copy() if aord_returns is not None else pd.Series(dtype=float)
+    if not aord_returns.empty:
+        aord_returns.index = pd.to_datetime(aord_returns.index).tz_localize(None)
+        aord_returns = aord_returns.sort_index()
+        aord_returns = aord_returns[~aord_returns.index.duplicated(keep="last")]
+
+    end_dt = strat_returns.index.max()
+
+    metric_order = ["Cumulative Return", "Annualised Return", "Annualised Volatility",
+                    "Sharpe Ratio", "Sortino Ratio", "Max Drawdown", "IR vs ^AORD",
+                    "Beta vs SPY", "Alpha vs SPY (ann)", "Alpha vs FF5 (ann)",
+                    "Annual Turnover"]
+
+    blocks = []
+    for h in horizons_years:
+        start_dt = end_dt - pd.DateOffset(years=h)
+        # Boolean mask avoids label-existence/monotonicity errors when
+        # start_dt or end_dt happens to land on a non-trading day.
+        s = strat_returns[(strat_returns.index >= start_dt) & (strat_returns.index <= end_dt)]
+        if s.empty:
+            continue
+        sp = spy_returns.reindex(s.index).fillna(0.0)
+        ao = aord_returns.reindex(s.index).fillna(0.0)
+
+        m_s = _series_metrics(s)
+        m_sp = _series_metrics(sp)
+        m_ao = _series_metrics(ao)
+
+        ir = _ir_vs_bench(s, ao)
+        alpha_spy, beta_spy = _capm_alpha_beta(s, sp)
+        alpha_ff5 = _ff5_alpha(s, ff5_factors) if ff5_factors is not None else np.nan
+        turn = _annual_turnover(weights_history, start_dt, end_dt)
+
+        strat_col = [m_s["Cumulative Return"], m_s["Annualised Return"],
+                     m_s["Annualised Volatility"], m_s["Sharpe Ratio"],
+                     m_s["Sortino Ratio"], m_s["Max Drawdown"], ir, beta_spy,
+                     alpha_spy, alpha_ff5, turn]
+        spy_col = [m_sp["Cumulative Return"], m_sp["Annualised Return"],
+                   m_sp["Annualised Volatility"], m_sp["Sharpe Ratio"],
+                   m_sp["Sortino Ratio"], m_sp["Max Drawdown"],
+                   np.nan, np.nan, np.nan, np.nan, np.nan]
+        aord_col = [m_ao["Cumulative Return"], m_ao["Annualised Return"],
+                    m_ao["Annualised Volatility"], m_ao["Sharpe Ratio"],
+                    m_ao["Sortino Ratio"], m_ao["Max Drawdown"],
+                    np.nan, np.nan, np.nan, np.nan, np.nan]
+
+        block = pd.DataFrame({"Strategy": strat_col, "SPY (AUD)": spy_col,
+                              "^AORD": aord_col}, index=metric_order)
+        block.columns = pd.MultiIndex.from_tuples(
+            [(f"{h}Y", c) for c in block.columns]
+        )
+        blocks.append(block)
+
+    if not blocks:
+        return pd.DataFrame()
+    return pd.concat(blocks, axis=1)
+
+
 # === Rebuild core analytics ===
 prices_aud_for_returns, df_melt, df_cov_wide, Sigma_daily, mu_ann_geo = _rebuild_core_from_prices(prices)
 globals()["returns_wide_df"] = df_cov_wide.copy()
+
+# === OOS walk-forward validation (Task #7 Part B) ===
+# Default ON via config.oos_validation. Skipped silently when False.
+# NOTE: the live pipeline downloads only 2y of prices (PRICE_DOWNLOAD_PERIOD),
+# which is too short to start a 24mo-trained walk-forward backtest. We fetch
+# a separate long-history (12y) view here so live optimisation behaviour is
+# unchanged. Task #11 will consolidate this into a single data store.
+oos_returns_daily = pd.Series(dtype=float)
+oos_weights_history = pd.DataFrame()
+oos_prices_aud_long = pd.DataFrame()
+if bool(CFG.get("oos_validation", True)):
+    try:
+        _oos_t0 = time.perf_counter()
+        _oos_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+        _oos_long_raw = yf.download(
+            _oos_tickers,
+            period="12y",
+            interval="1d",
+            auto_adjust=True,
+            threads=False,
+            progress=False,
+        )
+        _oos_long_px = _normalize_yfinance_close(_oos_long_raw)
+        _oos_long_px.index = pd.to_datetime(_oos_long_px.index).tz_localize(None)
+        _oos_long_px = _oos_long_px.sort_index().ffill().bfill()
+        # FX-adjust USD tickers into AUD (same recipe as _rebuild_core_from_prices).
+        _fx_raw = yf.download("USDAUD=X", period="12y", interval="1d",
+                              auto_adjust=True, threads=False, progress=False)
+        _fx = _fx_raw["Close"] if isinstance(_fx_raw, pd.DataFrame) else _fx_raw
+        if isinstance(_fx, pd.DataFrame):
+            _fx = _fx.iloc[:, 0]
+        _fx = pd.to_numeric(_fx, errors="coerce").reindex(_oos_long_px.index).ffill()
+        _usd_cols = [c for c in _oos_long_px.columns
+                     if not str(c).endswith(".AX") and not str(c).startswith("^")]
+        oos_prices_aud_long = _oos_long_px.copy()
+        if _usd_cols:
+            oos_prices_aud_long.update(_oos_long_px.loc[:, _usd_cols].mul(_fx, axis=0))
+        oos_prices_aud_long = oos_prices_aud_long.ffill().bfill()
+
+        ensemble_out = run_oos_ensemble_walk_forward(
+            oos_prices_aud_long,
+            train_window_months=24,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+        )
+        oos_returns_daily = ensemble_out["blended_returns"]
+        oos_weights_history = ensemble_out["blended_weights"]
+        # Per-candidate returns + softmax history available for downstream
+        # ensemble-mix displays (roadshow stacked area, trade-plan regime row).
+        globals()["oos_per_candidate_returns"] = ensemble_out["per_candidate_returns"]
+        globals()["oos_softmax_history"] = ensemble_out["softmax_history"]
+        globals()["oos_per_candidate_weights"] = ensemble_out["per_candidate_weights"]
+        globals()["oos_rebalance_costs"] = ensemble_out.get("rebalance_costs", pd.Series(dtype=float))
+        globals()["oos_rebalance_taxes"] = ensemble_out.get("rebalance_taxes", pd.Series(dtype=float))
+        # Report annualised drag from brokerage + CGT separately (informative).
+        _cost_ser = ensemble_out.get("rebalance_costs", pd.Series(dtype=float))
+        _tax_ser = ensemble_out.get("rebalance_taxes", pd.Series(dtype=float))
+        _years = max(len(oos_returns_daily) / ANNUAL_TRADING_DAYS, 1e-6)
+        if not _cost_ser.empty:
+            _ann_cost_bps = float(_cost_ser.sum()) / _years * 10_000
+            print(f"[oos] brokerage ({BROKER_CONFIG['name']}): "
+                  f"avg {float(_cost_ser.mean())*10000:.1f} bps/rebal, "
+                  f"~{_ann_cost_bps:.0f} bps/year")
+        if not _tax_ser.empty and _tax_ser.sum() > 0:
+            _ann_tax_bps = float(_tax_ser.sum()) / _years * 10_000
+            _mtr_pct = (float(CGT_CONFIG['marginal_tax_rate']) +
+                        float(CGT_CONFIG.get('medicare_levy', 0.0)) *
+                        (1.0 if CGT_CONFIG.get('include_medicare', True) else 0.0)) * 100
+            print(f"[oos] CGT (MTR {_mtr_pct:.0f}%, LT discount "
+                  f"{int(float(CGT_CONFIG['lt_discount_rate'])*100)}%): "
+                  f"avg {float(_tax_ser.mean())*10000:.1f} bps/rebal, "
+                  f"~{_ann_tax_bps:.0f} bps/year")
+            print(f"[oos] TOTAL drag (brokerage + CGT): "
+                  f"~{_ann_cost_bps + _ann_tax_bps:.0f} bps/year (NET in metrics)")
+        _oos_t1 = time.perf_counter()
+        if not oos_returns_daily.empty:
+            print(
+                f"[oos] ensemble walk-forward ({REBALANCE_FREQ}, "
+                f"~{REBALANCES_PER_YEAR:.1f}/yr): "
+                f"{oos_returns_daily.index.min().date()} → "
+                f"{oos_returns_daily.index.max().date()} "
+                f"({len(oos_returns_daily)} days, {len(oos_weights_history)} rebalances, "
+                f"{_oos_t1 - _oos_t0:.1f}s)"
+            )
+            # Conditional rebalancing diagnostics
+            _ns = int(ensemble_out.get("n_scheduled", 0))
+            _net = int(ensemble_out.get("n_early_triggered", 0))
+            _nex = int(ensemble_out.get("n_executed", 0))
+            _nsk = int(ensemble_out.get("n_skipped", 0))
+            print(
+                f"[oos] rebal mix → scheduled={_ns}, early-triggered={_net}, "
+                f"executed={_nex}, skipped={_nsk} "
+                f"(skip<{SKIP_REBAL_DELTA*100:.0f}% Δw, DD-trigger>{EARLY_TRIGGER_DD_DEEPEN*100:.0f}%)"
+            )
+            # Latest regime mix — useful for the trade plan slide.
+            if not ensemble_out["softmax_history"].empty:
+                _latest = ensemble_out["softmax_history"].iloc[-1]
+                _mix = ", ".join(f"{n.split(' ')[0]}={float(_latest.get(n,0))*100:.0f}%"
+                                  for n in ENSEMBLE_SLOT_NAMES)
+                print(f"[oos] latest regime mix → {_mix}")
+        else:
+            print("[oos] ensemble walk-forward returned empty series — check training-window coverage")
+    except Exception as _e:
+        print(f"[oos] walk-forward failed: {_e}")
+        oos_returns_daily = pd.Series(dtype=float)
+        oos_weights_history = pd.DataFrame()
+globals()["oos_returns_daily"] = oos_returns_daily
+globals()["oos_weights_history"] = oos_weights_history
+globals()["oos_prices_aud_long"] = oos_prices_aud_long
+
+# === Live ensemble recommendation (Task #10) ===
+# Use TODAY's mu/Sigma (live 2y window) for candidate solving, but score the
+# candidates with OOS HISTORICAL per-candidate returns (10y of evidence). This
+# is the unified engine: the roadshow shows what the live engine would have
+# done, and the live engine produces the same thing today.
+w_ensemble_live = pd.Series(dtype=float)
+ensemble_mix_live = pd.Series(dtype=float)
+try:
+    _mu_live = pd.Series(mu_ann_geo).astype(float).dropna()
+    _Sigma_live = Sigma_daily.copy()
+    _spy_mu_live = float(_mu_live["SPY"]) if "SPY" in _mu_live.index else None
+    _cand_live = solve_candidate_portfolios(_mu_live, _Sigma_live, _spy_mu_live)
+    _oos_cand_rets = globals().get("oos_per_candidate_returns", pd.DataFrame())
+    # For IR scoring, pass SPY daily returns aligned to OOS candidate returns.
+    _spy_bench_for_score = None
+    if "SPY" in oos_prices_aud_long.columns:
+        _spy_bench_for_score = oos_prices_aud_long["SPY"].pct_change().dropna()
+    ensemble_mix_live = softmax_ensemble_weights(
+        _oos_cand_rets, lookback_days=252, lambda_temp=3.0, halflife_days=60,
+        benchmark_returns=_spy_bench_for_score,
+    )
+    # Blend with forward-looking SPY regime signal (same as OOS engine).
+    if "SPY" in oos_prices_aud_long.columns and not oos_prices_aud_long.empty:
+        _fwd_live = compute_forward_regime_signal(
+            benchmark_prices=oos_prices_aud_long["SPY"],
+            as_of_date=oos_prices_aud_long.index.max(),
+        )
+        ensemble_mix_live = blend_ensemble_signals(
+            backward_weights=ensemble_mix_live,
+            forward_weights=_fwd_live,
+            backward_alpha=0.5,
+        )
+    # Blend
+    _ticker_idx = sorted(set().union(*[set(c.index) for c in _cand_live.values() if not c.empty]))
+    if _ticker_idx and not ensemble_mix_live.empty:
+        w_ensemble_live = pd.Series(0.0, index=_ticker_idx)
+        for n in ENSEMBLE_SLOT_NAMES:
+            cand_w = _cand_live.get(n, pd.Series(dtype=float))
+            if cand_w.empty or ensemble_mix_live.get(n, 0.0) <= 0:
+                continue
+            w_ensemble_live = w_ensemble_live.add(
+                cand_w.reindex(_ticker_idx).fillna(0.0) * float(ensemble_mix_live[n]),
+                fill_value=0.0,
+            )
+        w_ensemble_live = w_ensemble_live[w_ensemble_live > 1e-6]
+        if not w_ensemble_live.empty and w_ensemble_live.sum() > 0:
+            w_ensemble_live = w_ensemble_live / w_ensemble_live.sum()
+    _mix_str = ", ".join(
+        f"{n.split(' ')[0]}={float(ensemble_mix_live.get(n,0))*100:.0f}%"
+        for n in ENSEMBLE_SLOT_NAMES
+    )
+    print(f"[ensemble] Live regime mix → {_mix_str}")
+    print(f"[ensemble] Live recommendation: {len(w_ensemble_live)} positions, "
+          f"top: {w_ensemble_live.nlargest(5).to_dict() if not w_ensemble_live.empty else '{}'}")
+except Exception as _e:
+    print(f"[ensemble] Live ensemble blend failed: {_e}")
+globals()["W_ENSEMBLE_SER"] = w_ensemble_live
+globals()["ensemble_mix_live"] = ensemble_mix_live
+
+# Metrics table (Phase 2): horizons × series, written to Excel + Slide 2 later.
+oos_metrics_table = pd.DataFrame()
+if not oos_returns_daily.empty and not oos_prices_aud_long.empty:
+    try:
+        _spy_aud = oos_prices_aud_long.get("SPY") if "SPY" in oos_prices_aud_long.columns else None
+        _aord = oos_prices_aud_long.get("^AORD") if "^AORD" in oos_prices_aud_long.columns else None
+        _spy_ret = _spy_aud.pct_change().dropna() if _spy_aud is not None else pd.Series(dtype=float)
+        _aord_ret = _aord.pct_change().dropna() if _aord is not None else pd.Series(dtype=float)
+        _ff5 = globals().get("ff5_raw", None)
+        oos_metrics_table = compute_oos_metrics(
+            strat_returns=oos_returns_daily,
+            spy_returns=_spy_ret,
+            aord_returns=_aord_ret,
+            ff5_factors=_ff5,
+            weights_history=oos_weights_history,
+            horizons_years=(3, 5, 10),
+        )
+        if not oos_metrics_table.empty:
+            print(f"[oos] metrics computed: {oos_metrics_table.shape[0]} metrics × {oos_metrics_table.shape[1]} cols")
+    except Exception as _e:
+        print(f"[oos] metrics computation failed: {_e}")
+globals()["oos_metrics_table"] = oos_metrics_table
 
 # Tables used later
 n_opt = len(securities_opt)
@@ -4677,54 +6351,117 @@ if USE_XLWINGS:
           
             # ---- Build trade plan & costs - writing Trade Plan/Costs/Tilts ----
             _tp_mode = str(globals().get("TRADE_PLAN_MODE", "ask")).lower().strip()
-            
+            print(f"[tradeplan] resolved mode at entry: {_tp_mode!r}")
+
             # Decide which portfolio drives the ACTIVE trade plan
             if _tp_mode == "ask":
                 _tp_mode = ask_tradeplan_portfolio_choice()
-            
+
             elif _tp_mode == "auto":
-                # Validation-based choice (Sharpe over lookback)
+                # Validation-based choice (Sharpe over lookback). Now considers
+                # the regime-adaptive ensemble as a 3rd candidate.
                 _rwide = globals().get("returns_wide_df", None)
+                _w_ensemble_live = globals().get("W_ENSEMBLE_SER", pd.Series(dtype=float))
+                print(f"[tradeplan] auto branch entered. returns_wide_df type={type(_rwide).__name__}, "
+                      f"shape={getattr(_rwide,'shape',None)}; W_ENSEMBLE_SER len={len(_w_ensemble_live)}")
                 if isinstance(_rwide, pd.DataFrame) and not _rwide.empty:
-                    choice_label, w_chosen, diag = choose_portfolio_for_tradeplan(
-                        returns_df=_rwide,
-                        w_no_tilts=pd.Series(w_star, index=Sigma_opt.index),
-                        w_with_tilts=pd.Series(w_star_with_tilts, index=Sigma_opt.index),
-                        rf_annual=float(rf_annual),
-                        lookback_days=int(globals().get("VALIDATION_LOOKBACK_DAYS", 252)),
-                    )
-                    _tp_mode = choice_label
+                    try:
+                        choice_label, w_chosen, diag = choose_portfolio_for_tradeplan(
+                            returns_df=_rwide,
+                            w_no_tilts=pd.Series(w_star, index=Sigma_opt.index),
+                            w_with_tilts=pd.Series(w_star_with_tilts, index=Sigma_opt.index),
+                            rf_annual=float(rf_annual),
+                            lookback_days=int(globals().get("VALIDATION_LOOKBACK_DAYS", 252)),
+                            w_ensemble=_w_ensemble_live,
+                        )
+                        _tp_mode = choice_label
+                        print(f"[tradeplan] auto-selected: {choice_label} "
+                              f"(Sharpe — ens:{diag.get('sharpe_ensemble', np.nan):.2f}, "
+                              f"with:{diag.get('sharpe_with_tilts', np.nan):.2f}, "
+                              f"no:{diag.get('sharpe_no_tilts', np.nan):.2f})")
+                    except Exception as _e_choose:
+                        print(f"[tradeplan] choose_portfolio_for_tradeplan FAILED: {_e_choose!r}")
+                        _tp_mode = "no_tilts"
                 else:
+                    print("[tradeplan] returns_wide_df not usable → defaulting to no_tilts")
                     _tp_mode = "no_tilts"
-            
-            # Final mapping to weights
-            w_tradeplan = w_star_with_tilts if _tp_mode == "with_tilts" else w_star
-            w_tradeplan = pd.Series(np.asarray(w_tradeplan, dtype=float), index=Sigma_opt.index)            
-            # Build BOTH trade plans
+
+            # Resolve ensemble weights for the active plan (if requested).
+            _w_ensemble_live = globals().get("W_ENSEMBLE_SER", pd.Series(dtype=float))
+
+            # Build ALL three trade plans up-front; downstream code can compare
+            # what each one implies, and the "active" one is picked below.
             trade_no, resid_no = make_trade_plan(
                 units, last_px_hold, fx_map_all, w_star,
                 include_zero_lines=True, include_flags=include_flags,
                 portfolio_value_override=portfolio_value_override
             )
-            
+
             trade_with, resid_with = make_trade_plan(
                 units, last_px_hold, fx_map_all, w_star_with_tilts,
                 include_zero_lines=True, include_flags=include_flags,
                 portfolio_value_override=portfolio_value_override
             )
-            
-            # Select which one is the "active" plan (the rest of your pipeline uses trade_rec)
-            use_with = (_tp_mode == "with_tilts")
-            trade_rec  = trade_with if use_with else trade_no
-            resid_rec  = resid_with if use_with else resid_no
-            
+
+            trade_ens, resid_ens = None, None
+            if isinstance(_w_ensemble_live, pd.Series) and not _w_ensemble_live.empty:
+                try:
+                    # The ensemble can recommend tickers that aren't in Sigma_opt
+                    # (e.g. GOLD.AX, GOVT.AX — added to prices but missing FF5
+                    # regional betas). Use the UNION of Sigma_opt and the
+                    # ensemble's own tickers so nothing gets dropped.
+                    _target_idx = _w_ensemble_live.index.union(Sigma_opt.index)
+                    _target_idx = _target_idx.difference({"^AORD", "PortfolioValue"})
+                    _w_ens_full = pd.Series(0.0, index=_target_idx)
+                    _w_ens_full.loc[_w_ensemble_live.index.intersection(_target_idx)] = \
+                        _w_ensemble_live.reindex(_target_idx.intersection(_w_ensemble_live.index))
+                    if _w_ens_full.sum() > 0:
+                        _w_ens_full = _w_ens_full / _w_ens_full.sum()
+                    # Diagnostic: surface tickers the ensemble picked that
+                    # weren't in Sigma_opt (FF5 filtered them out).
+                    _extras = sorted(set(_w_ensemble_live.index) - set(Sigma_opt.index) - {"^AORD"})
+                    if _extras:
+                        print(f"[tradeplan] ensemble picks NOT in Sigma_opt "
+                              f"(FF5 filter): {_extras}")
+                    trade_ens, resid_ens = make_trade_plan(
+                        units, last_px_hold, fx_map_all, _w_ens_full,
+                        include_zero_lines=True, include_flags=include_flags,
+                        portfolio_value_override=portfolio_value_override
+                    )
+                except Exception as _e_ens:
+                    print(f"[tradeplan] ensemble plan build failed: {_e_ens}")
+                    trade_ens, resid_ens = None, None
+
+            # Map _tp_mode → (w_tradeplan, trade_rec, resid_rec)
+            # The ensemble path can include tickers outside Sigma_opt (e.g.
+            # GOLD.AX or dialog-added NDQ.AX that lack FF5 regional betas).
+            # Capture the actual weight index per-branch so we don't force a
+            # length mismatch when the ensemble's universe is wider.
+            if _tp_mode == "ensemble" and trade_ens is not None:
+                w_tradeplan_vals = _w_ens_full.values
+                w_tradeplan_idx = _w_ens_full.index
+                trade_rec, resid_rec = trade_ens, resid_ens
+            elif _tp_mode == "with_tilts":
+                w_tradeplan_vals = w_star_with_tilts
+                w_tradeplan_idx = Sigma_opt.index
+                trade_rec, resid_rec = trade_with, resid_with
+            else:
+                _tp_mode = "no_tilts"
+                w_tradeplan_vals = w_star
+                w_tradeplan_idx = Sigma_opt.index
+                trade_rec, resid_rec = trade_no, resid_no
+            w_tradeplan = pd.Series(np.asarray(w_tradeplan_vals, dtype=float),
+                                    index=w_tradeplan_idx)
+
             # Persist labels/weights for PPT + achieved-tilts table
-            globals()["TRADEPLAN_LABEL"] = "with_tilts" if use_with else "no_tilts"
-            globals()["TRADEPLAN_WEIGHTS_SER"] = pd.Series(np.asarray(w_tradeplan, dtype=float), index=Sigma_opt.index).copy()
-            
-            # Keep the other plan available for Excel writing
+            globals()["TRADEPLAN_LABEL"] = _tp_mode
+            globals()["TRADEPLAN_WEIGHTS_SER"] = w_tradeplan.copy()
+
+            # Keep the others available for Excel writing / comparison
             globals()["TRADEPLAN_DF_NO_TILTS"] = trade_no.copy()
             globals()["TRADEPLAN_DF_WITH_TILTS"] = trade_with.copy()
+            if trade_ens is not None:
+                globals()["TRADEPLAN_DF_ENSEMBLE"] = trade_ens.copy()
             
             # --- Ensure 'Security' is a proper column BEFORE any downstream functions ---
             trade_rec = trade_rec.copy()
@@ -5273,6 +7010,37 @@ if USE_XLWINGS:
                     print(f"[excel] Regression_Diagnostics: {len(_stats_out)} securities written")
             except Exception as _e_diag:
                 print(f"[excel] Regression_Diagnostics write skipped: {_e_diag}")
+
+            # OOS_Validation sheet — walk-forward backtest metrics across 3y/5y/10y.
+            try:
+                _oos_tbl = globals().get("oos_metrics_table", None)
+                if isinstance(_oos_tbl, pd.DataFrame) and not _oos_tbl.empty:
+                    # Flatten MultiIndex columns to "(horizon, series)" strings for xlwings.
+                    _oos_flat = _oos_tbl.copy()
+                    _oos_flat.columns = [f"{h} {s}" for h, s in _oos_tbl.columns]
+                    oos_sht = get_or_clear_sheet(wb, 'OOS_Validation')
+                    oos_sht.range('A1').options(pd.DataFrame, index=True, header=True).value = _oos_flat
+
+                    # Format metrics by row (percentages vs ratios).
+                    pct_rows = {"Cumulative Return", "Annualised Return", "Annualised Volatility",
+                                "Max Drawdown", "Alpha vs SPY (ann)", "Alpha vs FF5 (ann)",
+                                "Annual Turnover"}
+                    ratio_rows = {"Sharpe Ratio", "Sortino Ratio", "IR vs ^AORD", "Beta vs SPY"}
+                    n_cols = len(_oos_flat.columns)
+                    _fmts_oos = {}
+                    for i, metric in enumerate(_oos_flat.index):
+                        row_excel = i + 2  # +1 for header, +1 for 1-indexed
+                        end_letter = chr(ord("A") + n_cols)  # last data column letter
+                        rng = f"B{row_excel}:{end_letter}{row_excel}"
+                        if metric in pct_rows:
+                            _fmts_oos[rng] = "0.00%"
+                        elif metric in ratio_rows:
+                            _fmts_oos[rng] = "0.00"
+                    set_number_formats(oos_sht, _fmts_oos)
+                    oos_sht.autofit()
+                    print(f"[excel] OOS_Validation: {_oos_flat.shape[0]} metrics × {_oos_flat.shape[1]} cols written")
+            except Exception as _e_oos:
+                print(f"[excel] OOS_Validation write skipped: {_e_oos}")
 
             # ---- Update Lots and overwrite Holdings with target units (for next run) ----
             UPDATED_LOTS = _update_lots_after_trades(lots_df, trade_rec, pd.Timestamp(prices.index[-1]), fx_map_all)
@@ -5922,7 +7690,9 @@ def export_to_ppt(results, trades, charts=None):
     
     # Show both options with one checked
     pl = plan_label.lower().replace("_", " ").strip()
-    is_with = (pl == "with tilts")
+    is_with = (pl == "with tilts" or pl == "with_tilts")
+    is_ens = (pl == "ensemble")
+    is_no = not (is_with or is_ens)
     box = slide.shapes.add_textbox(Cm(2.15), Cm(2.05), Cm(21.80), Cm(0.45))
     tf = box.text_frame
     tf.clear()
@@ -5932,11 +7702,49 @@ def export_to_ppt(results, trades, charts=None):
     tf.margin_top = 0
     tf.margin_bottom = 0
     p = tf.paragraphs[0]
-    p.text = f"{'[x]' if is_with else '[ ]'} With Tilts    {'[ ]' if is_with else '[x]'} Optimised (No Tilts)    |    Trade plan: {plan_label}"
+    p.text = (
+        f"{'[x]' if is_ens else '[ ]'} Ensemble    "
+        f"{'[x]' if is_with else '[ ]'} With Tilts    "
+        f"{'[x]' if is_no else '[ ]'} Optimised (No Tilts)    "
+        f"|    Trade plan: {plan_label}"
+    )
     p.font.size = Pt(11)
     p.font.bold = True
     p.font.color.rgb = RGBColor(255, 255, 255)
     p.alignment = PP_ALIGN.LEFT
+
+    # --- Regime mix annotation (only when ensemble is the active plan) ---
+    if is_ens:
+        try:
+            mix = globals().get("ensemble_mix_live", pd.Series(dtype=float))
+            if isinstance(mix, pd.Series) and not mix.empty:
+                # Compact mix string: "Def 3% · Modest 15% · Agg 27% · Bold 28% · Max 27%"
+                _abbr = {
+                    "Modest (SPY+0%)":      "Modest",
+                    "Aggressive (SPY+5%)":  "Agg",
+                    "Bold (SPY+10%)":       "Bold",
+                    "Maximum (SPY+15%)":    "Max",
+                    "Stretch (SPY+25%)":    "Stretch",
+                }
+                parts = []
+                for n in ENSEMBLE_SLOT_NAMES:
+                    if n in mix.index:
+                        parts.append(f"{_abbr.get(n, n)} {float(mix[n])*100:.0f}%")
+                mix_str = " · ".join(parts)
+                mix_box = slide.shapes.add_textbox(Cm(2.15), Cm(2.55), Cm(21.80), Cm(0.45))
+                tfm = mix_box.text_frame
+                tfm.clear()
+                tfm.word_wrap = False
+                tfm.margin_left = 0
+                tfm.margin_top = 0
+                pm = tfm.paragraphs[0]
+                pm.text = f"Regime mix today (rolling-12M Sortino softmax): {mix_str}"
+                pm.font.size = Pt(10)
+                pm.font.italic = True
+                pm.font.color.rgb = RGBColor(255, 255, 255)
+                pm.alignment = PP_ALIGN.LEFT
+        except Exception as _e_mix:
+            print(f"[pptx] Slide 2 regime mix annotation skipped: {_e_mix}")
 
     # --- Draw Trade Plan table ---
     if trades is not None and not trades.empty:
@@ -6125,9 +7933,8 @@ def export_to_ppt(results, trades, charts=None):
             slide.shapes.title.text = "Portfolio Performance"
 
         # --- Get 3-month portfolio + benchmarks ---
-        lookback_days = 90
         slide3 = slide  # alias for clarity in the callout call below
-        
+
         # Use the portfolio value series as the date anchor (NOT prices)
         pval_src = globals().get("portfolio_value_series", None)
         if pval_src is None and isinstance(charts, dict):
@@ -6136,42 +7943,53 @@ def export_to_ppt(results, trades, charts=None):
             raise ValueError("portfolio_value_series is missing. Run Cell 15 first.")
         pval_all = pd.to_numeric(pd.Series(pval_src), errors="coerce").dropna().copy()
         pval_all.index = pd.to_datetime(pval_all.index).tz_localize(None)
-        
-        end_dt = pval_all.index.max()
-        start_dt = end_dt - pd.Timedelta(days=lookback_days)
 
-        # Date callout under the slide title — Slide 3 anchors to LIVE portfolio end.
-        _add_date_callout(slide3, start_dt, end_dt, prefix="Data")
+        end_dt = pval_all.index.max()
+        # IMPORTANT: use the SAME 3-month anchor as the return table below
+        # (_period_total_return uses relativedelta(months=3)). A naive
+        # timedelta(days=90) gives a different baseline by ~4 trading days,
+        # which causes the chart's rightmost y-value to disagree with the
+        # table's 3M column (e.g. With Tilts visually below SPY on chart but
+        # above in table).
+        start_dt = end_dt - relativedelta(months=3)
+
+        # Date callout is deferred until after perf_df is built so it reflects
+        # the ACTUAL first/last trading day rendered on the chart — otherwise
+        # start_dt can land on a weekend and disagree with the x-axis by 1–2 days.
 
         pval = pval_all.loc[start_dt:end_dt].copy()
         pval = pval.ffill().bfill()
-        
+
         benchmarks = ["^AORD", "^GSPC", "^IXIC"]
-        
-        # yfinance end is exclusive; add a day so we actually include the last date
-        bench_raw = yf.download(
+
+        # ONE benchmark download — long enough for the 3Y table column. The
+        # chart slices this for its 3M window. Using two separate downloads
+        # (short for chart, long for table) causes auto_adjust to back-adjust
+        # dividends differently across the two windows, which makes the chart's
+        # 3M return disagree with the table's 3M column for the same ticker.
+        bench_long_start = end_dt - relativedelta(years=3, months=1)
+        bench_long = yf.download(
             benchmarks,
-            start=pval.index.min(),
-            end=(pval.index.max() + pd.Timedelta(days=1)),
+            start=bench_long_start,
+            end=(end_dt + pd.Timedelta(days=1)),
             progress=False,
             auto_adjust=True,
             threads=False
         )
-        
+
         # Handle multi-index and clean
-        if isinstance(bench_raw.columns, pd.MultiIndex):
-            bench_raw = bench_raw["Close"]
+        if isinstance(bench_long.columns, pd.MultiIndex):
+            bench_long = bench_long["Close"]
         else:
-            # Sometimes yf returns a single level; still try to use Close if present
-            if "Close" in bench_raw.columns:
-                bench_raw = bench_raw["Close"]
-        
-        bench_raw.index = pd.to_datetime(bench_raw.index).tz_localize(None)
-        bench_raw = bench_raw.ffill().bfill()
-        
-        # Align benchmarks to portfolio dates
-        bench = bench_raw.reindex(pval.index).ffill().bfill()
-        
+            if "Close" in bench_long.columns:
+                bench_long = bench_long["Close"]
+
+        bench_long.index = pd.to_datetime(bench_long.index).tz_localize(None)
+        bench_long = bench_long.ffill().bfill()
+
+        # Chart uses the 3M slice of the unified download
+        bench = bench_long.reindex(pval.index).ffill().bfill()
+
         # Returns from start of window (decimal)
         portfolio_returns = (pval / pval.iloc[0]) - 1.0
         benchmark_returns = bench.div(bench.iloc[0]).subtract(1.0)
@@ -6231,16 +8049,33 @@ def export_to_ppt(results, trades, charts=None):
         except Exception:
             pass
 
+        # Now that perf_df is finalised, add the date callout using the ACTUAL
+        # first/last trading day rendered. This is what the user sees on the
+        # x-axis, so the callout cannot disagree with the chart.
+        _add_date_callout(slide3, perf_df.index.min(), perf_df.index.max(), prefix="Data")
+
         # --- Plot ---
+        # Use matplotlib directly (not pandas .plot) so the x-axis is a real
+        # date axis. pandas's plotter uses period codes internally, which makes
+        # explicit set_xticks([Timestamp,...]) silently fall back to an auto-
+        # locator with the wrong range.
         fig, ax = plt.subplots(figsize=(7, 4.5))
-        perf_df.mul(100).plot(ax=ax, linewidth=1.8)
-        # Lock the x-axis to the actual data range so callout date and chart
-        # x-axis agree. Without this, matplotlib's auto date-locator picks
-        # ticks that don't reflect the real data span.
+        for col in perf_df.columns:
+            ax.plot(perf_df.index, perf_df[col].mul(100), linewidth=1.8, label=col)
+
+        # Lock x-axis to actual data range so callout and chart agree.
         ax.set_xlim(perf_df.index.min(), perf_df.index.max())
-        # Monthly major ticks + a couple of minor ticks per month — fewer
-        # labels, but each one is unambiguous.
-        ax.xaxis.set_major_locator(mdates.MonthLocator())
+
+        # Explicit major ticks: data start + each subsequent month-start within range.
+        # Converted to mpl date numbers so FixedLocator places them correctly.
+        _start, _end = perf_df.index.min(), perf_df.index.max()
+        _month_ticks = pd.date_range(
+            start=(_start + pd.offsets.MonthBegin(1)),
+            end=_end,
+            freq="MS",
+        )
+        major_ticks = [mdates.date2num(_start)] + [mdates.date2num(t) for t in _month_ticks]
+        ax.xaxis.set_major_locator(mtick.FixedLocator(major_ticks))
         ax.xaxis.set_minor_locator(mdates.DayLocator(bymonthday=(15,)))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
         ax.xaxis.set_minor_formatter(mdates.DateFormatter("%d"))
@@ -6252,7 +8087,21 @@ def export_to_ppt(results, trades, charts=None):
         ax.set_ylabel("Return (%)")
         ax.legend(loc="upper left", frameon=False)
         ax.grid(True, linestyle="--", alpha=0.4)
-        
+
+        # Explicit end-date annotation in the chart bottom-right, mirroring the
+        # FF-vs-Portfolio slide so the live-data end date is unambiguous.
+        try:
+            ax.annotate(
+                f"End: {pd.Timestamp(perf_df.index.max()).strftime('%d %b %Y')}",
+                xy=(0.99, 0.02), xycoords="axes fraction",
+                ha="right", va="bottom",
+                fontsize=9, color="#404040", style="italic",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          edgecolor="#bbbbbb", alpha=0.85),
+            )
+        except Exception:
+            pass
+
         _perf_buf = io.BytesIO()
         fig.savefig(_perf_buf, format="png", bbox_inches="tight")
         plt.close(fig)
@@ -6273,32 +8122,10 @@ def export_to_ppt(results, trades, charts=None):
                 port_px = globals().get("portfolio_value_series", None)
 
             
-            # Benchmarks: download a longer window so 6M/12M/3Y arenâ€™t clipped to the same start date
-            bench_px = {}
-            if port_px is not None and not pd.to_numeric(port_px, errors="coerce").dropna().empty:
-                end_dt_tbl = pd.to_datetime(pd.to_numeric(port_px, errors="coerce").dropna().index[-1])
-            else:
-                end_dt_tbl = pd.to_datetime(recent_prices.index[-1])
-            
-            start_dt_tbl = end_dt_tbl - relativedelta(years=3, months=1)
-            
-            benchmark_data_long = yf.download(
-                benchmarks,
-                start=start_dt_tbl,
-                end=end_dt_tbl,
-                progress=False,
-                auto_adjust=True,
-                threads=False
-            )
-            
-            if isinstance(benchmark_data_long.columns, pd.MultiIndex):
-                benchmark_data_long = benchmark_data_long["Close"]
-            
-            benchmark_data_long = benchmark_data_long.ffill().bfill()
-            
-            for b in benchmarks:
-                if b in benchmark_data_long.columns:
-                    bench_px[b] = benchmark_data_long[b]
+            # Re-use the single benchmark download from the chart section so the
+            # chart's 3M curves and the table's 3M column are computed from
+            # IDENTICAL price series (no auto_adjust drift between windows).
+            bench_px = {b: bench_long[b] for b in benchmarks if b in bench_long.columns}
 
         
             end_dt = None
@@ -6634,6 +8461,211 @@ def export_to_ppt(results, trades, charts=None):
 
         except Exception as e:
             print(f"[pptx] Slide 5 skipped: {e}")
+
+        # ---- ROADSHOW SLIDE (Phase 3): inserted at position 2 after build. ----
+        try:
+            oos_rets = globals().get("oos_returns_daily", pd.Series(dtype=float))
+            oos_mtx = globals().get("oos_metrics_table", pd.DataFrame())
+            oos_px_long = globals().get("oos_prices_aud_long", pd.DataFrame())
+
+            if (isinstance(oos_rets, pd.Series) and not oos_rets.empty and
+                isinstance(oos_mtx, pd.DataFrame) and not oos_mtx.empty):
+
+                slide_layout = prs.slide_layouts[20]
+                road = prs.slides.add_slide(slide_layout)
+                if road.shapes.title:
+                    road.shapes.title.text = "Fund Performance vs Benchmarks"
+
+                # Aligned daily returns for chart.
+                end_dt_rs = oos_rets.index.max()
+                start_dt_rs = end_dt_rs - pd.DateOffset(years=10)
+                rs_strat = oos_rets[(oos_rets.index >= start_dt_rs) &
+                                    (oos_rets.index <= end_dt_rs)].copy()
+
+                # Benchmark daily returns from the unified long download.
+                def _bench_rets(col):
+                    if col not in oos_px_long.columns:
+                        return pd.Series(dtype=float)
+                    px = pd.to_numeric(oos_px_long[col], errors="coerce").dropna()
+                    return px.pct_change().dropna()
+                spy_rs = _bench_rets("SPY").reindex(rs_strat.index).fillna(0.0)
+                aord_rs = _bench_rets("^AORD").reindex(rs_strat.index).fillna(0.0)
+
+                # Wealth curves: $100k base.
+                base = 100_000.0
+                w_strat = base * (1.0 + rs_strat).cumprod()
+                w_spy = base * (1.0 + spy_rs).cumprod()
+                w_aord = base * (1.0 + aord_rs).cumprod()
+
+                # Date callout under title (using actual rendered range).
+                _add_date_callout(road, w_strat.index.min(), w_strat.index.max(),
+                                  prefix="Backtest")
+
+                # Cumulative wealth chart + ensemble regime evolution.
+                # Two stacked subplots sharing the x-axis: top = wealth curves,
+                # bottom = softmax-weighted regime mix over time.
+                oos_soft = globals().get("oos_softmax_history", pd.DataFrame())
+                has_softmax = isinstance(oos_soft, pd.DataFrame) and not oos_soft.empty
+                if has_softmax:
+                    fig, (ax, ax_mix) = plt.subplots(
+                        2, 1, figsize=(11.5, 5.5),
+                        gridspec_kw={"height_ratios": [3.5, 1.0]},
+                        sharex=True,
+                    )
+                else:
+                    fig, ax = plt.subplots(figsize=(11.5, 4.5))
+                    ax_mix = None
+
+                ax.plot(w_strat.index, w_strat.values, linewidth=2.2,
+                        label="Fund (Strategy)", color="#1f4e8a")
+                ax.plot(w_spy.index, w_spy.values, linewidth=1.6,
+                        label="SPY (AUD)", color="#c53030", alpha=0.85)
+                ax.plot(w_aord.index, w_aord.values, linewidth=1.6,
+                        label="^AORD", color="#2f855a", alpha=0.85)
+                ax.set_xlim(w_strat.index.min(), w_strat.index.max())
+                ax.xaxis.set_major_locator(mdates.YearLocator())
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+                ax.yaxis.set_major_formatter(mtick.FuncFormatter(
+                    lambda x, _p: f"${x/1000:,.0f}k"))
+                ax.set_title(
+                    f"$100,000 invested — terminal value vs benchmarks    "
+                    f"(net of {BROKER_CONFIG['name']} brokerage + AU CGT "
+                    f"[{ACTIVE_CGT_PROFILE}])",
+                    fontsize=10,
+                )
+                ax.set_ylabel("Portfolio Value (AUD)")
+                ax.legend(loc="upper left", frameon=False)
+                ax.grid(True, linestyle="--", alpha=0.4)
+
+                # Terminal-value annotations on right edge.
+                for s, lbl, col in [(w_strat, "Fund", "#1f4e8a"),
+                                    (w_spy, "SPY", "#c53030"),
+                                    (w_aord, "^AORD", "#2f855a")]:
+                    if not s.empty:
+                        ax.annotate(f"  ${s.iloc[-1]/1000:,.0f}k",
+                                    xy=(s.index[-1], s.iloc[-1]),
+                                    xytext=(4, 0), textcoords="offset points",
+                                    va="center", fontsize=9,
+                                    fontweight="bold", color=col)
+
+                # Bottom subplot: ensemble regime mix stacked area.
+                if ax_mix is not None:
+                    regime_colors = {
+                        "Modest (SPY+0%)":      "#5b9bd5",  # blue - lowest aggression
+                        "Aggressive (SPY+5%)":  "#70ad47",  # green
+                        "Bold (SPY+10%)":       "#ffc000",  # yellow
+                        "Maximum (SPY+15%)":    "#ed7d31",  # orange
+                        "Stretch (SPY+25%)":    "#c00000",  # dark red - top aggression
+                    }
+                    cols_in_order = [n for n in ENSEMBLE_SLOT_NAMES if n in oos_soft.columns]
+                    if cols_in_order:
+                        soft_plot = oos_soft[cols_in_order].copy()
+                        # Reindex to a regular forward-fill so the area chart
+                        # interpolates between monthly rebalance dates.
+                        idx_daily = w_strat.index
+                        soft_plot = soft_plot.reindex(idx_daily, method="ffill").fillna(0.0)
+                        ax_mix.stackplot(
+                            soft_plot.index,
+                            *[soft_plot[c].values for c in cols_in_order],
+                            labels=[c.split(" ")[0] for c in cols_in_order],
+                            colors=[regime_colors.get(c, "#888888") for c in cols_in_order],
+                            alpha=0.85,
+                        )
+                        ax_mix.set_ylim(0, 1)
+                        ax_mix.set_ylabel("Regime", fontsize=9)
+                        ax_mix.yaxis.set_major_formatter(mtick.PercentFormatter(1.0, 0))
+                        ax_mix.tick_params(axis="y", labelsize=8)
+                        ax_mix.tick_params(axis="x", labelsize=9)
+                        # Legend below the strip with clearly-sized labels —
+                        # 5 entries in one row.
+                        ax_mix.legend(loc="upper center", ncol=5, fontsize=9,
+                                       frameon=False, bbox_to_anchor=(0.5, -0.30),
+                                       handlelength=1.4, handleheight=1.0,
+                                       columnspacing=1.5, borderpad=0.2)
+                        ax_mix.grid(True, axis="y", linestyle="--", alpha=0.3)
+
+                fig.tight_layout()
+                _rs_buf = io.BytesIO()
+                fig.savefig(_rs_buf, format="png", bbox_inches="tight")
+                plt.close(fig)
+                _rs_buf.seek(0)
+
+                # Bigger picture area, matched to the (11.5, 5.5) figure aspect
+                # so the regime legend renders at readable size.
+                road.shapes.add_picture(_rs_buf, Cm(0.7), Cm(2.4),
+                                        width=Cm(23.8), height=Cm(10.5))
+
+                # ---- Metrics table (3Y / 5Y / 10Y) ----
+                # Restructure for display: rows = (horizon, series), cols = metric.
+                # FF5 alpha dropped from the slide (still in the Excel sheet) to
+                # keep the table compact enough to fit alongside the bigger chart.
+                display_metrics = ["Annualised Return", "Annualised Volatility",
+                                   "Sharpe Ratio", "Sortino Ratio",
+                                   "Max Drawdown"]
+                rows = []
+                row_labels = []
+                for h in ("3Y", "5Y", "10Y"):
+                    for series_name in ("Strategy", "SPY (AUD)", "^AORD"):
+                        col_key = (h, series_name)
+                        if col_key not in oos_mtx.columns:
+                            continue
+                        row = []
+                        for m in display_metrics:
+                            v = oos_mtx.at[m, col_key] if m in oos_mtx.index else np.nan
+                            row.append(v)
+                        rows.append(row)
+                        row_labels.append(f"{h} — {series_name}")
+
+                if rows:
+                    n_rows = len(rows) + 1  # +1 header
+                    n_cols = len(display_metrics) + 1  # +1 row label
+                    tbl_shape = road.shapes.add_table(
+                        n_rows, n_cols,
+                        Cm(1.3), Cm(13.0), Cm(22.6), Cm(4.7)
+                    )
+                    tbl = tbl_shape.table
+                    # Header row
+                    tbl.cell(0, 0).text = "Horizon — Series"
+                    for j, m in enumerate(display_metrics, start=1):
+                        tbl.cell(0, j).text = m
+                    # Data rows
+                    pct_metrics = {"Annualised Return", "Annualised Volatility",
+                                   "Max Drawdown", "Alpha vs FF5 (ann)"}
+                    for i, (label, row) in enumerate(zip(row_labels, rows), start=1):
+                        tbl.cell(i, 0).text = label
+                        for j, (m, v) in enumerate(zip(display_metrics, row), start=1):
+                            if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                                txt = ""
+                            elif m in pct_metrics:
+                                txt = f"{v*100:+.2f}%"
+                            else:
+                                txt = f"{v:.2f}"
+                            tbl.cell(i, j).text = txt
+                    # Format: bold + colour Strategy rows
+                    for rr in range(n_rows):
+                        for cc in range(n_cols):
+                            cell = tbl.cell(rr, cc)
+                            cell.text_frame.word_wrap = False
+                            for p in cell.text_frame.paragraphs:
+                                p.font.size = Pt(10)
+                                p.alignment = PP_ALIGN.CENTER
+                                if rr == 0 or (rr > 0 and "Strategy" in row_labels[rr-1]):
+                                    p.font.bold = True
+
+                print(f"[pptx] Roadshow slide built — Fund 10y end = ${w_strat.iloc[-1]:,.0f}, SPY = ${w_spy.iloc[-1]:,.0f}")
+        except Exception as e:
+            print(f"[pptx] Roadshow slide skipped: {e}")
+
+        # Reorder: move the roadshow slide (last added) into position 2.
+        try:
+            _xml_slides = prs.slides._sldIdLst
+            _sl = list(_xml_slides)
+            if len(_sl) >= 3:
+                _last = _sl[-1]
+                _xml_slides.remove(_last)
+                _xml_slides.insert(1, _last)
+        except Exception as _e_reorder:
+            print(f"[pptx] Roadshow reorder skipped: {_e_reorder}")
 
         tmp_path = ppt_path.replace(".pptx", ".__tmp__.pptx")
         prs.save(tmp_path)
