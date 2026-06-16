@@ -340,6 +340,32 @@ REBALANCES_PER_YEAR = {"MS": 12, "QS": 4, "6W": 8.67, "YS": 1}.get(REBALANCE_FRE
 
 
 # ============================================================================
+# PER-ASSET WEIGHT CAPS
+# ----------------------------------------------------------------------------
+# Some assets (leveraged ETFs, volatility products) have structural problems
+# for mean-variance optimisation: their trailing μ is inflated by gamma drag
+# and decay effects that don't appear in the covariance matrix. The solver
+# would over-allocate to them based on backward-looking returns that don't
+# predict forward performance.
+#
+# Capping their max weight per candidate portfolio keeps them OPTIONAL (the
+# solver can still use them when their μ is good) without letting them
+# dominate the allocation. 5% is a defensible default — leveraged exposure
+# of that size adds meaningful return tail without crippling drawdowns.
+#
+# To disable a cap: remove the entry. To exclude a ticker entirely: set the
+# cap to 0.0 (forces weight = 0).
+# ============================================================================
+PER_ASSET_WEIGHT_CAPS: dict[str, float] = {
+    "SOXL":  0.05,   # 3x daily leveraged semis — high decay
+    "TQQQ":  0.05,   # 3x daily leveraged NASDAQ — high decay
+    "SVIX":  0.05,   # short-VIX 1x — looks high-μ in calm regimes, blows up in vol spikes
+    "UVIX":  0.00,   # 2x leveraged long-VIX — structural ~-30%/yr decay, never useful long-only
+    "VXX":   0.00,   # 1x long-VIX — structural decay, never useful long-only
+}
+
+
+# ============================================================================
 # CONDITIONAL REBALANCING (Q2)
 # ----------------------------------------------------------------------------
 # Layered on top of the scheduled REBALANCE_FREQ cadence to reduce turnover-
@@ -2848,11 +2874,18 @@ def max_sharpe_long_only(mu, Sigma, rf: float = 0.0) -> pd.Series:
     n = len(idx)
     excess = mu_v - float(rf)
 
+    # Per-asset weight caps: y[i] <= cap[i] * sum(y) → w[i] <= cap[i] post-norm.
+    _caps = globals().get("PER_ASSET_WEIGHT_CAPS", {}) or {}
+
     w = None
     if np.any(excess > 0):
         y = cp.Variable(n, nonneg=True)
+        cons_tg = [excess @ y == 1]
+        for _i, _ticker in enumerate(idx):
+            if _ticker in _caps:
+                cons_tg.append(y[_i] <= float(_caps[_ticker]) * cp.sum(y))
         try:
-            prob = cp.Problem(cp.Minimize(cp.quad_form(y, S_v)), [excess @ y == 1])
+            prob = cp.Problem(cp.Minimize(cp.quad_form(y, S_v)), cons_tg)
             prob.solve(solver=cp.OSQP, verbose=False)
             if y.value is None:
                 prob.solve(solver=cp.ECOS, verbose=False)
@@ -2862,12 +2895,16 @@ def max_sharpe_long_only(mu, Sigma, rf: float = 0.0) -> pd.Series:
             w = np.clip(np.asarray(y.value, dtype=float), 0.0, None)
             w = w / w.sum()
 
-    if w is None:  # fallback: minimum-variance long-only
+    if w is None:  # fallback: minimum-variance long-only (same caps applied)
         wv = cp.Variable(n, nonneg=True)
+        cons_mv = [cp.sum(wv) == 1]
+        for _i, _ticker in enumerate(idx):
+            if _ticker in _caps:
+                cons_mv.append(wv[_i] <= float(_caps[_ticker]))
         try:
-            cp.Problem(cp.Minimize(cp.quad_form(wv, S_v)), [cp.sum(wv) == 1]).solve(solver=cp.OSQP, verbose=False)
+            cp.Problem(cp.Minimize(cp.quad_form(wv, S_v)), cons_mv).solve(solver=cp.OSQP, verbose=False)
             if wv.value is None:
-                cp.Problem(cp.Minimize(cp.quad_form(wv, S_v)), [cp.sum(wv) == 1]).solve(solver=cp.ECOS, verbose=False)
+                cp.Problem(cp.Minimize(cp.quad_form(wv, S_v)), cons_mv).solve(solver=cp.ECOS, verbose=False)
         except Exception:
             pass
         if wv.value is None:
@@ -2975,139 +3012,100 @@ FACTOR_MU_RECENT_WEIGHT = 0.20     # weight on the recent window (0..1)
 
 USE_FF5 = True
 
-# Multi-region beta computation: each security regresses against its home-region
-# factor set (US / AP-ex-Japan / Japan). Aggregation across regions happens for
-# free via the tilt engine's portfolio-weighted sum — see Task #6 design notes.
-# return_stats=True also captures per-security R², t-stats, alpha t, residual σ
-# for the Regression_Diagnostics Excel sheet (Task #7 Part A).
-B, alpha_daily, resid_var, ff5_regression_stats = compute_ff5_betas_multi_region(
-    df_cov_wide,
-    regional_factors=ff5_regional_windows,
-    region_map=region_for_ticker,
-    min_obs=120,
-    return_stats=True,
-)
-# Surface which region each security got regressed against — useful for
-# spotting unexpected ticker classifications in run.log.
-if B is not None and not B.empty:
-    _reg_summary: dict[str, list[str]] = {}
-    for sec in B.index:
-        _reg_summary.setdefault(region_for_ticker(sec), []).append(sec)
-    print("[ff5] regional beta assignment:")
-    for r, secs in _reg_summary.items():
-        print(f"  {r}: {len(secs)} securities -> {secs}")
-
+# ---------------------------------------------------------------------------
+# DIALOG-FIRST ARCHITECTURE: FF5 build deferred until AFTER the dialog.
+# Previously, FF5 regression + Sigma_opt build ran here at module load on the
+# sheet's tickers. Dialog-added tickers then needed a second-pass refresh.
+# Now we initialise placeholders only — `_run_ff5_and_frontier_setup()` is
+# called post-dialog as the single source of truth for the OPT universe.
+# ---------------------------------------------------------------------------
+B = pd.DataFrame()
+alpha_daily = pd.Series(dtype=float)
+resid_var = pd.Series(dtype=float)
+ff5_regression_stats = pd.DataFrame()
 f_mean_ann = pd.Series(dtype=float)
 Fcov_daily = pd.DataFrame()
-
-if USE_FF5 and (B is not None) and (not B.empty):
-    ff_aud = get_ff5_mom_aud(ff5_raw, fx_ret)
-    ff5_win = ff_aud.tail(WINDOW)
-    fac_cols = [c for c in ff5_win.columns if c != "RF"]
-
-    Fcov_daily = ff5_win[fac_cols].cov()
-    # Blended expected returns (long-run anchor + small capped recent tilt).
-    _mu_long = ff_aud[fac_cols].tail(FACTOR_MU_LONG_DAYS).mean() * TRADING_DAYS
-    _mu_recent = ff_aud[fac_cols].tail(FACTOR_MU_RECENT_DAYS).mean() * TRADING_DAYS
-    f_mean_ann = (1.0 - FACTOR_MU_RECENT_WEIGHT) * _mu_long + FACTOR_MU_RECENT_WEIGHT * _mu_recent
-
-    alpha_ann = pd.to_numeric(alpha_daily, errors="coerce").fillna(0.0) * TRADING_DAYS
-
-    B_aligned = B.reindex(columns=fac_cols)
-    mu_ff_ann = alpha_ann.reindex(B_aligned.index).fillna(0.0) + (B_aligned @ f_mean_ann).fillna(0.0) + float(rf_annual)
-
-    securities_opt = [t for t in B_aligned.index if t not in EXCLUDE_FROM_OPT]
-
-    F = Fcov_daily.to_numpy(dtype=float)
-    Bmat = B_aligned.fillna(0.0).to_numpy(dtype=float)
-    resid_diag = np.diag(pd.to_numeric(resid_var.reindex(B_aligned.index), errors="coerce").clip(lower=0).fillna(0.0).to_numpy(dtype=float))
-    Sigma_ff_daily_np = Bmat @ F @ Bmat.T + resid_diag
-
-    Sigma_ff_daily = pd.DataFrame(Sigma_ff_daily_np, index=B_aligned.index, columns=B_aligned.index)
-    Sigma_opt = Sigma_ff_daily.loc[securities_opt, securities_opt].copy()
-    mu_vec_opt = mu_ff_ann.reindex(securities_opt).copy()
-
-    exp_ret_label = "Expected Return (annual, FF5 AUD-adjusted)"
-else:
-    securities_opt = [s for s in valid_all if s not in EXCLUDE_FROM_OPT]
-    Sigma_opt = Sigma_daily.loc[securities_opt, securities_opt].copy()
-    mu_vec_opt = mu_vec_all.reindex(securities_opt).copy()
-    exp_ret_label = "Expected Return (ann., geom)"
-
-# Guardrail: PortfolioValue never belongs in optimisation inputs
-if "PortfolioValue" in Sigma_opt.index:
-    Sigma_opt = Sigma_opt.drop(index="PortfolioValue", columns="PortfolioValue", errors="ignore")
-if "PortfolioValue" in mu_vec_opt.index:
-    mu_vec_opt = mu_vec_opt.drop(index="PortfolioValue", errors="ignore")
-
-Sigma_frontier = Sigma_opt.copy()
-mu_frontier = mu_vec_opt.copy()
-mu_plus = mu_vec_opt.copy()
-cov_plus = Sigma_opt.copy()
-
-# Diagnostic: surface the highest and lowest annualized mu values so we can spot data corruption
-# (e.g. a 400%+ mu pointing at a stale split adjustment or short-history outlier).
-try:
-    _mu_sorted = pd.to_numeric(mu_vec_opt, errors="coerce").dropna().sort_values(ascending=False)
-    print(f"[diag] mu top 5 (annualized): {_mu_sorted.head(5).to_dict()}")
-    print(f"[diag] mu bottom 5 (annualized): {_mu_sorted.tail(5).to_dict()}")
-except Exception as _e_mu_diag:
-    print(f"[diag] mu summary skipped: {_e_mu_diag}")
-
-# Recommended tilts (if factor inputs are available)
+ff_aud = pd.DataFrame()
+B_aligned = pd.DataFrame()
+Sigma_ff_daily = pd.DataFrame()
+securities_opt: list = []
+Sigma_opt = pd.DataFrame()
+mu_vec_opt = pd.Series(dtype=float)
+exp_ret_label = "Expected Return (annual, FF5 AUD-adjusted)"
+Sigma_frontier = pd.DataFrame()
+mu_frontier = pd.Series(dtype=float)
+mu_plus = pd.Series(dtype=float)
+cov_plus = pd.DataFrame()
+exp_ret_df = pd.DataFrame()
 tilt_reco_achievable = pd.Series(dtype=float)
 w_tilt = None
 tilt_reco = pd.Series(dtype=float)
-
-if (B is not None) and (not B.empty) and (not f_mean_ann.empty) and (not Fcov_daily.empty):
-    try:
-        tilt_reco_achievable = optimal_portfolio_tilts(B, mu_vec_opt, Sigma_opt, TILT_FACTORS, rf=rf_annual)
-        tilt_reco = recommend_factor_tilts(f_mean_ann, Fcov_daily)
-        print("\nRecommended factor tilts (betas of the risk-optimal long-only portfolio):")
-        print(tilt_reco_achievable.round(3))
-    except Exception as e:
-        print(f"[tilts] recommendation skipped: {e}")
+# Frontier outputs — also deferred.
+W = pd.DataFrame()
+stats_df = pd.DataFrame()
+tan_ret = float("nan")
+tan_vol = float("nan")
 
 
-# Display tables (once mu / Sigma are final)
-n_opt = len(Sigma_opt.index)
-cov_plus = pd.DataFrame(0.0, index=list(Sigma_opt.index) + ["w"], columns=list(Sigma_opt.index) + ["w"])
-cov_plus.iloc[:n_opt, :n_opt] = Sigma_opt.values
-exp_ret_df = mu_vec_opt.rename(exp_ret_label).to_frame()
+def _run_ff5_and_frontier_setup(new_prices: pd.DataFrame) -> None:
+    """Canonical FF5 + frontier setup. Runs on the dialog's final universe.
 
+    Architectural anchor for the dialog-first flow: this function IS the OPT
+    universe build. It runs once post-dialog (whether the dialog was saved or
+    cancelled) and is the single source of truth for Sigma_opt / mu_vec_opt /
+    B / Frontier / cov_plus / exp_ret_df. The initial module-level FF5 block
+    is intentionally skipped — every downstream consumer reads from globals
+    that THIS function writes.
 
-def _refresh_ff5_universe_after_dialog(new_prices: pd.DataFrame) -> None:
-    """Re-run FF5 regression + Sigma_opt build when the dialog added new tickers.
+    Builds in order:
+      1. df_cov_wide from new_prices (FX-adjusted)
+      2. Regional FF5 windows (auto-load any new regions the universe needs)
+      3. FF5 regression → B, alpha_daily, resid_var, ff5_regression_stats
+      4. Factor-implied Σ and μ → Sigma_opt, mu_vec_opt
+      5. cov_plus + exp_ret_df
+      6. Frontier (W, stats_df, tan_ret, tan_vol)
+      7. Diagnostic prints (mu top/bottom 5, tilt recommendation, Sigma diag)
 
-    Called from the post-dialog handler when `prices.columns` has expanded
-    beyond the original FF5 universe (e.g. user added NDQ.AX via the dialog).
-    Updates module-level globals so downstream OPT / trade-plan / Excel / PPT
-    paths see one consistent universe — the dialog is now the source of truth.
-
-    Idempotent: if no new tickers detected vs current B.index, returns early.
+    All outputs published to globals(). Previously named
+    `_refresh_ff5_universe_after_dialog` and had a no-new-tickers early-return —
+    that early-return removed: this function is now the ONLY FF5 setup path.
     """
     g = globals()
     px_cols = [c for c in new_prices.columns if c != "PortfolioValue"]
     existing_B = g.get("B", pd.DataFrame())
     existing_idx = set(existing_B.index) if isinstance(existing_B, pd.DataFrame) else set()
     new_tickers = sorted(set(px_cols) - existing_idx)
-    if not new_tickers:
-        return
 
-    print(f"[ff5-refresh] Dialog added new tickers: {new_tickers}. "
-          f"Re-running FF5 regression + universe build.")
+    if new_tickers:
+        print(f"[ff5-setup] Building FF5 universe (new tickers: {new_tickers}).")
+    else:
+        print(f"[ff5-setup] Building FF5 universe ({len(px_cols)} tickers from dialog).")
 
     # 1) Rebuild df_cov_wide on the expanded prices (FX-adjust USD tickers to AUD).
+    # USE fx_usdaud (USDAUD=X, ~1.41) — the price of USD in AUD. Multiplying
+    # USD prices by this gives AUD prices. The earlier draft of this function
+    # mistakenly used fx_audusd (AUDUSD=X, ~0.71 — the reciprocal), which
+    # systematically inflated USD-ticker μ in Sigma_opt.
     px = new_prices.copy()
     px = px.drop(columns=[c for c in ["PortfolioValue"] if c in px.columns], errors="ignore")
-    _fx_aud = g.get("fx_audusd")
-    if isinstance(_fx_aud, pd.Series) and not _fx_aud.empty:
+    _fx_usdaud = g.get("fx_usdaud")
+    if isinstance(_fx_usdaud, pd.Series) and not _fx_usdaud.empty:
         usd_cols = [c for c in px.columns
                     if not str(c).endswith(".AX") and not str(c).startswith("^")]
-        fx_reidx = _fx_aud.reindex(px.index).ffill()
+        fx_reidx = _fx_usdaud.reindex(px.index).ffill()
         if usd_cols:
             px.update(px.loc[:, usd_cols].mul(fx_reidx, axis=0))
     px = px.ffill().bfill()
+    # Drop columns that are entirely NaN (failed yfinance fetch — e.g. ticker
+    # was delisted, renamed, or doesn't exist on Yahoo). Without this, the
+    # downstream `dropna(how="any")` would drop EVERY row that has any NaN
+    # in the failed column, which is every row → 0 observations → FF5
+    # regression yields no betas → universe build fails silently.
+    _all_nan_cols = [c for c in px.columns if px[c].isna().all()]
+    if _all_nan_cols:
+        print(f"[ff5-setup] Dropping {len(_all_nan_cols)} ticker(s) with no price "
+              f"data (failed yfinance fetch): {sorted(_all_nan_cols)}")
+        px = px.drop(columns=_all_nan_cols, errors="ignore")
     rets_w = px.pct_change()
     rets_w = rets_w.where(rets_w.abs() <= RETURN_OUTLIER_THRESHOLD).dropna(how="any")
     df_cov_wide_new = rets_w
@@ -3120,10 +3118,14 @@ def _refresh_ff5_universe_after_dialog(new_prices: pd.DataFrame) -> None:
             try:
                 raw_r = _safe_load_region(r)
                 ff5_rw[r] = raw_r.tail(FF5_BETA_WINDOW_DAYS)
-                print(f"[ff5-refresh] Loaded factor window for region '{r}'.")
+                print(f"[ff5-setup] Loaded factor window for region '{r}'.")
             except Exception as _e:
-                print(f"[ff5-refresh] Could not load region '{r}': {_e}")
+                print(f"[ff5-setup] Could not load region '{r}': {_e}")
     g["ff5_regional_windows"] = ff5_rw
+
+    # Surface which region each security got regressed against (was in the old
+    # initial FF5 block — moved here so post-dialog runs still get the audit).
+    # Note: the regression itself happens below; we print this after.
 
     # 3) Re-run FF5 regression on the expanded universe.
     B_new, alpha_daily_new, resid_var_new, ff5_stats_new = compute_ff5_betas_multi_region(
@@ -3134,8 +3136,17 @@ def _refresh_ff5_universe_after_dialog(new_prices: pd.DataFrame) -> None:
         return_stats=True,
     )
     if B_new is None or B_new.empty:
-        print("[ff5-refresh] FF5 regression yielded no betas; keeping original universe.")
+        print("[ff5-setup] FF5 regression yielded no betas — cannot build OPT universe.")
         return
+
+    # Audit: surface regional beta assignments (was in old initial block).
+    if not B_new.empty:
+        _reg_summary: dict[str, list[str]] = {}
+        for sec in B_new.index:
+            _reg_summary.setdefault(region_for_ticker(sec), []).append(sec)
+        print("[ff5] regional beta assignment:")
+        for r, secs in _reg_summary.items():
+            print(f"  {r}: {len(secs)} securities -> {secs}")
 
     # 4) Rebuild factor-implied Σ + μ — mirrors the module-level FF5 block recipe.
     ff_aud_new = get_ff5_mom_aud(g.get("ff5_raw"), g.get("fx_ret"))
@@ -3186,7 +3197,7 @@ def _refresh_ff5_universe_after_dialog(new_prices: pd.DataFrame) -> None:
         g.get("exp_ret_label", "Expected Return (annual, FF5 AUD-adjusted)")
     ).to_frame()
 
-    # 6) Publish to globals.
+    # 6) Publish FF5 outputs to globals.
     g["prices"] = new_prices
     g["df_cov_wide"] = df_cov_wide_new
     g["B"] = B_new
@@ -3205,10 +3216,76 @@ def _refresh_ff5_universe_after_dialog(new_prices: pd.DataFrame) -> None:
     g["mu_plus"] = mu_vec_opt_new.copy()
     g["cov_plus"] = cov_plus_new
     g["exp_ret_df"] = exp_ret_df_new
+    g["exp_ret_label"] = g.get("exp_ret_label", "Expected Return (annual, FF5 AUD-adjusted)")
 
-    print(f"[ff5-refresh] Universe rebuilt → {len(securities_opt_new)} securities "
-          f"(was {len(existing_idx)}). FF5 now covers: "
-          f"{sorted(set(B_new.index) - existing_idx)}")
+    # 7) mu top/bottom 5 diagnostic (was in initial block).
+    try:
+        _mu_sorted = pd.to_numeric(mu_vec_opt_new, errors="coerce").dropna().sort_values(ascending=False)
+        print(f"[diag] mu top 5 (annualized): {_mu_sorted.head(5).to_dict()}")
+        print(f"[diag] mu bottom 5 (annualized): {_mu_sorted.tail(5).to_dict()}")
+    except Exception as _e_mu_diag:
+        print(f"[diag] mu summary skipped: {_e_mu_diag}")
+
+    # 8) Tilt recommendation (was in initial block).
+    g["tilt_reco_achievable"] = pd.Series(dtype=float)
+    g["tilt_reco"] = pd.Series(dtype=float)
+    g["w_tilt"] = None
+    if not f_mean_ann_new.empty and not Fcov_daily_new.empty:
+        try:
+            g["tilt_reco_achievable"] = optimal_portfolio_tilts(
+                B_new, mu_vec_opt_new, Sigma_opt_new, TILT_FACTORS, rf=rf_annual
+            )
+            g["tilt_reco"] = recommend_factor_tilts(f_mean_ann_new, Fcov_daily_new)
+            print("\nRecommended factor tilts (betas of the risk-optimal long-only portfolio):")
+            print(g["tilt_reco_achievable"].round(3))
+        except Exception as _e_tilt_reco:
+            print(f"[tilts] recommendation skipped: {_e_tilt_reco}")
+
+    # 9) Frontier build (was at line 3561 in the initial block — moved here so
+    # the frontier is built on the dialog's final universe).
+    try:
+        W_new, stats_df_new, tan_ret_new, tan_vol_new = _build_frontier(
+            mu_vec_opt_new.copy(),
+            Sigma_opt_new.copy(),
+            target_returns=None,
+            n_points=24,
+        )
+        g["W"] = W_new
+        g["stats_df"] = stats_df_new
+        g["tan_ret"] = tan_ret_new
+        g["tan_vol"] = tan_vol_new
+    except Exception as _e_frontier:
+        print(f"[frontier] build skipped: {_e_frontier}")
+        g["W"] = pd.DataFrame()
+        g["stats_df"] = pd.DataFrame()
+        g["tan_ret"] = float("nan")
+        g["tan_vol"] = float("nan")
+
+    # 10) Sigma_opt / mu_vec_opt sanity diagnostic (was at line 3691).
+    try:
+        print("\n--- DEBUG CHECK: Sigma_opt / mu_vec_opt ---")
+        print("Any NaN in Sigma_opt:", bool(Sigma_opt_new.isna().any().any()))
+        print("Any NaN in mu_vec_opt:", bool(mu_vec_opt_new.isna().any()))
+        if len(Sigma_opt_new) > 0:
+            print("Min variance:", float(np.nanmin(np.diag(Sigma_opt_new))))
+        print("Number of assets:", len(Sigma_opt_new))
+        if not Sigma_opt_new.empty:
+            print(Sigma_opt_new.head())
+        if not mu_vec_opt_new.empty:
+            print(mu_vec_opt_new.head())
+        print("OPT TICKERS:", list(securities_opt_new))
+        print("mu:", mu_vec_opt_new.describe())
+        if len(Sigma_opt_new) > 0:
+            print("Sigma diag min/max:",
+                  float(np.nanmin(Sigma_opt_new.values.diagonal())),
+                  float(np.nanmax(Sigma_opt_new.values.diagonal())))
+        if not f_mean_ann_new.empty:
+            print(f_mean_ann_new)
+    except Exception as _e_diag:
+        print(f"[diag] Sigma_opt summary skipped: {_e_diag}")
+
+    print(f"[ff5-setup] Universe built → {len(securities_opt_new)} securities. "
+          f"FF5 covers: {sorted(B_new.index.tolist())}")
 
 
 # ------------------------------------------------------------
@@ -3252,6 +3329,17 @@ def solve_frontier_point_cvxpy(
     w = cp.Variable(n)
 
     constraints = [cp.sum(w) == 1, w >= 0]
+
+    # Per-asset weight caps for assets where the mean-variance solver would
+    # over-allocate based on inflated trailing μ (leveraged ETFs, volatility
+    # products). Read from the PER_ASSET_WEIGHT_CAPS module-level dict; any
+    # ticker NOT in the dict is uncapped. Setting cap=0 forces w=0 (exclude).
+    _caps = globals().get("PER_ASSET_WEIGHT_CAPS", {}) or {}
+    if _caps:
+        for _i, _ticker in enumerate(mu_use.index):
+            if _ticker in _caps:
+                constraints.append(w[_i] <= float(_caps[_ticker]))
+
     if use_inequality:
         constraints.append(mu_use.to_numpy(dtype=float) @ w >= float(target_return))
     else:
@@ -3466,7 +3554,14 @@ def _build_frontier(
         mu_p90 = 0.20
 
     low = R_mvp_ann
-    high = min(mu_max, max(R_mvp_ann + 3.0 * robust_sd, mu_p90))
+    # Extend `high` to encompass concentrated portfolios (e.g. the regime-
+    # adaptive Ensemble at SMH×17% + VLUE×52%, return ~25% in current data).
+    # Previously capped at p90/3*robust_sd which left the Ensemble marker off
+    # the right edge of the visible frontier. Push high halfway from p90 to
+    # mu_max so the curve covers high-concentration single-asset-leaning
+    # portfolios without producing a degenerate single-point frontier corner.
+    mu_p90_extended = mu_p90 + 0.5 * (mu_max - mu_p90)
+    high = min(mu_max - 0.005, max(R_mvp_ann + 3.0 * robust_sd, mu_p90_extended))
 
     if high <= low + 0.01:
         high = low + 0.06
@@ -3555,22 +3650,15 @@ def _build_frontier(
 # ------------------------------------------------------------
 # 9) FRONTIER: MVP-centred long-only
 # ------------------------------------------------------------
-mu_frontier = mu_vec_opt.copy()
-Sigma_frontier = Sigma_opt.copy()
-
-W, stats_df, tan_ret, tan_vol = _build_frontier(
-    mu_frontier,
-    Sigma_frontier,
-    target_returns=None,
-    n_points=24,
-)
+# DIALOG-FIRST: frontier build moved into _run_ff5_and_frontier_setup()
+# which runs post-dialog. Module-level placeholders defined in block 6.
 
 
 # ------------------------------------------------------------
 # 10) PREPARE A TRADE PLAN
 # ------------------------------------------------------------
-cov_plus = cov_plus.fillna(0.0)
-exp_ret_df = mu_vec_opt.rename(exp_ret_label).to_frame()
+# DIALOG-FIRST: cov_plus + exp_ret_df also built inside
+# _run_ff5_and_frontier_setup(). No module-level execution here.
 
 
 def make_trade_plan(
@@ -3688,18 +3776,8 @@ def generate_targets_mvp_centric(mu_vec, Sigma, span_vol: float = 0.20, n_points
     return targets, mu_mvp, vol_mvp
 
 
-print("\n--- DEBUG CHECK: Sigma_opt / mu_vec_opt ---")
-print("Any NaN in Sigma_opt:", bool(Sigma_opt.isna().any().any()))
-print("Any NaN in mu_vec_opt:", bool(mu_vec_opt.isna().any()))
-print("Min variance:", float(np.nanmin(np.diag(Sigma_opt))))
-print("Number of assets:", len(Sigma_opt))
-print(Sigma_opt.head())
-print(mu_vec_opt.head())
-print("OPT TICKERS:", list(securities_opt))
-print("mu:", mu_vec_opt.describe())
-print("Sigma diag min/max:", float(np.nanmin(Sigma_opt.values.diagonal())), float(np.nanmax(Sigma_opt.values.diagonal())))
-if not f_mean_ann.empty:
-    print(f_mean_ann)
+# DIALOG-FIRST: Sigma_opt / mu_vec_opt diagnostic prints moved into
+# _run_ff5_and_frontier_setup() (step 10). No module-level execution here.
 
 
 # =====================================================================
@@ -4546,6 +4624,27 @@ else:
             tilt_seed.loc[f] = {"Target":0.0, "Band":0.20, "Use?":False}
     tilt_seed = tilt_seed.reindex(TILT_FACTORS)
 
+# Pre-dialog FF5 + frontier setup. Populates B, Sigma_opt, mu_vec_opt, etc.
+# so that BOTH the smart tilt seed AND the dialog's "Auto-recommend tilts"
+# button work correctly. The canonical setup ALSO runs post-dialog on the
+# final universe — running it twice costs ~1 second and is harmless.
+#
+# Without this pre-dialog call:
+#   - The tilt seed degrades to sheet/zero defaults (B is empty placeholder)
+#   - The "Auto-recommend tilts" button silently returns zeros because
+#     recommended_tilts_for_universe() reads mu_vec_opt/Sigma_opt and finds
+#     empty placeholders → optimal_portfolio_tilts returns the zero series
+try:
+    _run_ff5_and_frontier_setup(prices)
+    # Sync module-level locals from globals (mirror the post-dialog sync block).
+    Sigma_opt = globals().get("Sigma_opt", Sigma_opt)
+    mu_vec_opt = globals().get("mu_vec_opt", mu_vec_opt)
+    B = globals().get("B", B)
+    Fcov_daily = globals().get("Fcov_daily", Fcov_daily)
+    f_mean_ann = globals().get("f_mean_ann", f_mean_ann)
+except Exception as _e_pre_ff5_seed:
+    print(f"[tilts] Pre-dialog FF5 setup skipped: {_e_pre_ff5_seed}")
+
 # Seed the tilt TARGETS from the current portfolio's own factor exposures, so the
 # dialog opens at "where you are now" rather than arbitrary hardcoded defaults.
 try:
@@ -4563,10 +4662,17 @@ try:
         )
         _cur_tilts = compute_achieved_tilts(B, _w_cur_seed, factors=TILT_FACTORS)
         if _cur_tilts is not None and float(pd.Series(_w_cur_seed).abs().sum()) > 0 and not _cur_tilts.dropna().empty:
-            tilt_seed["Target"] = (
+            _new_targets = (
                 pd.to_numeric(_cur_tilts.reindex(TILT_FACTORS), errors="coerce").fillna(0.0).round(3)
             )
-            print("[tilts] Seeded dialog targets from current portfolio factor exposures.")
+            tilt_seed["Target"] = _new_targets
+            print(f"[tilts] Seeded dialog targets from current portfolio factor exposures: "
+                  f"{_new_targets.to_dict()}")
+            # Diagnostic: also print the top-5 holding weights so we can see
+            # what's driving the seed (if all targets round to 0.000 the
+            # current portfolio probably has factor-neutral diversification).
+            _top_w = pd.Series(_w_cur_seed).sort_values(ascending=False).head(5)
+            print(f"[tilts] Seed weights (top 5): {_top_w.to_dict()}")
 except Exception as _e_seed:
     print(f"[tilts] Could not seed from current portfolio; using sheet/defaults: {_e_seed}")
 
@@ -4578,6 +4684,7 @@ res = edit_holdings_and_tilts_dialog(
     seed_include=seed_include,
     seed_tilts=tilt_seed
 )
+portfolio_value_override = None
 if res is None:
     units = seed_units.copy()
     include_flags = seed_include.copy()
@@ -4588,31 +4695,43 @@ else:
         units, last_px_hold, prices, include_flags, tilt_df, portfolio_value_override = res
     else:
         units, last_px_hold, prices, include_flags, tilt_df = res
-        portfolio_value_override = None
 
     current_holdings_units = units.copy()
 
-    # If the dialog added new tickers (e.g. NDQ.AX, QQQ), re-run FF5 regression
-    # so they enter Sigma_opt / mu_vec_opt / B alongside the sheet-loaded set.
-    # The dialog is the canonical interaction surface — sheet vs dialog should
-    # behave identically downstream.
-    try:
-        _refresh_ff5_universe_after_dialog(prices)
-        # Pick up the refreshed globals into module-level names that subsequent
-        # code reads. (At module scope a global rebind would just propagate, but
-        # being explicit makes the data flow easier to follow.)
-        Sigma_opt = globals()["Sigma_opt"]
-        mu_vec_opt = globals()["mu_vec_opt"]
-        B = globals()["B"]
-        ff5_regression_stats = globals().get("ff5_regression_stats", ff5_regression_stats)
-        Sigma_frontier = globals().get("Sigma_frontier", Sigma_frontier)
-        mu_frontier = globals().get("mu_frontier", mu_frontier)
-        mu_plus = globals().get("mu_plus", mu_plus)
-        cov_plus = globals().get("cov_plus", cov_plus)
-        exp_ret_df = globals().get("exp_ret_df", exp_ret_df)
-    except Exception as _e_ff5_refresh:
-        print(f"[ff5-refresh] Failed to refresh universe after dialog: {_e_ff5_refresh}. "
-              f"Continuing with original FF5 universe.")
+# DIALOG-FIRST: regardless of whether the dialog was saved or cancelled, run
+# the canonical FF5 + frontier setup on the FINAL prices DataFrame. This is
+# the ONLY FF5/Sigma_opt build path now — the module-level initial pass was
+# removed in favour of this single call. Sigma_opt / mu_vec_opt / B /
+# W / stats_df / tan_ret / tan_vol / cov_plus / exp_ret_df all come from
+# here.
+try:
+    _run_ff5_and_frontier_setup(prices)
+    # Sync module-level locals with the globals the function just wrote.
+    Sigma_opt = globals()["Sigma_opt"]
+    mu_vec_opt = globals()["mu_vec_opt"]
+    B = globals()["B"]
+    alpha_daily = globals().get("alpha_daily", alpha_daily)
+    resid_var = globals().get("resid_var", resid_var)
+    ff5_regression_stats = globals().get("ff5_regression_stats", ff5_regression_stats)
+    f_mean_ann = globals().get("f_mean_ann", f_mean_ann)
+    Fcov_daily = globals().get("Fcov_daily", Fcov_daily)
+    ff_aud = globals().get("ff_aud", ff_aud)
+    Sigma_ff_daily = globals().get("Sigma_ff_daily", Sigma_ff_daily)
+    Sigma_frontier = globals().get("Sigma_frontier", Sigma_frontier)
+    mu_frontier = globals().get("mu_frontier", mu_frontier)
+    mu_plus = globals().get("mu_plus", mu_plus)
+    cov_plus = globals().get("cov_plus", cov_plus)
+    exp_ret_df = globals().get("exp_ret_df", exp_ret_df)
+    exp_ret_label = globals().get("exp_ret_label", exp_ret_label)
+    W = globals().get("W", W)
+    stats_df = globals().get("stats_df", stats_df)
+    tan_ret = globals().get("tan_ret", tan_ret)
+    tan_vol = globals().get("tan_vol", tan_vol)
+    tilt_reco_achievable = globals().get("tilt_reco_achievable", tilt_reco_achievable)
+    tilt_reco = globals().get("tilt_reco", tilt_reco)
+except Exception as _e_ff5_setup:
+    print(f"[ff5-setup] FAILED to build FF5/frontier universe: {_e_ff5_setup}. "
+          f"Downstream code will likely crash — check the dialog's price fetch.")
 
 # ---- Make optimiser globals available ----
 current_holdings_units = units
@@ -6071,7 +6190,8 @@ if USE_XLWINGS:
             target_point = None
             previous_point = None
             factor_point = None
-            
+            ensemble_point = None
+
             try:
                 mu_use = mu_vec_opt.reindex(Sigma_opt.index).fillna(0.0).values
                 S_use = Sigma_opt.values
@@ -6181,7 +6301,7 @@ if USE_XLWINGS:
                     w_nt = pd.Series(w_star_no_tilts, index=Sigma_opt.index)
                     if float(w_nt.sum()) != 0:
                         w_nt = w_nt / float(w_nt.sum())
-                
+
                     wv_nt = w_nt.values
                     nt_ret = float(mu_use @ wv_nt)
                     nt_vol = float(np.sqrt(wv_nt @ S_use @ wv_nt) * np.sqrt(252.0))
@@ -6189,12 +6309,34 @@ if USE_XLWINGS:
                 except Exception as e:
                     print(f"[chart] No-tilt point error: {e}")
 
+                # --- Ensemble (live regime-blend portfolio) ---
+                # The auto-selected plan in ~95% of runs. Project onto the
+                # same Sigma_opt / mu_vec_opt basis so the marker is directly
+                # comparable to With Tilts / Optimised on the frontier chart.
+                # Tickers outside Sigma_opt.index (rare after the FF5 refresh
+                # fix) get dropped here — their contribution to ensemble
+                # vol/return is not visualised on this chart.
+                ensemble_point = None
+                try:
+                    _w_ens = globals().get("W_ENSEMBLE_SER", None)
+                    if isinstance(_w_ens, pd.Series) and not _w_ens.empty:
+                        w_ens_ser = pd.Series(_w_ens, dtype=float).reindex(Sigma_opt.index).fillna(0.0)
+                        if float(w_ens_ser.sum()) > 0:
+                            w_ens_ser = w_ens_ser / float(w_ens_ser.sum())
+                            wv_ens = w_ens_ser.values
+                            ens_ret = float(mu_use @ wv_ens)
+                            ens_vol = float(np.sqrt(wv_ens @ S_use @ wv_ens) * np.sqrt(252.0))
+                            ensemble_point = (ens_vol, ens_ret)
+                except Exception as e:
+                    print(f"[chart] Ensemble point error: {e}")
+
             except Exception as e:
                 print(f"[chart] Point compute error: {e}")
                 current_point = None
                 target_point = None
                 previous_point = None
                 factor_point = None
+                ensemble_point = None
 
 
             # --- Build Efficient Frontier PNG for PowerPoint (optional) ---
@@ -6245,8 +6387,27 @@ if USE_XLWINGS:
                         s=80, marker="o", facecolors="none", edgecolors="purple",
                         linewidths=1.8, label="Optimised", zorder=5,
                     )
-                if target_point:
-                    ax.scatter([float(target_point[0])], [float(target_point[1])], s=70, marker="+", label="Target")
+                if ensemble_point:
+                    # Ensemble = the auto-selected plan in ~95% of runs. Plot
+                    # as a star so it stands out against With Tilts (diamond)
+                    # and Optimised (circle). Projected onto Sigma_opt basis,
+                    # so it's directly comparable to the other markers.
+                    ax.scatter(
+                        [float(ensemble_point[0])], [float(ensemble_point[1])],
+                        s=140, marker="*", color="#c00000",
+                        edgecolors="black", linewidths=0.8,
+                        label="Ensemble (selected)", zorder=7,
+                    )
+                    ax.annotate(
+                        "Ensemble",
+                        (float(ensemble_point[0]), float(ensemble_point[1])),
+                        xytext=(8, -10),
+                        textcoords="offset points",
+                        fontsize=9, fontweight="bold", color="#c00000",
+                    )
+                # NOTE: "Target" point removed — Ensemble (above) is the marker
+                # readers should focus on. The frontier curve + Optimised/With
+                # Tilts/Current already convey the reference points.
 
                 ax.legend()
                 _eff_buf = io.BytesIO()
@@ -6260,7 +6421,7 @@ if USE_XLWINGS:
                     "Previous": previous_point,
                     "Optimised": no_tilt_point if no_tilt_point else factor_point,
                     "With Tilts": with_tilts_point,
-                    "Target": target_point,
+                    "Ensemble": ensemble_point,
                 }
                 globals()["charts"] = charts
             except Exception as _e_eff_png:
@@ -7994,20 +8155,37 @@ def export_to_ppt(results, trades, charts=None):
         portfolio_returns = (pval / pval.iloc[0]) - 1.0
         benchmark_returns = bench.div(bench.iloc[0]).subtract(1.0)
                 
-        # --- Optional: add "With Tilts" synthetic performance line ---
+        # --- Strategy line: synthetic projection of the AUTO-SELECTED plan ---
+        # Previously hardcoded to "With Tilts" even when the auto-picker chose
+        # Ensemble (~95% of runs), which made the chart legend dishonest about
+        # what's driving live returns. Read TRADEPLAN_LABEL/WEIGHTS_SER (both
+        # set when the auto-picker runs, ~line 6457) and label the chart line
+        # accordingly. Falls back to W_WITH_TILTS_SER if the globals weren't
+        # populated for any reason.
+        _strategy_label_map = {
+            "ensemble":   "Strategy (Ensemble)",
+            "with_tilts": "Strategy (With Tilts)",
+            "no_tilts":   "Strategy (Optimised)",
+        }
+        _tp_label_raw = str(globals().get("TRADEPLAN_LABEL", "")).strip().lower()
+        strategy_legend_label = _strategy_label_map.get(_tp_label_raw, "Strategy (With Tilts)")
+
         tilted_returns = None
         try:
             returns_wide_df = globals().get("returns_wide_df", None)
-            w_with_tilts = globals().get("W_WITH_TILTS_SER", None)
-        
-            if isinstance(returns_wide_df, pd.DataFrame) and isinstance(w_with_tilts, (pd.Series, dict)):
-                w_ser = pd.Series(w_with_tilts).astype(float)
-                # Align weights to the returns matrix columns (tickers)
+            w_selected = globals().get("TRADEPLAN_WEIGHTS_SER", None)
+            if w_selected is None or (isinstance(w_selected, pd.Series) and w_selected.empty):
+                # Fallback: use W_WITH_TILTS_SER if the auto-picker didn't publish
+                w_selected = globals().get("W_WITH_TILTS_SER", None)
+                strategy_legend_label = "Strategy (With Tilts)"
+
+            if isinstance(returns_wide_df, pd.DataFrame) and isinstance(w_selected, (pd.Series, dict)):
+                w_ser = pd.Series(w_selected).astype(float)
                 common = returns_wide_df.columns.intersection(w_ser.index)
                 w_ser = w_ser.reindex(common).fillna(0.0)
                 if float(w_ser.sum()) != 0.0:
                     w_ser = w_ser / float(w_ser.sum())
-        
+
                 r_tilt = (returns_wide_df[common].reindex(pval.index).fillna(0.0) @ w_ser).astype(float)
                 tilted_curve = (1.0 + r_tilt).cumprod()
                 tilted_curve = tilted_curve / float(tilted_curve.iloc[0])
@@ -8026,9 +8204,9 @@ def export_to_ppt(results, trades, charts=None):
         # --- Combine into one DataFrame ---
         series_list = [portfolio_returns.rename("Portfolio")]
         
-        # Add With Tilts line if we successfully built it
+        # Add Strategy line (auto-selected plan) if we successfully built it
         if "tilted_returns" in locals() and tilted_returns is not None:
-            series_list.append(tilted_returns.rename("With Tilts"))
+            series_list.append(tilted_returns.rename(strategy_legend_label))
         
         series_list += [benchmark_returns[c].rename(c) for c in benchmark_returns.columns]
         
@@ -8144,24 +8322,37 @@ def export_to_ppt(results, trades, charts=None):
                     _period_total_return(port_px, end_dt, months=12),
                     _period_total_return(port_px, end_dt, years=3),
                 ]
-            # Add With Tilts to the table if we can build a synthetic tilted price series
+            # Strategy row: synthetic projection of the AUTO-SELECTED plan, with
+            # the legend label matching the chart above (Ensemble / With Tilts /
+            # Optimised). Falls back to W_WITH_TILTS_SER if the auto-picker
+            # didn't publish for any reason.
             try:
                 returns_wide_df = globals().get("returns_wide_df", None)
-                w_with_tilts = globals().get("W_WITH_TILTS_SER", None)
-            
-                if isinstance(returns_wide_df, pd.DataFrame) and isinstance(w_with_tilts, (pd.Series, dict)) and port_px is not None:
-                    w_ser = pd.Series(w_with_tilts).astype(float)
+                _tp_label_tbl = str(globals().get("TRADEPLAN_LABEL", "")).strip().lower()
+                _table_label_map = {
+                    "ensemble":   "Strategy (Ensemble)",
+                    "with_tilts": "Strategy (With Tilts)",
+                    "no_tilts":   "Strategy (Optimised)",
+                }
+                strategy_row_label = _table_label_map.get(_tp_label_tbl, "Strategy (With Tilts)")
+                w_selected_tbl = globals().get("TRADEPLAN_WEIGHTS_SER", None)
+                if w_selected_tbl is None or (isinstance(w_selected_tbl, pd.Series) and w_selected_tbl.empty):
+                    w_selected_tbl = globals().get("W_WITH_TILTS_SER", None)
+                    strategy_row_label = "Strategy (With Tilts)"
+
+                if isinstance(returns_wide_df, pd.DataFrame) and isinstance(w_selected_tbl, (pd.Series, dict)) and port_px is not None:
+                    w_ser = pd.Series(w_selected_tbl).astype(float)
                     common = returns_wide_df.columns.intersection(w_ser.index)
                     w_ser = w_ser.reindex(common).fillna(0.0)
                     if float(w_ser.sum()) != 0.0:
                         w_ser = w_ser / float(w_ser.sum())
-            
+
                     # Build a synthetic "price" series over the SAME date index as port_px (so _period_total_return works)
                     r_tilt_tbl = (returns_wide_df[common].reindex(port_px.index).fillna(0.0) @ w_ser).astype(float)
                     px_tilt_tbl = (1.0 + r_tilt_tbl).cumprod()
                     px_tilt_tbl = px_tilt_tbl * float(pd.to_numeric(port_px, errors="coerce").dropna().iloc[0])
-            
-                    rows["With Tilts"] = [
+
+                    rows[strategy_row_label] = [
                         _period_total_return(px_tilt_tbl, end_dt, months=3),
                         _period_total_return(px_tilt_tbl, end_dt, months=6),
                         _period_total_return(px_tilt_tbl, end_dt, months=12),
@@ -8244,8 +8435,47 @@ def export_to_ppt(results, trades, charts=None):
                 if c in ffd.columns:
                     series_to_show.append(c)
                         
-            chart_df = pd.DataFrame({"Portfolio": port_r_chart}).join(ffd_chart[series_to_show], how="inner")
-            tbl_df   = pd.DataFrame({"Portfolio": port_r_tbl}).join(ffd_tbl[series_to_show], how="inner")
+            # Strategy line: project the AUTO-SELECTED plan onto the FF window
+            # so the chart shows what the recommended portfolio would have done
+            # over the same window, not just the static current holdings.
+            _strategy_label_ff_map = {
+                "ensemble":   "Strategy (Ensemble)",
+                "with_tilts": "Strategy (With Tilts)",
+                "no_tilts":   "Strategy (Optimised)",
+            }
+            _tp_label_ff = str(globals().get("TRADEPLAN_LABEL", "")).strip().lower()
+            strategy_label_ff = _strategy_label_ff_map.get(_tp_label_ff, "Strategy")
+            strat_r_chart = pd.Series(dtype=float)
+            strat_r_tbl = pd.Series(dtype=float)
+            try:
+                returns_wide_df_ff = globals().get("returns_wide_df", None)
+                w_selected_ff = globals().get("TRADEPLAN_WEIGHTS_SER", None)
+                if w_selected_ff is None or (isinstance(w_selected_ff, pd.Series) and w_selected_ff.empty):
+                    w_selected_ff = globals().get("W_WITH_TILTS_SER", None)
+                    strategy_label_ff = "Strategy (With Tilts)"
+
+                if isinstance(returns_wide_df_ff, pd.DataFrame) and isinstance(w_selected_ff, (pd.Series, dict)):
+                    w_ser_ff = pd.Series(w_selected_ff).astype(float)
+                    common_ff = returns_wide_df_ff.columns.intersection(w_ser_ff.index)
+                    w_ser_ff = w_ser_ff.reindex(common_ff).fillna(0.0)
+                    if float(w_ser_ff.sum()) != 0.0:
+                        w_ser_ff = w_ser_ff / float(w_ser_ff.sum())
+                    _strat_returns_full = (
+                        returns_wide_df_ff[common_ff].fillna(0.0) @ w_ser_ff
+                    ).astype(float)
+                    strat_r_chart = _strat_returns_full.loc[window_start_chart:common_end]
+                    strat_r_tbl = _strat_returns_full.loc[window_start_tbl:common_end]
+            except Exception as _e_strat_ff:
+                print(f"[pptx] Slide 4 strategy series skipped: {_e_strat_ff}")
+
+            chart_df = pd.DataFrame({"Portfolio": port_r_chart})
+            if not strat_r_chart.empty:
+                chart_df[strategy_label_ff] = strat_r_chart
+            chart_df = chart_df.join(ffd_chart[series_to_show], how="inner")
+            tbl_df = pd.DataFrame({"Portfolio": port_r_tbl})
+            if not strat_r_tbl.empty:
+                tbl_df[strategy_label_ff] = strat_r_tbl
+            tbl_df = tbl_df.join(ffd_tbl[series_to_show], how="inner")
             
             ret = ((1.0 + chart_df.fillna(0.0)).cumprod() - 1.0) * 100.0
             fig, ax = plt.subplots(figsize=(7.5, 4.8))
@@ -8351,7 +8581,7 @@ def export_to_ppt(results, trades, charts=None):
                 pts = charts.get("frontier_points", {}) or {}
 
             rows = []
-            for k in ["Current", "Previous", "Optimised", "With Tilts", "Target"]: #Change these for the names
+            for k in ["Current", "Previous", "Optimised", "With Tilts", "Ensemble"]:
                 v = pts.get(k, None)
                 if v is None:
                     continue
