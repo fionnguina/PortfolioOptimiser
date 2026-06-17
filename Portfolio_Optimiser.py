@@ -331,6 +331,22 @@ CGT_CONFIG = CGT_PROFILES[ACTIVE_CGT_PROFILE].copy()
 
 
 # ============================================================================
+# DRIFT TRACKER (Tier-1 #3)
+# ----------------------------------------------------------------------------
+# Drives live-vs-backtest comparison + execution-quality monitoring. Set
+# LIVE_TRADING_START_DATE to the first day of live trading (e.g. "2026-08-01")
+# once IBKR is connected. Until then drift NAV tracking stays dormant but the
+# infrastructure (recommendation log, fill sheet, NAV history) keeps running.
+# ============================================================================
+LIVE_TRADING_START_DATE: str | None = None  # ISO date string, e.g. "2026-08-01"
+DRIFT_MONTHLY_THRESH       = 0.02   # warn if |monthly drift|       > 2%
+DRIFT_CUMULATIVE_THRESH    = 0.05   # warn if |cumulative drift|    > 5%
+DRIFT_DD_ALERT_THRESH      = -0.10  # warn if live MaxDD            < -10%
+DRIFT_SLIPPAGE_BPS_THRESH  = 25.0   # warn if |slippage|            > 25 bps
+DRIFT_FEE_MULTIPLIER       = 2.0    # warn if actual fees           > 2x expected
+
+
+# ============================================================================
 # REBALANCE FREQUENCY
 # ----------------------------------------------------------------------------
 # Drives how often the OOS engine (and live recommendation cadence) rebalances.
@@ -3795,6 +3811,378 @@ def append_trade_recommendation_log(
         print(f"[drift] failed to write recommendation log: {e}")
 
 
+# === Drift tracker v2/v3 helpers (Tier-1 #3) ================================
+# Fill comparison + monthly NAV drift + live MaxDD alert. Read by the live
+# pipeline after the recommendation log is written. All Excel writes are
+# guarded; nothing here can break a live run.
+
+def _ensure_actual_fills_sheet(wb) -> None:
+    """Create Actual_Fills sheet with column headers if missing. NEVER touches
+    existing user data (user enters fills by hand)."""
+    try:
+        existing = [s.name for s in wb.sheets]
+    except Exception:
+        return
+    if "Actual_Fills" in existing:
+        return
+    try:
+        sht = wb.sheets.add("Actual_Fills", after=wb.sheets[-1])
+        headers = ["Fill Date", "Ticker", "Side", "Units", "Px AUD",
+                   "Fees AUD", "Notes"]
+        sht.range("A1").value = headers
+        sht.range("A2").value = "(enter fills below — date YYYY-MM-DD, units signed +/-)"
+    except Exception as e:
+        print(f"[drift] could not create Actual_Fills sheet: {e}")
+
+
+def _read_actual_fills(wb) -> pd.DataFrame:
+    """Read Actual_Fills sheet. Returns empty DataFrame if missing/empty."""
+    try:
+        if "Actual_Fills" not in [s.name for s in wb.sheets]:
+            return pd.DataFrame()
+        sht = wb.sheets["Actual_Fills"]
+        raw = sht.range("A1").expand().value
+        if not raw or len(raw) < 2:
+            return pd.DataFrame()
+        hdr = [str(h).strip() for h in raw[0]]
+        rows = [r for r in raw[1:] if r and any(c is not None for c in r)]
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=hdr)
+        # Drop the placeholder hint row (first row of body that has no Ticker).
+        df = df[df.get("Ticker").notna()] if "Ticker" in df.columns else df
+        if df.empty:
+            return df
+        df["Fill Date"] = pd.to_datetime(df["Fill Date"], errors="coerce")
+        for col in ("Units", "Px AUD", "Fees AUD"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Fill Date", "Ticker", "Units"])
+        df["Ticker"] = df["Ticker"].astype(str).str.strip()
+        return df.reset_index(drop=True)
+    except Exception as e:
+        print(f"[drift] could not read Actual_Fills sheet: {e}")
+        return pd.DataFrame()
+
+
+def _load_recommendation_log(log_path) -> list[dict]:
+    """Load the recommendation JSONL. Returns [] if missing/empty."""
+    p = Path(log_path)
+    if not p.exists():
+        return []
+    out: list[dict] = []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        print(f"[drift] could not load recommendation log: {e}")
+    return out
+
+
+def _match_fill_to_recommendation(fill_row: pd.Series, recs: list[dict]) -> dict | None:
+    """Find the most recent recommendation (on or before fill_date) for
+    fill_row's ticker. Returns the per-trade rec dict (with px_aud,
+    brokerage_aud, etc) or None if no match."""
+    if not recs:
+        return None
+    fill_dt = pd.Timestamp(fill_row["Fill Date"])
+    ticker = str(fill_row["Ticker"]).strip()
+    best_rec_t = None
+    best_trade = None
+    for rec in recs:
+        try:
+            rec_dt = pd.Timestamp(rec["run_at"])
+        except Exception:
+            continue
+        if rec_dt > fill_dt:
+            continue
+        for t in rec.get("recommended_trades", []):
+            if str(t.get("ticker")).strip() != ticker:
+                continue
+            if best_rec_t is None or rec_dt > best_rec_t:
+                best_rec_t = rec_dt
+                best_trade = dict(t)
+                best_trade["recommendation_at"] = rec_dt.isoformat(timespec="seconds")
+    return best_trade
+
+
+def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
+    """Join Actual_Fills against recommendation log. Returns DataFrame with
+    slippage_bps, fee_delta_aud, time_to_fill_days, and adherence flags."""
+    if fills_df is None or fills_df.empty:
+        return pd.DataFrame()
+    recs = _load_recommendation_log(log_path)
+    rows: list[dict] = []
+    for _, fr in fills_df.iterrows():
+        matched = _match_fill_to_recommendation(fr, recs)
+        actual_units = float(fr["Units"])
+        actual_px = float(fr.get("Px AUD") or 0)
+        actual_fees = float(fr.get("Fees AUD") or 0)
+        side_actual = "buy" if actual_units > 0 else ("sell" if actual_units < 0 else "flat")
+        if matched is None:
+            rows.append({
+                "Fill Date": fr["Fill Date"], "Ticker": fr["Ticker"],
+                "Side Actual": side_actual,
+                "Units Actual": actual_units, "Px Actual (AUD)": actual_px,
+                "Fees Actual (AUD)": actual_fees,
+                "Recommended": False, "Px Recommended (AUD)": None,
+                "Units Recommended": None, "Slippage (bps)": None,
+                "Fee Expected (AUD)": None, "Fee Delta (AUD)": None,
+                "Time-to-Fill (days)": None, "Notes": fr.get("Notes", ""),
+            })
+            continue
+        rec_px = float(matched.get("px_aud") or 0)
+        rec_units = int(matched.get("delta_units") or 0)
+        rec_broke = float(matched.get("brokerage_aud") or 0)
+        rec_at = pd.Timestamp(matched["recommendation_at"])
+        # Slippage: + means worse than expected (paid more on buy, got less on sell).
+        if rec_px > 0:
+            if side_actual == "buy":
+                slip_bps = (actual_px - rec_px) / rec_px * 10000.0
+            elif side_actual == "sell":
+                slip_bps = (rec_px - actual_px) / rec_px * 10000.0
+            else:
+                slip_bps = 0.0
+        else:
+            slip_bps = None
+        fee_delta = actual_fees - rec_broke
+        ttf = (pd.Timestamp(fr["Fill Date"]) - rec_at).total_seconds() / 86400.0
+        rows.append({
+            "Fill Date": fr["Fill Date"], "Ticker": fr["Ticker"],
+            "Side Actual": side_actual,
+            "Units Actual": actual_units, "Px Actual (AUD)": actual_px,
+            "Fees Actual (AUD)": actual_fees,
+            "Recommended": True, "Px Recommended (AUD)": rec_px,
+            "Units Recommended": rec_units,
+            "Slippage (bps)": round(slip_bps, 2) if slip_bps is not None else None,
+            "Fee Expected (AUD)": round(rec_broke, 2),
+            "Fee Delta (AUD)": round(fee_delta, 2),
+            "Time-to-Fill (days)": round(ttf, 2),
+            "Notes": fr.get("Notes", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def append_live_nav_history(nav_path, nav_aud: float, as_of_date=None) -> None:
+    """Append today's NAV to live_nav_history.jsonl. Idempotent within a day —
+    if the most recent entry is already today's date, it's overwritten."""
+    if not np.isfinite(nav_aud) or nav_aud <= 0:
+        return
+    p = Path(nav_path)
+    date = pd.Timestamp(as_of_date or pd.Timestamp.today().normalize()).strftime("%Y-%m-%d")
+    new_entry = {"date": date, "nav_aud": float(nav_aud)}
+    try:
+        existing: list[dict] = []
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        existing.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        # Drop any prior entry on the same date — keep the latest.
+        existing = [e for e in existing if e.get("date") != date]
+        existing.append(new_entry)
+        # Sort by date for safety.
+        existing.sort(key=lambda e: e.get("date", ""))
+        with open(p, "w", encoding="utf-8") as f:
+            for e in existing:
+                f.write(json.dumps(e) + "\n")
+    except Exception as e:
+        print(f"[drift] could not append NAV history: {e}")
+
+
+def _load_live_nav_series(nav_path) -> pd.Series:
+    """Load live_nav_history.jsonl into a date-indexed Series."""
+    p = Path(nav_path)
+    if not p.exists():
+        return pd.Series(dtype=float)
+    rows: list[dict] = []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return pd.Series(dtype=float)
+    if not rows:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame(rows)
+    if "date" not in df.columns or "nav_aud" not in df.columns:
+        return pd.Series(dtype=float)
+    s = pd.Series(
+        pd.to_numeric(df["nav_aud"], errors="coerce").values,
+        index=pd.to_datetime(df["date"], errors="coerce"),
+    ).dropna().sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    return s
+
+
+def compute_live_max_drawdown(nav_series: pd.Series) -> float:
+    """Current drawdown from peak. Negative number, 0 if no data."""
+    if nav_series is None or nav_series.empty:
+        return 0.0
+    peak = nav_series.cummax()
+    dd = (nav_series / peak - 1.0)
+    return float(dd.iloc[-1])  # current drawdown (last observation)
+
+
+def compute_monthly_nav_drift(
+    live_nav: pd.Series,
+    oos_returns: pd.Series,
+    live_start_date: str | None,
+) -> pd.DataFrame:
+    """Per-month live vs OOS-expected returns since live_start_date.
+
+    Columns: Month | Live Return | OOS Return | Drift | Cumulative Drift
+    """
+    if live_start_date is None or live_nav is None or live_nav.empty:
+        return pd.DataFrame()
+    start = pd.Timestamp(live_start_date)
+    nav = live_nav.loc[live_nav.index >= start]
+    if nav.empty or len(nav) < 2:
+        return pd.DataFrame()
+    oos = (oos_returns if oos_returns is not None else pd.Series(dtype=float))
+    oos = oos.copy()
+    if not oos.empty:
+        oos.index = pd.to_datetime(oos.index).tz_localize(None)
+    months: list[dict] = []
+    # Live NAV resampled to month-end (last observed NAV per month).
+    nav_me = nav.resample("ME").last().dropna()
+    # Baseline = first NAV in the live period (could be mid-month).
+    prev_nav = float(nav.iloc[0])
+    prev_dt = nav.index[0]
+    for month_end, end_nav in nav_me.items():
+        # Skip the first month-end if it's <= baseline date (tautological).
+        if month_end <= prev_dt:
+            continue
+        live_ret = float(end_nav / prev_nav - 1.0) if prev_nav > 0 else 0.0
+        # OOS expected return = product of OOS daily returns over the same window.
+        if not oos.empty:
+            window = oos[(oos.index > prev_dt) & (oos.index <= month_end)]
+            oos_ret = float((1.0 + window).prod() - 1.0) if not window.empty else 0.0
+        else:
+            oos_ret = 0.0
+        drift = live_ret - oos_ret
+        months.append({
+            "Month": month_end.strftime("%Y-%m"),
+            "Live Return": round(live_ret, 6),
+            "OOS Return": round(oos_ret, 6),
+            "Drift": round(drift, 6),
+        })
+        prev_nav = float(end_nav)
+        prev_dt = month_end
+    if not months:
+        return pd.DataFrame()
+    df = pd.DataFrame(months)
+    df["Cumulative Drift"] = df["Drift"].cumsum().round(6)
+    return df
+
+
+def _write_drift_sheets(
+    wb,
+    fills_drift_df: pd.DataFrame,
+    nav_drift_df: pd.DataFrame,
+    live_nav_series: pd.Series,
+    live_dd: float,
+) -> None:
+    """Write Drift_Fills + Drift_NAV sheets. Overwrites each run."""
+    try:
+        sht = get_or_clear_sheet(wb, "Drift_Fills")
+        if fills_drift_df is not None and not fills_drift_df.empty:
+            sht.range("A1").options(index=False).value = fills_drift_df
+        else:
+            sht.range("A1").value = "(no fills in Actual_Fills yet — enter fills to populate)"
+    except Exception as e:
+        print(f"[drift] could not write Drift_Fills sheet: {e}")
+    try:
+        sht = get_or_clear_sheet(wb, "Drift_NAV")
+        # Summary header
+        sht.range("A1").value = "Live MaxDD (current from peak)"
+        sht.range("B1").value = round(float(live_dd) * 100, 2)
+        sht.range("C1").value = "%"
+        sht.range("A2").value = "Live NAV samples"
+        sht.range("B2").value = int(live_nav_series.size)
+        if nav_drift_df is not None and not nav_drift_df.empty:
+            sht.range("A4").options(index=False).value = nav_drift_df
+        else:
+            sht.range("A4").value = ("(monthly drift table inactive — set "
+                                     "LIVE_TRADING_START_DATE in config to enable)")
+    except Exception as e:
+        print(f"[drift] could not write Drift_NAV sheet: {e}")
+
+
+def _print_drift_warnings(
+    fills_drift_df: pd.DataFrame,
+    nav_drift_df: pd.DataFrame,
+    live_dd: float,
+) -> int:
+    """Print warnings on threshold breaches. Returns count of warnings issued."""
+    n_warn = 0
+    # Slippage / fee warnings per fill
+    if fills_drift_df is not None and not fills_drift_df.empty:
+        slip = pd.to_numeric(fills_drift_df.get("Slippage (bps)"), errors="coerce")
+        fee_delta = pd.to_numeric(fills_drift_df.get("Fee Delta (AUD)"), errors="coerce")
+        fee_exp = pd.to_numeric(fills_drift_df.get("Fee Expected (AUD)"), errors="coerce")
+        # Slippage breach
+        slip_breach = fills_drift_df[slip.abs() > DRIFT_SLIPPAGE_BPS_THRESH]
+        for _, r in slip_breach.iterrows():
+            print(f"[drift][WARN] {r['Ticker']} on {pd.Timestamp(r['Fill Date']).date()}: "
+                  f"slippage {r['Slippage (bps)']:+.1f} bps "
+                  f"(threshold ±{DRIFT_SLIPPAGE_BPS_THRESH:.0f})")
+            n_warn += 1
+        # Fee multiplier breach
+        fee_breach_mask = (fee_exp > 0) & (fee_delta + fee_exp > DRIFT_FEE_MULTIPLIER * fee_exp)
+        fee_breach = fills_drift_df[fee_breach_mask]
+        for _, r in fee_breach.iterrows():
+            print(f"[drift][WARN] {r['Ticker']} on {pd.Timestamp(r['Fill Date']).date()}: "
+                  f"fees {r['Fees Actual (AUD)']:.2f} > {DRIFT_FEE_MULTIPLIER:.0f}x expected "
+                  f"({r['Fee Expected (AUD)']:.2f})")
+            n_warn += 1
+        # Non-adherent fills (recommendation missing)
+        non_adherent = fills_drift_df[fills_drift_df["Recommended"] == False]
+        if not non_adherent.empty:
+            print(f"[drift][WARN] {len(non_adherent)} fill(s) had NO matching "
+                  f"recommendation in the log "
+                  f"(tickers: {sorted(non_adherent['Ticker'].astype(str).unique().tolist())})")
+            n_warn += 1
+    # Monthly + cumulative NAV drift
+    if nav_drift_df is not None and not nav_drift_df.empty:
+        for _, r in nav_drift_df.iterrows():
+            if abs(float(r["Drift"])) > DRIFT_MONTHLY_THRESH:
+                print(f"[drift][WARN] {r['Month']}: monthly drift "
+                      f"{float(r['Drift'])*100:+.2f}% > ±{DRIFT_MONTHLY_THRESH*100:.0f}% "
+                      f"(live {float(r['Live Return'])*100:+.2f}% vs OOS "
+                      f"{float(r['OOS Return'])*100:+.2f}%)")
+                n_warn += 1
+        cum = float(nav_drift_df["Cumulative Drift"].iloc[-1])
+        if abs(cum) > DRIFT_CUMULATIVE_THRESH:
+            print(f"[drift][WARN] cumulative drift since live start: "
+                  f"{cum*100:+.2f}% > ±{DRIFT_CUMULATIVE_THRESH*100:.0f}%")
+            n_warn += 1
+    # Live drawdown alert
+    if live_dd < DRIFT_DD_ALERT_THRESH:
+        print(f"[drift][WARN] live MaxDD {live_dd*100:+.2f}% < "
+              f"{DRIFT_DD_ALERT_THRESH*100:+.0f}% threshold — review regime exposure")
+        n_warn += 1
+    return n_warn
+
+
 def compute_target_units_for_holdings(
     units_cur,
     last_px,
@@ -6960,7 +7348,33 @@ if USE_XLWINGS:
                 )
             except Exception as _e_drift:
                 print(f"[drift] recommendation log skipped: {_e_drift}")
-            
+
+            # === Drift tracker v2/v3: fills + NAV history + warnings ===========
+            # Append live NAV; ensure Actual_Fills sheet; join fills against
+            # recommendation log; compute monthly drift if live trading is on.
+            try:
+                _nav_path = _app_dir() / "live_nav_history.jsonl"
+                append_live_nav_history(_nav_path, _portfolio_val_for_log)
+                _live_nav = _load_live_nav_series(_nav_path)
+                _live_dd = compute_live_max_drawdown(_live_nav)
+                _ensure_actual_fills_sheet(wb)
+                _fills_df = _read_actual_fills(wb)
+                _fills_drift = compute_fill_drift(_fills_df, _drift_log_path)
+                _oos_ret = globals().get("oos_returns_daily", pd.Series(dtype=float))
+                _nav_drift = compute_monthly_nav_drift(
+                    _live_nav, _oos_ret, LIVE_TRADING_START_DATE,
+                )
+                _write_drift_sheets(wb, _fills_drift, _nav_drift, _live_nav, _live_dd)
+                _n_warn = _print_drift_warnings(_fills_drift, _nav_drift, _live_dd)
+                _adherent = 0 if _fills_drift.empty else int(_fills_drift["Recommended"].sum())
+                _total_fills = 0 if _fills_drift.empty else len(_fills_drift)
+                print(f"[drift] tracker: NAV samples={int(_live_nav.size)}, "
+                      f"current DD {_live_dd*100:+.2f}%, "
+                      f"fills {_adherent}/{_total_fills} adherent, "
+                      f"warnings={_n_warn}")
+            except Exception as _e_drift_v2:
+                print(f"[drift] v2/v3 tracker skipped: {_e_drift_v2}")
+
             # --- Lot expansion (safe now that 'Security' exists as a column) ---
             lot_expanded = expand_with_lots(
                 trade_rec,
