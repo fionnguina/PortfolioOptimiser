@@ -77,6 +77,13 @@ except ImportError:
 # Debug: Print Python executable path
 print(sys.executable)
 
+# === CLI flags ===
+# `--stress-test`: skip live dialog + PPT pipeline, jump to GFC stress runner
+# (defined later, just before "# === Rebuild core analytics ===").
+_STRESS_TEST_MODE = "--stress-test" in sys.argv
+if _STRESS_TEST_MODE:
+    print("[stress] --stress-test detected; will skip dialog + live pipeline")
+
 
 # =====================================================================
 # BLOCK 2 Global codes and Data Retrieval from the web
@@ -3715,6 +3722,79 @@ def make_trade_plan(
     return df, residual_cash
 
 
+def append_trade_recommendation_log(
+    log_path,
+    *,
+    selected_mode: str,
+    trade_df: pd.DataFrame,
+    w_target: pd.Series,
+    current_units: pd.Series,
+    portfolio_value_aud: float,
+    regime_mix: pd.Series,
+    expected_brokerage_aud: float,
+    expected_cgt_aud: float,
+    broker_name: str,
+    cgt_mtr: float,
+    universe_size: int,
+) -> None:
+    """Append one JSONL entry recording the engine's current recommendation.
+
+    Foundation for the live vs backtest drift tracker (Tier-1 #3). Each run
+    appends one line. Once trading starts, a separate sheet of actual fills
+    will be joined against this log to compute slippage + adherence.
+    """
+    entry = {
+        "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+        "selected_mode": str(selected_mode),
+        "broker": str(broker_name),
+        "cgt_mtr": float(cgt_mtr),
+        "portfolio_value_aud": float(portfolio_value_aud),
+        "universe_size": int(universe_size),
+        "regime_mix": {
+            str(k): float(v) for k, v in regime_mix.items()
+        } if regime_mix is not None and not regime_mix.empty else {},
+        "target_weights": {
+            str(k): round(float(v), 6)
+            for k, v in w_target.items() if abs(float(v)) > 1e-6
+        },
+        "current_units": {
+            str(k): int(v)
+            for k, v in current_units.items() if int(v) != 0
+        },
+        "expected_brokerage_aud": round(float(expected_brokerage_aud), 2),
+        "expected_cgt_aud": round(float(expected_cgt_aud), 2),
+        "recommended_trades": [],
+    }
+    delta_col = "Delta Units" if "Delta Units" in trade_df.columns else None
+    if delta_col is not None:
+        for sec, row in trade_df.iterrows():
+            try:
+                delta = int(pd.to_numeric(row.get(delta_col, 0), errors="coerce"))
+            except Exception:
+                continue
+            if delta == 0:
+                continue
+            px_aud = float(pd.to_numeric(row.get("Last Px (AUD)", 0), errors="coerce") or 0)
+            broke = float(pd.to_numeric(row.get("Brokerage (AUD)", 0), errors="coerce") or 0)
+            ticker = str(row.get("Security", sec)) if "Security" in trade_df.columns else str(sec)
+            entry["recommended_trades"].append({
+                "ticker": ticker,
+                "side": "buy" if delta > 0 else "sell",
+                "delta_units": delta,
+                "px_aud": round(px_aud, 4),
+                "delta_value_aud": round(delta * px_aud, 2),
+                "brokerage_aud": round(broke, 2),
+            })
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        print(f"[drift] logged recommendation → {Path(log_path).name} "
+              f"({len(entry['recommended_trades'])} trades, "
+              f"NAV AUD {portfolio_value_aud:,.0f}, mode={selected_mode})")
+    except Exception as e:
+        print(f"[drift] failed to write recommendation log: {e}")
+
+
 def compute_target_units_for_holdings(
     units_cur,
     last_px,
@@ -4635,6 +4715,8 @@ else:
 #     recommended_tilts_for_universe() reads mu_vec_opt/Sigma_opt and finds
 #     empty placeholders → optimal_portfolio_tilts returns the zero series
 try:
+    if _STRESS_TEST_MODE:
+        raise RuntimeError("stress-test mode: skipping pre-dialog FF5 setup")
     _run_ff5_and_frontier_setup(prices)
     # Sync module-level locals from globals (mirror the post-dialog sync block).
     Sigma_opt = globals().get("Sigma_opt", Sigma_opt)
@@ -4677,13 +4759,19 @@ except Exception as _e_seed:
     print(f"[tilts] Could not seed from current portfolio; using sheet/defaults: {_e_seed}")
 
 # ---- 10B) Combined dialog (holdings + tilts) ----
-res = edit_holdings_and_tilts_dialog(
-    prices=prices,
-    exclude=EXCLUDE_FROM_OPT,
-    seed_units=current_holdings_units if 'current_holdings_units' in globals() and current_holdings_units is not None else seed_units,
-    seed_include=seed_include,
-    seed_tilts=tilt_seed
-)
+if _STRESS_TEST_MODE:
+    # Stress-test mode: bypass the modal dialog so the run can reach the
+    # stress-test gate downstream. Use sheet seeds (same as user cancelling).
+    print("[stress] bypassing holdings dialog (using sheet seeds)")
+    res = None
+else:
+    res = edit_holdings_and_tilts_dialog(
+        prices=prices,
+        exclude=EXCLUDE_FROM_OPT,
+        seed_units=current_holdings_units if 'current_holdings_units' in globals() and current_holdings_units is not None else seed_units,
+        seed_include=seed_include,
+        seed_tilts=tilt_seed
+    )
 portfolio_value_override = None
 if res is None:
     units = seed_units.copy()
@@ -4704,7 +4792,11 @@ else:
 # removed in favour of this single call. Sigma_opt / mu_vec_opt / B /
 # W / stats_df / tan_ret / tan_vol / cov_plus / exp_ret_df all come from
 # here.
+if _STRESS_TEST_MODE:
+    print("[stress] skipping live FF5/frontier setup (not needed for stress test)")
 try:
+    if _STRESS_TEST_MODE:
+        raise RuntimeError("stress-test mode: skipping FF5 setup")
     _run_ff5_and_frontier_setup(prices)
     # Sync module-level locals with the globals the function just wrote.
     Sigma_opt = globals()["Sigma_opt"]
@@ -5718,6 +5810,193 @@ def compute_oos_metrics(strat_returns: pd.Series,
     return pd.concat(blocks, axis=1)
 
 
+# === GFC stress test (Tier-1 #2) =============================================
+# Standalone walk-forward over a pre-2006 minimal universe to ask: does the
+# ensemble engine survive a -56% SPY drawdown? Triggered by `--stress-test`
+# on the CLI; exits before the live pipeline runs.
+def _run_gfc_stress_test() -> int:
+    print("\n" + "=" * 80)
+    print("GFC STRESS TEST — ensemble walk-forward through 2007-09 GFC peak")
+    print("=" * 80)
+
+    STRESS_TICKERS = ["SPY", "IVV", "QQQ", "IEF", "VWO", "GOLD.AX", "^AORD"]
+    START_DATE = "2005-10-01"
+    END_DATE = pd.Timestamp.today().normalize().strftime("%Y-%m-%d")
+
+    print(f"[stress] Universe ({len(STRESS_TICKERS)}): {STRESS_TICKERS}")
+    print(f"[stress] Window: {START_DATE} → {END_DATE}")
+    print(f"[stress] Broker:  {BROKER_CONFIG['name']} | CGT: {CGT_CONFIG.get('marginal_tax_rate', 0.30)*100:.0f}% MTR")
+
+    t0 = time.perf_counter()
+    raw = yf.download(STRESS_TICKERS, start=START_DATE, end=END_DATE,
+                      interval="1d", auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    missing = [t for t in STRESS_TICKERS if t not in px.columns]
+    if missing:
+        print(f"[stress] WARNING: missing tickers from yfinance: {missing}")
+    print(f"[stress] Downloaded {px.shape[0]} days × {px.shape[1]} tickers in {time.perf_counter()-t0:.1f}s")
+    print(f"[stress] First all-present row: {px.dropna(how='any').index.min().date() if not px.dropna(how='any').empty else 'never'}")
+
+    fx_raw = yf.download("USDAUD=X", start=START_DATE, end=END_DATE,
+                         interval="1d", auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    if fx.isna().all():
+        print("[stress] FX series empty — falling back to flat 1.50")
+        fx = pd.Series(1.50, index=px.index)
+
+    usd_cols = [c for c in px.columns if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[stress] AUD-adjusted USD tickers: {usd_cols}")
+
+    print(f"[stress] Running ensemble walk-forward (train=24mo, rebal={REBALANCE_FREQ})...")
+    t1 = time.perf_counter()
+    out = run_oos_ensemble_walk_forward(
+        px_aud,
+        train_window_months=24,
+        rebalance=REBALANCE_FREQ,
+        benchmark_ticker="SPY",
+        score_lookback_days=252,
+        lambda_temp=3.0,
+    )
+    strat_rets = out["blended_returns"]
+    weights = out["blended_weights"]
+    print(f"[stress] Walk-forward done in {time.perf_counter()-t1:.1f}s")
+
+    if strat_rets.empty:
+        print("[stress] FAIL — walk-forward returned no returns. Check universe inception dates.")
+        return 1
+
+    print(f"[stress] OOS span: {strat_rets.index.min().date()} → {strat_rets.index.max().date()} "
+          f"({len(strat_rets)} days, {len(weights)} rebalances)")
+    print(f"[stress] Rebal mix: scheduled={out.get('n_scheduled',0)}, "
+          f"early-triggered={out.get('n_early_triggered',0)}, "
+          f"executed={out.get('n_executed',0)}, skipped={out.get('n_skipped',0)}")
+
+    spy_aud = px_aud["SPY"] if "SPY" in px_aud.columns else None
+    aord = px_aud["^AORD"] if "^AORD" in px_aud.columns else None
+    spy_ret = spy_aud.pct_change().dropna() if spy_aud is not None else pd.Series(dtype=float)
+    aord_ret = aord.pct_change().dropna() if aord is not None else pd.Series(dtype=float)
+
+    full_years = max(1, int(round(len(strat_rets) / ANNUAL_TRADING_DAYS)))
+    metrics = compute_oos_metrics(
+        strat_returns=strat_rets, spy_returns=spy_ret, aord_returns=aord_ret,
+        ff5_factors=None, weights_history=weights,
+        horizons_years=(3, 5, 10, full_years),
+    )
+    print("\n[stress] Full-history metrics (3Y / 5Y / 10Y / since-inception):")
+    if not metrics.empty:
+        with pd.option_context("display.max_columns", None, "display.width", 240):
+            print(metrics.round(4).to_string())
+
+    print("\n[stress] GFC-only window metrics (2007-10-01 → 2009-12-31):")
+    gfc_start = pd.Timestamp("2007-10-01")
+    gfc_end = pd.Timestamp("2009-12-31")
+    strat_gfc = strat_rets[(strat_rets.index >= gfc_start) & (strat_rets.index <= gfc_end)]
+    spy_gfc = spy_ret[(spy_ret.index >= gfc_start) & (spy_ret.index <= gfc_end)]
+    aord_gfc = aord_ret[(aord_ret.index >= gfc_start) & (aord_ret.index <= gfc_end)]
+
+    if len(strat_gfc) > 0:
+        def _summary(r, label):
+            if r.empty:
+                return f"  {label:18s} (no data)"
+            nav = (1 + r).cumprod()
+            dd = nav / nav.cummax() - 1
+            total_ret = nav.iloc[-1] - 1
+            return (f"  {label:18s} TotRet {total_ret*100:+7.2f}%  "
+                    f"MaxDD {dd.min()*100:+7.2f}%  "
+                    f"VolAnn {r.std()*np.sqrt(ANNUAL_TRADING_DAYS)*100:5.2f}%")
+        print(_summary(strat_gfc, "Strategy"))
+        print(_summary(spy_gfc, "SPY (AUD)"))
+        print(_summary(aord_gfc, "^AORD"))
+
+        nav_strat_gfc = (1 + strat_gfc).cumprod()
+        nav_spy_gfc = (1 + spy_gfc).cumprod() if not spy_gfc.empty else None
+        dd_strat = (nav_strat_gfc / nav_strat_gfc.cummax() - 1).min()
+        if nav_spy_gfc is not None:
+            dd_spy = (nav_spy_gfc / nav_spy_gfc.cummax() - 1).min()
+            if dd_spy < -0.01:
+                print(f"\n  Defense ratio: Strategy MaxDD is {dd_strat/dd_spy*100:.1f}% of SPY MaxDD")
+                print(f"  (100% = no defense, 0% = perfect defense)")
+
+    try:
+        fig, ax = plt.subplots(figsize=(12, 5))
+        nav_strat = (1 + strat_rets).cumprod()
+        nav_spy_full = (1 + spy_ret.reindex(strat_rets.index).fillna(0)).cumprod() if not spy_ret.empty else None
+        dd_strat_full = nav_strat / nav_strat.cummax() - 1
+        ax.plot(dd_strat_full.index, dd_strat_full * 100, label="Strategy (Ensemble)",
+                linewidth=1.6, color="#1f4ea1")
+        if nav_spy_full is not None:
+            dd_spy_full = nav_spy_full / nav_spy_full.cummax() - 1
+            ax.plot(dd_spy_full.index, dd_spy_full * 100, label="SPY (AUD)",
+                    linewidth=1.1, color="#c44e4e", alpha=0.85)
+        ax.axvspan(gfc_start, pd.Timestamp("2009-06-30"),
+                   alpha=0.12, color="red", label="GFC")
+        ax.set_title(f"GFC Stress Test — Drawdowns ({strat_rets.index.min().date()} → {strat_rets.index.max().date()})")
+        ax.set_ylabel("Drawdown (%)")
+        ax.axhline(0, color="black", linewidth=0.5)
+        ax.legend(loc="lower right")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        out_path = _app_dir() / "gfc_stress_drawdown.png"
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+        print(f"\n[stress] Drawdown chart → {out_path}")
+    except Exception as e:
+        print(f"[stress] Chart save failed: {e}")
+
+    # Save summary JSON for memory + later comparison
+    try:
+        nav_full = (1 + strat_rets).cumprod()
+        dd_full = nav_full / nav_full.cummax() - 1
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "universe": STRESS_TICKERS,
+            "broker": BROKER_CONFIG["name"],
+            "oos_start": str(strat_rets.index.min().date()),
+            "oos_end": str(strat_rets.index.max().date()),
+            "full_period_total_return_pct": float((nav_full.iloc[-1] - 1) * 100),
+            "full_period_max_drawdown_pct": float(dd_full.min() * 100),
+            "gfc_window": {
+                "start": str(gfc_start.date()),
+                "end": str(gfc_end.date()),
+                "strategy_total_return_pct": float(((1 + strat_gfc).cumprod().iloc[-1] - 1) * 100) if len(strat_gfc) else None,
+                "strategy_max_dd_pct": float(((1 + strat_gfc).cumprod() / (1 + strat_gfc).cumprod().cummax() - 1).min() * 100) if len(strat_gfc) else None,
+                "spy_total_return_pct": float(((1 + spy_gfc).cumprod().iloc[-1] - 1) * 100) if len(spy_gfc) else None,
+                "spy_max_dd_pct": float(((1 + spy_gfc).cumprod() / (1 + spy_gfc).cumprod().cummax() - 1).min() * 100) if len(spy_gfc) else None,
+            },
+            "rebalances": {
+                "scheduled": int(out.get("n_scheduled", 0)),
+                "early_triggered": int(out.get("n_early_triggered", 0)),
+                "executed": int(out.get("n_executed", 0)),
+                "skipped": int(out.get("n_skipped", 0)),
+            },
+        }
+        json_path = _app_dir() / "gfc_stress_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"[stress] Summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[stress] Summary JSON save failed: {e}")
+
+    print("\n" + "=" * 80)
+    print("GFC STRESS TEST COMPLETE")
+    print("=" * 80)
+    return 0
+
+
+if "--stress-test" in sys.argv:
+    _exit_code = _run_gfc_stress_test()
+    sys.exit(_exit_code)
+
+
 # === Rebuild core analytics ===
 prices_aud_for_returns, df_melt, df_cov_wide, Sigma_daily, mu_ann_geo = _rebuild_core_from_prices(prices)
 globals()["returns_wide_df"] = df_cov_wide.copy()
@@ -6645,12 +6924,42 @@ if USE_XLWINGS:
             _delta_vals = pd.to_numeric(trade_rec.get(_delta_col, 0), errors="coerce").fillna(0).astype(int)
             row_b = np.where(_delta_vals == 0, 0.0, row_b)
             trade_rec["Brokerage (AUD)"] = pd.Series(row_b, index=trade_rec.index).round(2)
-            
+
             trade_rec.drop(
                 columns=[c for c in trade_rec.columns if str(c).lower().startswith("promo")],
                 errors="ignore",
                 inplace=True
             )
+
+            # === Drift tracker (Tier-1 #3): recommendation log =================
+            # One JSONL line per run. Foundation for later fill/slippage compare
+            # once IBKR API or manual fill sheet is wired up.
+            try:
+                _drift_log_path = _app_dir() / "trade_recommendation_log.jsonl"
+                if (portfolio_value_override is not None
+                        and np.isfinite(portfolio_value_override)
+                        and portfolio_value_override > 0):
+                    _portfolio_val_for_log = float(portfolio_value_override)
+                else:
+                    _cu = pd.to_numeric(trade_rec.get("Curr Units", 0), errors="coerce").fillna(0)
+                    _lp = pd.to_numeric(trade_rec.get("Last Px (AUD)", 0), errors="coerce").fillna(0)
+                    _portfolio_val_for_log = float((_cu * _lp).sum())
+                append_trade_recommendation_log(
+                    _drift_log_path,
+                    selected_mode=_tp_mode,
+                    trade_df=trade_rec,
+                    w_target=w_tradeplan,
+                    current_units=pd.Series(units),
+                    portfolio_value_aud=_portfolio_val_for_log,
+                    regime_mix=globals().get("ensemble_mix_live", pd.Series(dtype=float)),
+                    expected_brokerage_aud=float(costs_rec.get("brokerage", 0.0)),
+                    expected_cgt_aud=float(costs_rec.get("cgt_tax", 0.0)),
+                    broker_name=str(BROKER_CONFIG.get("name", "unknown")),
+                    cgt_mtr=float(CGT_CONFIG.get("marginal_tax_rate", 0.30)),
+                    universe_size=int(len(w_tradeplan)),
+                )
+            except Exception as _e_drift:
+                print(f"[drift] recommendation log skipped: {_e_drift}")
             
             # --- Lot expansion (safe now that 'Security' exists as a column) ---
             lot_expanded = expand_with_lots(

@@ -18,3 +18,15 @@ last_run_state.json
 
 # Office lock files (~$Document.docx, ~$Workbook.xlsx, etc.)
 ~$*
+
+# Auto-generated user artefacts (state, region overrides, output workbooks)
+regions.json
+Stock Analysis_AUTO.xlsm
+
+# Stress-test outputs (Tier-1 #2)
+gfc_stress_drawdown.png
+gfc_stress_summary.json
+gfc_run.log
+
+# Drift tracker log (Tier-1 #3) — local-only state, append-only
+trade_recommendation_log.jsonl
