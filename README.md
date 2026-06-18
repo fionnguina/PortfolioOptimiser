@@ -85,31 +85,31 @@ Full breakdown in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ```
 Portfolio_Optimiser/
-├── Portfolio_Optimiser.py      # The engine. ~9k lines, one monolithic file.
-├── Main.py                      # Entry point that sets up logging then exec's the engine
-├── build_helper.py              # PyInstaller wrapper. Writes _version.py with git SHA.
-├── _version.py                  # AUTO-GENERATED at build time. Gitignored.
-├── Stock Analysis.xlsm          # The workbook. Holdings + Tilts + Lots input;
-│                                # OPT, OOS_Validation, CGT_Audit, Drift_Fills,
-│                                # Drift_NAV, Actual_Fills, Cash_Ledger output.
-├── regions.json                 # User region overrides (e.g. NDQ.AX → US)
-├── portfolio_state.json         # Last-run NAV snapshot (auto-rewritten)
+├── Portfolio_Optimiser.py          # The engine. ~9k lines, one monolithic file.
+├── Main.py                         # Entry point that sets up logging then exec's the engine
+├── build_helper.py                 # PyInstaller wrapper. Writes _version.py with git SHA.
+├── _version.py                     # AUTO-GENERATED at build time. Gitignored.
+├── Stock Analysis.xlsm             # The workbook. Holdings + Tilts + Lots input;
+│                                   # OPT, OOS_Validation, CGT_Audit, Drift_Fills,
+│                                   # Drift_NAV, Actual_Fills, Cash_Ledger output.
+├── regions.json                    # User region overrides (e.g. NDQ.AX → US)
+├── portfolio_state.json            # Last-run NAV snapshot (auto-rewritten)
 ├── trade_recommendation_log.jsonl  # JSONL: one entry per run, all recommendations
-├── live_nav_history.jsonl       # JSONL: daily NAV snapshot
-├── cash_ledger.jsonl            # JSONL: per-run cumulative cost tracking
+├── live_nav_history.jsonl          # JSONL: daily NAV snapshot
+├── cash_ledger.jsonl               # JSONL: per-run cumulative cost tracking
 ├── Reports/
-│   └── Portfolio_Report.pptx    # The roadshow deck
-├── ibkr_paper_test.py           # IBKR Phase 0: read-only connection test
-├── ibkr_price_check.py          # PoC: delayed quotes vs yfinance comparison
-├── ibkr_seed_paper.py           # IBKR Phase 1.5: pretend-trade engine units → paper
-├── ibkr_dry_run.py              # IBKR Phase 2: format engine's rebalance as IBKR
-│                                # Order objects, print, NO submit
+│   └── Portfolio_Report.pptx       # The roadshow deck
+├── ibkr_paper_test.py              # IBKR Phase 0: read-only connection test
+├── ibkr_price_check.py             # PoC: delayed quotes vs yfinance comparison
+├── ibkr_seed_paper.py              # IBKR Phase 1.5: pretend-trade engine units → paper
+├── ibkr_dry_run.py                 # IBKR Phase 2: format engine's rebalance as IBKR
+│                                   # Order objects, print, NO submit
 ├── dist/
-│   ├── Portfolio Optimiser.exe  # PyInstaller-built .exe (~165 MB)
-│   └── run.log + run.log.1..7   # Rotated run logs
-├── AUDIT.md                     # Pre-paper-live audit + readiness checklist
-├── ARCHITECTURE.md              # Data flow + key data structures + module guide
-└── tests/                       # Pytest suite (minimal coverage)
+│   ├── Portfolio Optimiser.exe     # PyInstaller-built .exe (~165 MB)
+│   └── run.log + run.log.1..7      # Rotated run logs
+├── AUDIT.md                        # Pre-paper-live audit + readiness checklist
+├── ARCHITECTURE.md                 # Data flow + key data structures + module guide
+└── tests/                          # Pytest suite (minimal coverage)
 ```
 
 ---

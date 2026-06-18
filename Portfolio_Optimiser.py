@@ -111,6 +111,13 @@ def _log_swallowed(stage: str = "") -> None:
 _STRESS_TEST_MODE = "--stress-test" in sys.argv
 if _STRESS_TEST_MODE:
     print("[stress] --stress-test detected; will skip dialog + live pipeline")
+# `--scale-analysis`: skip dialog + run OOS walk-forward at 6 NAV scales to
+# produce a fee-drag-vs-AUM evidence pack. See _run_scale_analysis().
+_SCALE_ANALYSIS_MODE = "--scale-analysis" in sys.argv
+if _SCALE_ANALYSIS_MODE:
+    print("[scale] --scale-analysis detected; will skip dialog + live pipeline")
+# Both modes follow the same skip-everything-heavy path.
+_SKIP_LIVE_PIPELINE = _STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
 
 
 # =====================================================================
@@ -5490,8 +5497,8 @@ else:
 #     recommended_tilts_for_universe() reads mu_vec_opt/Sigma_opt and finds
 #     empty placeholders → optimal_portfolio_tilts returns the zero series
 try:
-    if _STRESS_TEST_MODE:
-        raise RuntimeError("stress-test mode: skipping pre-dialog FF5 setup")
+    if _SKIP_LIVE_PIPELINE:
+        raise RuntimeError("skip-pipeline mode: skipping pre-dialog FF5 setup")
     _run_ff5_and_frontier_setup(prices)
     # Sync module-level locals from globals (mirror the post-dialog sync block).
     Sigma_opt = globals().get("Sigma_opt", Sigma_opt)
@@ -5534,10 +5541,10 @@ except Exception as _e_seed:
     print(f"[tilts] Could not seed from current portfolio; using sheet/defaults: {_e_seed}")
 
 # ---- 10B) Combined dialog (holdings + tilts) ----
-if _STRESS_TEST_MODE:
-    # Stress-test mode: bypass the modal dialog so the run can reach the
-    # stress-test gate downstream. Use sheet seeds (same as user cancelling).
-    print("[stress] bypassing holdings dialog (using sheet seeds)")
+if _SKIP_LIVE_PIPELINE:
+    # Stress-test / scale-analysis mode: bypass the modal dialog so the run can
+    # reach the downstream gate. Use sheet seeds (same as user cancelling).
+    print("[skip-pipeline] bypassing holdings dialog (using sheet seeds)")
     res = None
 else:
     res = edit_holdings_and_tilts_dialog(
@@ -5567,11 +5574,11 @@ else:
 # removed in favour of this single call. Sigma_opt / mu_vec_opt / B /
 # W / stats_df / tan_ret / tan_vol / cov_plus / exp_ret_df all come from
 # here.
-if _STRESS_TEST_MODE:
-    print("[stress] skipping live FF5/frontier setup (not needed for stress test)")
+if _SKIP_LIVE_PIPELINE:
+    print("[skip-pipeline] skipping live FF5/frontier setup")
 try:
-    if _STRESS_TEST_MODE:
-        raise RuntimeError("stress-test mode: skipping FF5 setup")
+    if _SKIP_LIVE_PIPELINE:
+        raise RuntimeError("skip-pipeline mode: skipping FF5 setup")
     _run_ff5_and_frontier_setup(prices)
     # Sync module-level locals with the globals the function just wrote.
     Sigma_opt = globals()["Sigma_opt"]
@@ -6065,6 +6072,7 @@ def run_oos_ensemble_walk_forward(
     lambda_temp: float = 2.0,
     sortino_halflife_days: int = 60,
     forward_signal_alpha: float = 0.5,
+    starting_nav_aud: float = 1_000_000.0,
 ) -> dict:
     """Ensemble walk-forward: solve 5 candidates per rebalance, softmax-blend
     by rolling 12M Sortino, hold the blended portfolio for 1 month.
@@ -6142,7 +6150,7 @@ def run_oos_ensemble_walk_forward(
     rebalance_costs: dict[pd.Timestamp, float] = {}
     rebalance_taxes: dict[pd.Timestamp, float] = {}
     _prev_blend_w = pd.Series(dtype=float)
-    _running_nav = 1_000_000.0  # AUD; flat-fee impact scales with portfolio size
+    _running_nav = float(starting_nav_aud)  # AUD; flat-fee impact scales with NAV
     # Conditional rebalancing diagnostics
     n_skipped = 0
     n_executed = 0
@@ -6769,6 +6777,224 @@ def _run_gfc_stress_test() -> int:
 
 if "--stress-test" in sys.argv:
     _exit_code = _run_gfc_stress_test()
+    sys.exit(_exit_code)
+
+
+# === Scale analysis (--scale-analysis) ======================================
+# Runs the OOS walk-forward at 6 starting NAVs ($10k → $10M) to surface the
+# fee-drag curve. Answers: "at what AUM does this strategy actually work?"
+# Same walk-forward engine, same universe, same ~10-year window — only the
+# starting_nav changes, which scales the flat-fee component appropriately.
+def _run_scale_analysis() -> int:
+    print("\n" + "=" * 88)
+    print("SCALE ANALYSIS — net-of-cost OOS performance at six AUM levels")
+    print("=" * 88)
+
+    SCALES = [
+        ("$10k",  10_000),
+        ("$100k", 100_000),
+        ("$250k", 250_000),
+        ("$500k", 500_000),
+        ("$1M",   1_000_000),
+        ("$10M",  10_000_000),
+    ]
+
+    # Use the live universe (already-downloaded prices) — we want apples-to-
+    # apples comparability with the standard OOS report.
+    _scale_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[scale] universe: {len(_scale_tickers)} tickers")
+    print(f"[scale] downloading 12y of long-history data...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_scale_tickers, period="12y", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="12y", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[scale] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    # SPY + ^AORD daily returns for benchmark comparison.
+    spy_ret = (px_aud["SPY"].pct_change().dropna()
+               if "SPY" in px_aud.columns else pd.Series(dtype=float))
+    aord_ret = (px_aud["^AORD"].pct_change().dropna()
+                if "^AORD" in px_aud.columns else pd.Series(dtype=float))
+
+    results: list[dict] = []
+    for label, nav in SCALES:
+        print(f"\n[scale] running OOS at {label} ({nav:,.0f} AUD starting NAV)...")
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(
+            px_aud,
+            train_window_months=24,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            starting_nav_aud=float(nav),
+        )
+        strat_rets = out["blended_returns"]
+        if strat_rets.empty:
+            print(f"[scale] {label}: empty returns, skipping")
+            continue
+
+        # Net return metrics
+        days = len(strat_rets)
+        years = max(days / ANNUAL_TRADING_DAYS, 1e-6)
+        nav_curve = (1.0 + strat_rets).cumprod()
+        total_ret = float(nav_curve.iloc[-1] - 1.0)
+        ann_ret = float((1.0 + total_ret) ** (1.0 / years) - 1.0)
+        vol_ann = float(strat_rets.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        sharpe = ann_ret / vol_ann if vol_ann > 0 else 0.0
+        downside = strat_rets[strat_rets < 0].std() * np.sqrt(ANNUAL_TRADING_DAYS)
+        sortino = ann_ret / float(downside) if float(downside) > 0 else 0.0
+        dd = (nav_curve / nav_curve.cummax() - 1.0).min()
+
+        # Cost drags
+        cost_ser = out.get("rebalance_costs", pd.Series(dtype=float))
+        tax_ser = out.get("rebalance_taxes", pd.Series(dtype=float))
+        # rebalance_costs is in fraction-of-NAV. Convert to bps/year.
+        brokerage_drag_bps = float(cost_ser.sum() / years * 10_000) if not cost_ser.empty else 0.0
+        cgt_drag_bps = float(tax_ser.sum() / years * 10_000) if not tax_ser.empty else 0.0
+
+        # SPY benchmark over the same window
+        spy_window = spy_ret.reindex(strat_rets.index).fillna(0.0)
+        spy_nav = (1.0 + spy_window).cumprod()
+        spy_ann = float(spy_nav.iloc[-1] ** (1.0 / years) - 1.0)
+        alpha_vs_spy = ann_ret - spy_ann
+
+        elapsed = time.perf_counter() - t1
+        results.append({
+            "label": label,
+            "starting_nav_aud": int(nav),
+            "years": round(years, 2),
+            "ann_return": round(ann_ret, 6),
+            "ann_volatility": round(vol_ann, 6),
+            "sharpe": round(sharpe, 3),
+            "sortino": round(sortino, 3),
+            "max_drawdown": round(float(dd), 6),
+            "brokerage_drag_bps_per_year": round(brokerage_drag_bps, 1),
+            "cgt_drag_bps_per_year": round(cgt_drag_bps, 1),
+            "total_drag_bps_per_year": round(brokerage_drag_bps + cgt_drag_bps, 1),
+            "spy_ann_return": round(spy_ann, 6),
+            "alpha_vs_spy": round(alpha_vs_spy, 6),
+            "n_rebalances": int(out.get("n_executed", 0)),
+            "elapsed_sec": round(elapsed, 1),
+        })
+        print(f"[scale] {label}: ann_ret {ann_ret*100:+.2f}%  "
+              f"Sharpe {sharpe:.2f}  "
+              f"MaxDD {float(dd)*100:+.2f}%  "
+              f"brok {brokerage_drag_bps:.0f}bps/y  "
+              f"CGT {cgt_drag_bps:.0f}bps/y  "
+              f"α(SPY) {alpha_vs_spy*100:+.2f}%  "
+              f"({elapsed:.1f}s)")
+
+    if not results:
+        print("[scale] no results produced.")
+        return 1
+
+    # === Comparison table ===
+    print("\n" + "=" * 88)
+    print("SCALE ANALYSIS RESULTS — net of brokerage + AU CGT (30% MTR)")
+    print("=" * 88)
+    print(f"  {'AUM':<8} {'Ann Ret':>9} {'Vol':>7} {'Sharpe':>7} "
+          f"{'MaxDD':>8} {'Brok':>9} {'CGT':>9} {'Drag':>9} "
+          f"{'α(SPY)':>9} {'Rebals':>7}")
+    print(f"  {'-'*8} {'-'*9} {'-'*7} {'-'*7} {'-'*8} "
+          f"{'-'*9} {'-'*9} {'-'*9} {'-'*9} {'-'*7}")
+    for r in results:
+        print(f"  {r['label']:<8} "
+              f"{r['ann_return']*100:>+8.2f}% "
+              f"{r['ann_volatility']*100:>6.2f}% "
+              f"{r['sharpe']:>7.2f} "
+              f"{r['max_drawdown']*100:>+7.2f}% "
+              f"{r['brokerage_drag_bps_per_year']:>7.0f}bps "
+              f"{r['cgt_drag_bps_per_year']:>7.0f}bps "
+              f"{r['total_drag_bps_per_year']:>7.0f}bps "
+              f"{r['alpha_vs_spy']*100:>+8.2f}% "
+              f"{r['n_rebalances']:>7}")
+    print()
+    print(f"  SPY benchmark over same window: {results[0]['spy_ann_return']*100:+.2f}%/yr")
+    print()
+
+    # Verdict
+    print("=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    spy_ann = results[0]["spy_ann_return"]
+    viable = [r for r in results if r["alpha_vs_spy"] > 0.005]  # >50bps over SPY
+    if viable:
+        print(f"  Strategy beats SPY (net) at: {', '.join(r['label'] for r in viable)}")
+        floor = viable[0]["label"]
+        print(f"  Minimum viable AUM (alpha > 50bps vs SPY): {floor}")
+    else:
+        print(f"  Strategy DOES NOT beat SPY net of costs at any tested scale.")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "spy_ann_return_window": results[0]["spy_ann_return"],
+            "scales": results,
+        }
+        json_path = APP_DIR / "scale_analysis_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n[scale] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[scale] summary JSON save failed: {e}")
+
+    # Chart: ann return + drag vs scale
+    try:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        xs = [r["starting_nav_aud"] for r in results]
+        ax1.semilogx(xs, [r["ann_return"]*100 for r in results],
+                     marker="o", linewidth=2, label="Strategy (net)")
+        ax1.axhline(spy_ann*100, color="red", linestyle="--", alpha=0.6,
+                    label=f"SPY ({spy_ann*100:.2f}%/yr)")
+        ax1.set_ylabel("Annualised return (%)")
+        ax1.set_title("Strategy net return vs starting AUM")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax2.semilogx(xs, [r["brokerage_drag_bps_per_year"] for r in results],
+                     marker="s", color="orange", label="Brokerage drag")
+        ax2.semilogx(xs, [r["cgt_drag_bps_per_year"] for r in results],
+                     marker="^", color="purple", label="CGT drag")
+        ax2.semilogx(xs, [r["total_drag_bps_per_year"] for r in results],
+                     marker="o", color="black", label="Total drag")
+        ax2.set_ylabel("Annual drag (bps)")
+        ax2.set_xlabel("Starting AUM (AUD, log scale)")
+        ax2.set_title("Cost drag vs starting AUM")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        fig.tight_layout()
+        chart_path = APP_DIR / "scale_analysis_chart.png"
+        fig.savefig(chart_path, dpi=120)
+        plt.close(fig)
+        print(f"[scale] chart → {chart_path}")
+    except Exception as e:
+        print(f"[scale] chart save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("SCALE ANALYSIS COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--scale-analysis" in sys.argv:
+    _exit_code = _run_scale_analysis()
     sys.exit(_exit_code)
 
 

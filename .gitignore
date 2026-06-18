@@ -28,6 +28,9 @@ gfc_stress_drawdown.png
 gfc_stress_summary.json
 gfc_run.log
 
+# Scale-analysis outputs (one-shot diagnostic, regenerate via --scale-analysis)
+scale_run.log
+
 # Drift tracker logs (Tier-1 #3) — local-only state, append-only
 trade_recommendation_log.jsonl
 live_nav_history.jsonl
