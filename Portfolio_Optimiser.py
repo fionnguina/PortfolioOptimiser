@@ -344,6 +344,21 @@ DRIFT_CUMULATIVE_THRESH    = 0.05   # warn if |cumulative drift|    > 5%
 DRIFT_DD_ALERT_THRESH      = -0.10  # warn if live MaxDD            < -10%
 DRIFT_SLIPPAGE_BPS_THRESH  = 25.0   # warn if |slippage|            > 25 bps
 DRIFT_FEE_MULTIPLIER       = 2.0    # warn if actual fees           > 2x expected
+TARGET_PORTFOLIO_VALUE_AUD = 1_000_000.0  # anchor for "drift vs target" in cash ledger
+
+# === Hybrid pricing (Tier-1 #1) ============================================
+# When True + TWS paper connection works, the live trade plan uses IBKR's
+# delayed last-price (free, ~15min lag) instead of yfinance's close. Fixes
+# the after-hours/corporate-action gaps that yfinance has. 10y OOS backtest
+# still uses yfinance for history depth + bulk download. Silent fallback to
+# yfinance if TWS isn't running.
+USE_IBKR_LIVE_PRICES   = True
+IBKR_HOST              = "127.0.0.1"
+IBKR_PORT              = 7497    # paper TWS (7496 = live; never use here)
+IBKR_CLIENT_ID         = 10      # distinct from helper scripts (7/8/9)
+IBKR_CONNECT_TIMEOUT   = 8
+IBKR_SNAPSHOT_WAIT_SEC = 6
+IBKR_DIVERGENCE_WARN_BPS = 100   # warn per-ticker if IBKR vs yfinance > this
 
 
 # ============================================================================
@@ -4183,6 +4198,304 @@ def _print_drift_warnings(
     return n_warn
 
 
+# === Persistent cash ledger (Tier-1 #3 add-on) ===============================
+# One JSONL entry per run. Surfaces cumulative brokerage + CGT + drift vs the
+# anchor target portfolio value, so the user can see where money is going
+# (currently the engine reports brokerage but never subtracts it from NAV).
+
+def append_cash_ledger(
+    ledger_path,
+    *,
+    portfolio_value_aud: float,
+    net_invested_aud: float,
+    cash_balance_aud: float,
+    brokerage_this_run_aud: float,
+    cgt_this_run_aud: float,
+    loss_cf_tax_aud: float,
+    selected_mode: str,
+    broker_name: str,
+    as_of_date=None,
+) -> None:
+    """Append one snapshot to cash_ledger.jsonl. Pure append — every run is
+    recorded as its own row so we can see what's happening across re-runs
+    (price drift, brokerage cost, etc.). Dedup by exact run_at timestamp
+    only, to guard against pathological double-invocations within the
+    same second."""
+    p = Path(ledger_path)
+    iso_date = pd.Timestamp(as_of_date or pd.Timestamp.now()).strftime("%Y-%m-%d")
+    run_at = pd.Timestamp.now().isoformat(timespec="seconds")
+    entry = {
+        "date": iso_date,
+        "run_at": run_at,
+        "portfolio_value_aud": round(float(portfolio_value_aud), 2),
+        "net_invested_aud": round(float(net_invested_aud), 2),
+        "cash_balance_aud": round(float(cash_balance_aud), 2),
+        "brokerage_this_run_aud": round(float(brokerage_this_run_aud), 2),
+        "cgt_this_run_aud": round(float(cgt_this_run_aud), 2),
+        "loss_carry_forward_tax_aud": round(float(loss_cf_tax_aud), 2),
+        "selected_mode": str(selected_mode),
+        "broker": str(broker_name),
+    }
+    try:
+        existing: list[dict] = []
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        existing.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        # Only dedup if an entry with the EXACT same run_at exists (would only
+        # happen on a re-entrant call within the same second).
+        if not any(e.get("run_at") == run_at for e in existing):
+            existing.append(entry)
+        existing.sort(key=lambda e: e.get("run_at", e.get("date", "")))
+        with open(p, "w", encoding="utf-8") as f:
+            for e in existing:
+                f.write(json.dumps(e) + "\n")
+    except Exception as e:
+        print(f"[cash] could not append cash ledger: {e}")
+
+
+def _load_cash_ledger(ledger_path) -> pd.DataFrame:
+    """Load cash_ledger.jsonl into a DataFrame, computing cumulative columns
+    + drift vs first record + drift vs TARGET_PORTFOLIO_VALUE_AUD anchor."""
+    p = Path(ledger_path)
+    if not p.exists():
+        return pd.DataFrame()
+    rows: list[dict] = []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
+    df = df.sort_values("run_at").reset_index(drop=True)
+    # Cumulative + drift columns
+    df["cum_brokerage_aud"] = pd.to_numeric(df["brokerage_this_run_aud"],
+                                            errors="coerce").fillna(0).cumsum().round(2)
+    df["cum_cgt_aud"] = pd.to_numeric(df["cgt_this_run_aud"],
+                                       errors="coerce").fillna(0).cumsum().round(2)
+    first_val = float(df["portfolio_value_aud"].iloc[0]) if not df.empty else 0.0
+    df["delta_vs_prev_aud"] = pd.to_numeric(df["portfolio_value_aud"],
+                                            errors="coerce").diff().round(2)
+    df["drift_vs_start_aud"] = (
+        pd.to_numeric(df["portfolio_value_aud"], errors="coerce") - first_val
+    ).round(2)
+    df["drift_vs_target_aud"] = (
+        pd.to_numeric(df["portfolio_value_aud"], errors="coerce") - TARGET_PORTFOLIO_VALUE_AUD
+    ).round(2)
+    # Reconciliation: portfolio change between runs SHOULD equal
+    # (market_move) - (brokerage_paid) - (cgt_paid). So
+    # market_move = Δ_portfolio + brokerage + cgt. If market_move is wildly
+    # different from what underlying prices actually did, that's unexplained
+    # drift (slippage, FX, math bug). Blank on the first row — there's no
+    # prior NAV to diff against.
+    df["unexplained_delta_aud"] = (
+        df["delta_vs_prev_aud"]
+        + pd.to_numeric(df["brokerage_this_run_aud"], errors="coerce").fillna(0)
+        + pd.to_numeric(df["cgt_this_run_aud"], errors="coerce").fillna(0)
+    ).round(2)
+    return df
+
+
+# === IBKR hybrid live-price fetch (Tier-1 #1) ================================
+# Pulls delayed last-prices from IBKR for the live trade plan. Read-only;
+# requires TWS or IB Gateway running on PAPER (DUQ... account). Returns {}
+# on any failure so the engine falls back to yfinance cleanly.
+
+def _ibkr_pick_price(tk) -> float | None:
+    """Best available price from an ib_insync Ticker, or None.
+
+    Requires v > 0: IBKR uses -1.0 as a 'no data' sentinel that's still
+    finite, and accepting it would torch downstream cash-flow maths."""
+    def _ok(v):
+        return (v is not None and isinstance(v, (int, float))
+                and math.isfinite(v) and v > 0.0)
+    if _ok(tk.last):
+        return float(tk.last)
+    if _ok(tk.close):
+        return float(tk.close)
+    if _ok(tk.bid) and _ok(tk.ask):
+        return (float(tk.bid) + float(tk.ask)) / 2.0
+    return None
+
+
+def fetch_ibkr_live_prices_native(tickers: list[str]) -> dict[str, float]:
+    """Return native-currency last prices for `tickers` keyed by engine ticker.
+
+    Engine tickers ending with '.AX' are mapped to ASX/AUD; '^*' (benchmarks)
+    are skipped; everything else is treated as SMART/USD. Empty dict on any
+    failure (TWS not running, non-paper account, contract qualification fail).
+    """
+    try:
+        from ib_insync import IB, Stock
+    except ImportError:
+        print("[ibkr-price] ib_insync not installed; skipping IBKR price fetch")
+        return {}
+    ib = IB()
+    out: dict[str, float] = {}
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID,
+                   timeout=IBKR_CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[ibkr-price] connection skipped ({type(e).__name__}); "
+              f"using yfinance prices")
+        return {}
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed or not str(managed[0]).startswith("DU"):
+            print(f"[ibkr-price] non-paper account {managed} — refusing; "
+                  f"using yfinance")
+            return {}
+        ib.reqMarketDataType(3)  # delayed (free)
+        plan: list[tuple[str, object]] = []
+        for t in tickers:
+            ts = str(t).strip()
+            if ts.startswith("^"):
+                continue
+            if ts.endswith(".AX"):
+                c = Stock(ts[:-3], exchange="SMART", currency="AUD",
+                          primaryExchange="ASX")
+            else:
+                c = Stock(ts, exchange="SMART", currency="USD")
+            plan.append((ts, c))
+        if not plan:
+            return {}
+        ib.qualifyContracts(*[c for _, c in plan])
+        plan = [(t, c) for t, c in plan if getattr(c, "conId", 0)]
+        ticks = [(t, ib.reqMktData(c, "", snapshot=True,
+                                    regulatorySnapshot=False))
+                 for t, c in plan]
+        deadline = time.time() + IBKR_SNAPSHOT_WAIT_SEC
+        while time.time() < deadline:
+            ready = sum(1 for _, tk in ticks if _ibkr_pick_price(tk) is not None)
+            if ready == len(ticks):
+                break
+            ib.sleep(0.4)
+        for ticker, tk in ticks:
+            p = _ibkr_pick_price(tk)
+            if p is not None:
+                out[ticker] = float(p)
+        return out
+    except Exception as e:
+        print(f"[ibkr-price] fetch failed ({type(e).__name__}): {e}")
+        return {}
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+def apply_ibkr_price_override(
+    last_px_hold: pd.Series,
+    ibkr_prices: dict[str, float],
+) -> tuple[pd.Series, dict]:
+    """Replace yfinance last-prices with IBKR's where available. Returns
+    (updated_series, diagnostics)."""
+    if not ibkr_prices:
+        return last_px_hold, {"n_overridden": 0, "n_warn": 0, "max_bps": 0.0}
+    updated = last_px_hold.copy()
+    n_over = 0
+    n_warn = 0
+    max_bps_abs = 0.0
+    max_bps_ticker = ""
+    for ticker, ibkr_px in ibkr_prices.items():
+        if ticker not in updated.index:
+            continue
+        # Defensive: reject non-positive IBKR prices (sentinel values like -1).
+        if not (isinstance(ibkr_px, (int, float)) and math.isfinite(ibkr_px) and ibkr_px > 0):
+            print(f"[ibkr-price][WARN] {ticker}: rejecting non-positive IBKR "
+                  f"price {ibkr_px} (keeping yfinance)")
+            continue
+        yf_px = pd.to_numeric(updated.get(ticker), errors="coerce")
+        if pd.notna(yf_px) and float(yf_px) > 0:
+            diff_bps = (ibkr_px - float(yf_px)) / float(yf_px) * 10_000
+            if abs(diff_bps) > max_bps_abs:
+                max_bps_abs = abs(diff_bps)
+                max_bps_ticker = ticker
+            if abs(diff_bps) > IBKR_DIVERGENCE_WARN_BPS:
+                print(f"[ibkr-price][WARN] {ticker}: IBKR {ibkr_px:.4f} vs "
+                      f"yfinance {float(yf_px):.4f} ({diff_bps:+.1f} bps)")
+                n_warn += 1
+        updated.loc[ticker] = ibkr_px
+        n_over += 1
+    return updated, {"n_overridden": n_over, "n_warn": n_warn,
+                     "max_bps": max_bps_abs, "max_bps_ticker": max_bps_ticker}
+
+
+def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame) -> None:
+    """Render the cash ledger to an Excel sheet. Overwrites each run."""
+    try:
+        sht = get_or_clear_sheet(wb, "Cash_Ledger")
+        if ledger_df is None or ledger_df.empty:
+            sht.range("A1").value = "(cash ledger empty — first run after this update populates it)"
+            return
+        # Summary band across the top.
+        latest = ledger_df.iloc[-1]
+        n_runs = len(ledger_df)
+        sht.range("A1").value = "Target Portfolio (AUD)"
+        sht.range("B1").value = round(TARGET_PORTFOLIO_VALUE_AUD, 2)
+        sht.range("A2").value = "Latest Portfolio (AUD)"
+        sht.range("B2").value = float(latest["portfolio_value_aud"])
+        sht.range("A3").value = "Total Drift vs Target"
+        sht.range("B3").value = float(latest["drift_vs_target_aud"])
+        sht.range("A4").value = "Total Drift vs Start (run 1)"
+        sht.range("B4").value = float(latest["drift_vs_start_aud"])
+        sht.range("A5").value = "Cum. Brokerage (all runs)"
+        sht.range("B5").value = float(latest["cum_brokerage_aud"])
+        sht.range("A6").value = "Cum. CGT (all runs)"
+        sht.range("B6").value = float(latest["cum_cgt_aud"])
+        sht.range("A7").value = "Total Cost (Brokerage + CGT)"
+        sht.range("B7").value = float(latest["cum_brokerage_aud"] + latest["cum_cgt_aud"])
+        sht.range("A8").value = "Runs recorded"
+        sht.range("B8").value = int(n_runs)
+        # Per-run detail starts below.
+        display_cols = [
+            "date", "selected_mode",
+            "portfolio_value_aud", "net_invested_aud", "cash_balance_aud",
+            "delta_vs_prev_aud",
+            "brokerage_this_run_aud", "cgt_this_run_aud",
+            "loss_carry_forward_tax_aud",
+            "cum_brokerage_aud", "cum_cgt_aud",
+            "drift_vs_start_aud", "drift_vs_target_aud",
+            "unexplained_delta_aud",
+        ]
+        present = [c for c in display_cols if c in ledger_df.columns]
+        out_df = ledger_df[present].copy()
+        out_df.rename(columns={
+            "date": "Date",
+            "selected_mode": "Mode",
+            "portfolio_value_aud": "Portfolio (AUD)",
+            "net_invested_aud": "Net Invested (AUD)",
+            "cash_balance_aud": "Cash (AUD)",
+            "delta_vs_prev_aud": "Δ vs Prior (AUD)",
+            "brokerage_this_run_aud": "Brokerage (AUD)",
+            "cgt_this_run_aud": "CGT (AUD)",
+            "loss_carry_forward_tax_aud": "Tax Saved (AUD)",
+            "cum_brokerage_aud": "Cum. Brokerage",
+            "cum_cgt_aud": "Cum. CGT",
+            "drift_vs_start_aud": "Drift vs Start",
+            "drift_vs_target_aud": "Drift vs Target",
+            "unexplained_delta_aud": "Unexplained Δ",
+        }, inplace=True)
+        sht.range("A10").options(index=False).value = out_df
+    except Exception as e:
+        print(f"[cash] could not write Cash_Ledger sheet: {e}")
+
+
 def compute_target_units_for_holdings(
     units_cur,
     last_px,
@@ -4575,6 +4888,9 @@ def compute_cgt_tax(
         "losses": float(losses + carry_forward_loss),
         "discounted_lt_after_losses": float(discounted_lt),
         "taxable": float(taxable),
+        # Losses left after offsetting ST + LT gains. Carries to next FY and
+        # becomes the "tax saved" side of the Deferred Tax callout.
+        "loss_carry_forward": float(max(0.0, rem_losses)),
         "audit": pd.DataFrame(audit_rows),
     }
     return float(tax), bkd
@@ -7217,6 +7533,27 @@ if USE_XLWINGS:
             # Resolve ensemble weights for the active plan (if requested).
             _w_ensemble_live = globals().get("W_ENSEMBLE_SER", pd.Series(dtype=float))
 
+            # === Hybrid pricing: IBKR delayed override (Tier-1 #1) ===
+            # Replace yfinance last-prices with IBKR's where available so the
+            # trade plan's cash flow + brokerage estimates match what we'd
+            # actually fill at. Silently falls back to yfinance if TWS isn't
+            # running.
+            if USE_IBKR_LIVE_PRICES:
+                try:
+                    _t_ibkr = time.perf_counter()
+                    _ibkr_px = fetch_ibkr_live_prices_native(list(last_px_hold.index))
+                    if _ibkr_px:
+                        last_px_hold, _diag = apply_ibkr_price_override(last_px_hold, _ibkr_px)
+                        print(f"[ibkr-price] applied to {_diag['n_overridden']} tickers "
+                              f"in {time.perf_counter()-_t_ibkr:.1f}s "
+                              f"(max divergence: {_diag['max_bps']:.0f} bps "
+                              f"on {_diag.get('max_bps_ticker') or 'n/a'}; "
+                              f"{_diag['n_warn']} >{IBKR_DIVERGENCE_WARN_BPS}bps warned)")
+                    else:
+                        print(f"[ibkr-price] no IBKR prices returned; using yfinance")
+                except Exception as _e_px:
+                    print(f"[ibkr-price] override skipped: {_e_px}")
+
             # Build ALL three trade plans up-front; downstream code can compare
             # what each one implies, and the "active" one is picked below.
             trade_no, resid_no = make_trade_plan(
@@ -7374,6 +7711,67 @@ if USE_XLWINGS:
                       f"warnings={_n_warn}")
             except Exception as _e_drift_v2:
                 print(f"[drift] v2/v3 tracker skipped: {_e_drift_v2}")
+
+            # === Cash ledger (persistent) =====================================
+            # Snapshot every run so the user can see where money is going:
+            # cumulative brokerage + CGT, drift vs start, drift vs $1M target,
+            # unexplained delta (if non-zero, brokerage/CGT/market doesn't add up).
+            try:
+                _cash_ledger_path = _app_dir() / "cash_ledger.jsonl"
+                # Compute trade-plan-summary values inline (the live block that
+                # defines `total_portfolio` etc. lives below this point — we
+                # mirror its logic here so the ledger runs in the right scope).
+                _cash_total_brokerage = float(costs_rec.get("brokerage", 0.0))
+                _cash_net_invested = 0.0
+                _cash_balance_local = 0.0
+                _cash_total_portfolio = 0.0
+                if trade_rec is not None and not trade_rec.empty:
+                    _tgt_units = pd.to_numeric(trade_rec.get("Target Units"), errors="coerce").fillna(0.0)
+                    _last_px = pd.to_numeric(trade_rec.get("Last Px (AUD)"), errors="coerce").fillna(0.0)
+                    _cash_net_invested = float((_tgt_units * _last_px).sum())
+                    if (portfolio_value_override is not None
+                            and np.isfinite(portfolio_value_override)
+                            and float(portfolio_value_override) > 0):
+                        _cash_total_portfolio = float(portfolio_value_override)
+                        _cash_balance_local = (_cash_total_portfolio
+                                               - _cash_net_invested
+                                               - _cash_total_brokerage)
+                    else:
+                        _cash_balance_local = float(
+                            pd.to_numeric(trade_rec.get("Cash Flow (AUD)"),
+                                          errors="coerce").fillna(0.0).sum()
+                        )
+                        _cash_total_portfolio = _cash_net_invested + _cash_balance_local
+                append_cash_ledger(
+                    _cash_ledger_path,
+                    portfolio_value_aud=_cash_total_portfolio,
+                    net_invested_aud=_cash_net_invested,
+                    cash_balance_aud=_cash_balance_local,
+                    brokerage_this_run_aud=_cash_total_brokerage,
+                    cgt_this_run_aud=float(costs_rec.get("cgt_tax", 0.0)),
+                    loss_cf_tax_aud=float(
+                        costs_rec.get("breakdown", {}).get("loss_carry_forward", 0.0)
+                    ) * float(CGT_CONFIG.get("marginal_tax_rate", 0.30)),
+                    selected_mode=_tp_mode,
+                    broker_name=str(BROKER_CONFIG.get("name", "unknown")),
+                )
+                _ledger_df = _load_cash_ledger(_cash_ledger_path)
+                _write_cash_ledger_sheet(wb, _ledger_df)
+                if not _ledger_df.empty:
+                    _latest = _ledger_df.iloc[-1]
+                    _runs = len(_ledger_df)
+                    _unex = _latest.get("unexplained_delta_aud")
+                    _unex_str = (f"${float(_unex):,.0f}"
+                                 if _unex is not None and not pd.isna(_unex)
+                                 else "(first run — no prior to compare)")
+                    print(f"[cash] ledger: {_runs} run(s) recorded. "
+                          f"Drift vs ${TARGET_PORTFOLIO_VALUE_AUD:,.0f}: "
+                          f"${float(_latest['drift_vs_target_aud']):,.0f} | "
+                          f"Cum. brokerage ${float(_latest['cum_brokerage_aud']):,.0f} | "
+                          f"Cum. CGT ${float(_latest['cum_cgt_aud']):,.0f} | "
+                          f"Unexplained Δ {_unex_str}")
+            except Exception as _e_cash:
+                print(f"[cash] ledger skipped: {_e_cash}")
 
             # --- Lot expansion (safe now that 'Security' exists as a column) ---
             lot_expanded = expand_with_lots(
@@ -7984,6 +8382,8 @@ if USE_XLWINGS:
                 print("[info] No previous state file found â€” starting fresh deltas at 0.")
             
             # --- Step 3: Compute deltas for PowerPoint ---
+            _bkd_for_cgt = costs_rec.get("breakdown", {}) if "costs_rec" in globals() else {}
+            _mtr_for_cgt = float(CGT_CONFIG.get("marginal_tax_rate", 0.30))
             results = {
                 "total_brokerage": total_brokerage,
                 "net_invested": net_invested,
@@ -7991,6 +8391,12 @@ if USE_XLWINGS:
                 "portfolio_change": total_portfolio - previous_portfolio,
                 "net_invested_change": net_invested - previous_invested,
                 "cash_balance": cash_balance,
+                # CGT this rebalance (positive = tax owed on realised gains).
+                "total_cgt": float(costs_rec.get("cgt_tax", 0.0)),
+                # Unused losses available to carry forward × MTR = tax saved.
+                "loss_carry_forward_tax_aud": (
+                    float(_bkd_for_cgt.get("loss_carry_forward", 0.0)) * _mtr_for_cgt
+                ),
             }
             
             # --- Step 4: Save current state for next comparison ---
@@ -8114,6 +8520,8 @@ if "results" not in globals():
         _cash_balance = float(pd.to_numeric(trade_rec.get("Cash Flow (AUD)"), errors="coerce").fillna(0.0).sum())
     _total_brokerage = float(costs_rec.get("brokerage", 0.0)) if "costs_rec" in globals() else 0.0
     _total_portfolio = float(_net_invested + _cash_balance)
+    _bkd_fb = costs_rec.get("breakdown", {}) if "costs_rec" in globals() else {}
+    _mtr_fb = float(CGT_CONFIG.get("marginal_tax_rate", 0.30))
     results = {
         "total_brokerage": _total_brokerage,
         "net_invested": _net_invested,
@@ -8121,6 +8529,10 @@ if "results" not in globals():
         "portfolio_change": 0.0,
         "net_invested_change": 0.0,
         "cash_balance": _cash_balance,
+        "total_cgt": float(costs_rec.get("cgt_tax", 0.0)) if "costs_rec" in globals() else 0.0,
+        "loss_carry_forward_tax_aud": (
+            float(_bkd_fb.get("loss_carry_forward", 0.0)) * _mtr_fb
+        ),
     }
 if "trades" not in globals():
     trades = trade_rec.copy() if "trade_rec" in globals() and isinstance(trade_rec, pd.DataFrame) else pd.DataFrame()
@@ -8674,8 +9086,23 @@ def export_to_ppt(results, trades, charts=None):
         # Reorder to your final order but only for those that exist
         final_order = [c for c in ["Security","Current","Target","Change","Last Price","Brokerage","Cash Flow"] if c in df.columns]
         df = df[final_order]
-            
-    
+
+        # --- Filter: hide universe rows with no position and no trade today ---
+        # Show row if it has units (Current > 0 or Target > 0) OR is being
+        # traded this run (Change != 0). Hides dormant universe members so the
+        # table only shows what's actually in play.
+        try:
+            _cur_n = pd.to_numeric(df.get("Current"), errors="coerce").fillna(0)
+            _tgt_n = pd.to_numeric(df.get("Target"), errors="coerce").fillna(0)
+            _chg_n = pd.to_numeric(df.get("Change"), errors="coerce").fillna(0)
+            _keep_mask = (_cur_n.abs() > 0) | (_tgt_n.abs() > 0) | (_chg_n.abs() > 0)
+            _rows_before = len(df)
+            df = df[_keep_mask].reset_index(drop=True)
+            print(f"[pptx] Trade plan filtered {_rows_before} -> {len(df)} rows "
+                  f"(dormant universe entries hidden)")
+        except Exception as _e_filter:
+            print(f"[pptx] Trade plan filter skipped: {_e_filter}")
+
         # --- Clean and format values ---
         df["Security"] = df["Security"].astype(str).str.replace(".AX", "", regex=False)
         for col in ["Last Price", "Cash Flow", "Brokerage"]:
@@ -8797,7 +9224,7 @@ def export_to_ppt(results, trades, charts=None):
             cash_balance = 0.0
             if trades is not None and not trades.empty and "Cash Flow (AUD)" in trades.columns:
                 cash_balance = float(results.get("cash_balance", 0.0))
-        
+
             cash_box = slide.shapes.add_textbox(Cm(18.288), Cm(14.732), Cm(6.604), Cm(1.524))
             tfc = cash_box.text_frame
             tfc.clear()
@@ -8808,6 +9235,29 @@ def export_to_ppt(results, trades, charts=None):
             p.alignment = PP_ALIGN.RIGHT
         except Exception:
             pass
+
+        # --- Deferred Tax callout (mirrors Cash). Sign convention:
+        # positive = losses incurred → tax saved (carry forward to next FY)
+        # negative = gains realised → tax owed this rebalance
+        try:
+            _cgt_owed = float(results.get("total_cgt", 0.0))
+            _cgt_saved = float(results.get("loss_carry_forward_tax_aud", 0.0))
+            _net_deferred = _cgt_saved - _cgt_owed
+            _tax_box = slide.shapes.add_textbox(Cm(11.684), Cm(14.732), Cm(6.604), Cm(1.524))
+            tft = _tax_box.text_frame
+            tft.clear()
+            pt = tft.paragraphs[0]
+            if _net_deferred >= 0:
+                pt.text = f"Deferred Tax: +{_net_deferred:,.0f} AUD"
+                pt.font.color.rgb = RGBColor(0, 128, 0)  # green: tax saved
+            else:
+                pt.text = f"Deferred Tax: {_net_deferred:,.0f} AUD"
+                pt.font.color.rgb = RGBColor(192, 0, 0)  # red: tax owed
+            pt.font.size = Pt(18)
+            pt.font.bold = True
+            pt.alignment = PP_ALIGN.RIGHT
+        except Exception as _e_dt:
+            print(f"[pptx] Deferred Tax callout skipped: {_e_dt}")
 
         slide_layout = prs.slide_layouts[20]  # clean layout from your master
         slide = prs.slides.add_slide(slide_layout)
