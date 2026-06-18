@@ -130,9 +130,17 @@ if _DEV_VALIDATION_MODE:
 _REBAL_SKIP_SWEEP_MODE = "--rebal-skip-sweep" in sys.argv
 if _REBAL_SKIP_SWEEP_MODE:
     print("[skip-sweep] --rebal-skip-sweep detected; will skip dialog + live pipeline")
+# `--turnover-penalty-sweep`: dev-only sweep of the cost-aware solver
+# penalty (γ_cgt × ||w - w_prev||_1 inside cvxpy). Tests if penalising
+# regime-switch turnover at the optimiser level reduces CGT drag enough
+# to lift net Sharpe. Picks DEV winner, then opens VAL lock-box once.
+_TURNOVER_SWEEP_MODE = "--turnover-penalty-sweep" in sys.argv
+if _TURNOVER_SWEEP_MODE:
+    print("[turnover-sweep] --turnover-penalty-sweep detected; will skip dialog + live pipeline")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
-                       or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE)
+                       or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
+                       or _TURNOVER_SWEEP_MODE)
 
 
 # =====================================================================
@@ -3694,9 +3702,17 @@ def solve_frontier_point_cvxpy(
     use_mask: dict | None = None,
     tilt_mode: str = "soft",
     tilt_penalty: float = 1e4,
+    w_prev: pd.Series | None = None,
+    turnover_penalty: float = 0.0,
 ) -> tuple[np.ndarray, bool, str]:
     """
     Long-only Markowitz with optional factor tilt constraints.
+
+    Turnover penalty (cost-aware solver): if w_prev is supplied and
+    turnover_penalty > 0, adds turnover_penalty * ||w - w_prev||_1 to the
+    objective. Reduces unnecessary rebalancing churn that would realise CGT.
+    Units: penalty is in the same units as w'Σw (daily variance), so a
+    value around 1e-4 to 1e-3 is typically the right ballpark.
     """
     mu = pd.Series(mu).reindex(Sigma.index)
     mu = pd.to_numeric(mu, errors="coerce")
@@ -3773,6 +3789,16 @@ def solve_frontier_point_cvxpy(
     objective = cp.quad_form(w, S)
     if slack_terms and tilt_mode.lower() == "soft":
         objective = objective + float(tilt_penalty) * cp.sum(cp.hstack(slack_terms))
+
+    # Turnover (cost-aware) penalty: ||w - w_prev||_1 in weight space.
+    if w_prev is not None and float(turnover_penalty) > 0:
+        try:
+            w_prev_arr = (pd.Series(w_prev).reindex(mu_use.index)
+                           .fillna(0.0).to_numpy(dtype=float))
+            objective = objective + float(turnover_penalty) * cp.norm(w - w_prev_arr, 1)
+        except Exception:
+            # If w_prev can't be aligned, fall back silently to no penalty.
+            pass
 
     prob = cp.Problem(cp.Minimize(objective), constraints)
 
@@ -6097,6 +6123,8 @@ def solve_candidate_portfolios(
     Sigma: pd.DataFrame,
     spy_mu: float | None,
     slots: tuple[tuple[str, float | None], ...] = ENSEMBLE_SLOTS,
+    w_prev: pd.Series | None = None,
+    turnover_penalty: float = 0.0,
 ) -> dict[str, pd.Series]:
     """Solve all 5 candidate portfolios for a single rebalance.
 
@@ -6105,6 +6133,11 @@ def solve_candidate_portfolios(
     feasible slot, then ultimately to tangency. This means in unfavourable
     universes the ensemble degenerates gracefully toward defensive — exactly
     when defensive is appropriate.
+
+    Turnover penalty: when turnover_penalty > 0 and w_prev is given, the
+    return-floor slots (non-tangency) include a ||w - w_prev||_1 penalty in
+    their objective. Tangency (Modest) uses the kappa transform and isn't
+    affected — it's already low-turnover by construction.
     """
     out: dict[str, pd.Series] = {}
     tangency = max_sharpe_long_only(mu, Sigma, rf=0.0)
@@ -6129,7 +6162,8 @@ def solve_candidate_portfolios(
             target_ret = max(target_ret, tangency_mu)
         try:
             w_arr, ok, _note = solve_frontier_point_cvxpy(
-                mu, Sigma, target_ret, use_inequality=True
+                mu, Sigma, target_ret, use_inequality=True,
+                w_prev=w_prev, turnover_penalty=turnover_penalty,
             )
             if ok and w_arr is not None and len(w_arr) > 0 and np.isfinite(w_arr).all():
                 w = pd.Series(w_arr, index=Sigma.index)
@@ -6350,6 +6384,7 @@ def run_oos_ensemble_walk_forward(
     forward_signal_alpha: float = 0.5,
     starting_nav_aud: float = 1_000_000.0,
     skip_rebal_delta: float | None = None,
+    turnover_penalty: float = 0.0,
 ) -> dict:
     """Ensemble walk-forward: solve 5 candidates per rebalance, softmax-blend
     by rolling 12M Sortino, hold the blended portfolio for 1 month.
@@ -6500,7 +6535,11 @@ def run_oos_ensemble_walk_forward(
         Sigma = train_rets.cov()
         spy_mu = float(mu[benchmark_ticker]) if benchmark_ticker in mu.index else None
 
-        candidates = solve_candidate_portfolios(mu, Sigma, spy_mu)
+        candidates = solve_candidate_portfolios(
+            mu, Sigma, spy_mu,
+            w_prev=_prev_blend_w if not _prev_blend_w.empty else None,
+            turnover_penalty=float(turnover_penalty),
+        )
         # All candidates must be solvable to participate; otherwise skip rebalance.
         if all(w.empty for w in candidates.values()):
             continue
@@ -7815,6 +7854,244 @@ def _run_rebal_skip_sweep() -> int:
 
 if "--rebal-skip-sweep" in sys.argv:
     _exit_code = _run_rebal_skip_sweep()
+    sys.exit(_exit_code)
+
+
+# === Turnover-penalty sweep (--turnover-penalty-sweep) ======================
+# Dev-only sweep of the cost-aware solver penalty. The penalty
+# turnover_penalty * ||w - w_prev||_1 is added to the cvxpy objective in
+# solve_frontier_point_cvxpy → solve_candidate_portfolios → walk-forward.
+# Hypothesis: regime-switch turnover (the Modest ↔ Stretch slot flips)
+# drives most of the engine's CGT drag. Penalising weight changes inside
+# the optimiser should reduce that turnover without hurting risk
+# adjustment. Tested values bracket the typical magnitude of w'Σw (~1e-4
+# to 1e-3 daily variance for long-only weights).
+def _run_turnover_penalty_sweep() -> int:
+    print("\n" + "=" * 88)
+    print("TURNOVER-PENALTY SWEEP — cost-aware solver tuning on DEV")
+    print("=" * 88)
+
+    SWEEP_VALUES = [0.0, 1e-4, 5e-4, 1e-3, 5e-3]  # 0 = off (baseline)
+    TRAIN_MONTHS = 24
+    DEV_OOS_START = pd.Timestamp("2015-01-01")
+    DEV_OOS_END   = pd.Timestamp("2020-02-19")
+    VAL_OOS_START = pd.Timestamp("2020-02-20")
+    VAL_OOS_END   = pd.Timestamp.now().normalize()
+
+    _sw_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[turnover-sweep] universe: {len(_sw_tickers)} tickers")
+    print(f"[turnover-sweep] downloading full history (max)...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_sw_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[turnover-sweep] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+
+    def _eval_window(label: str, oos_start, oos_end, penalty: float) -> dict:
+        data_start = pd.Timestamp(oos_start) - pd.DateOffset(months=TRAIN_MONTHS)
+        slice_px = px_aud.loc[data_start:oos_end]
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(
+            slice_px,
+            train_window_months=TRAIN_MONTHS,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            starting_nav_aud=1_000_000.0,
+            turnover_penalty=float(penalty),
+        )
+        strat_rets = out["blended_returns"]
+        if strat_rets.empty:
+            return {}
+        years = max(len(strat_rets) / ANNUAL_TRADING_DAYS, 1e-6)
+        nav_curve = (1.0 + strat_rets).cumprod()
+        ann_ret = float(nav_curve.iloc[-1] ** (1.0 / years) - 1.0)
+        vol = float(strat_rets.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        sharpe = ann_ret / vol if vol > 0 else 0.0
+        downside = strat_rets[strat_rets < 0].std() * np.sqrt(ANNUAL_TRADING_DAYS)
+        sortino = ann_ret / float(downside) if float(downside) > 0 else 0.0
+        dd = float((nav_curve / nav_curve.cummax() - 1.0).min())
+
+        cost_ser = out.get("rebalance_costs", pd.Series(dtype=float))
+        tax_ser = out.get("rebalance_taxes", pd.Series(dtype=float))
+        brk_bps = float(cost_ser.sum() / years * 10_000) if not cost_ser.empty else 0.0
+        cgt_bps = float(tax_ser.sum() / years * 10_000) if not tax_ser.empty else 0.0
+
+        spy_window = spy_ret_full.reindex(strat_rets.index).fillna(0.0)
+        spy_nav = (1.0 + spy_window).cumprod()
+        spy_ann = float(spy_nav.iloc[-1] ** (1.0 / years) - 1.0)
+        alpha = ann_ret - spy_ann
+
+        n_executed = int(out.get("n_executed", 0))
+        n_skipped = int(out.get("n_skipped", 0))
+        tlh_n = len(out.get("tlh_events", []) or [])
+        elapsed = time.perf_counter() - t1
+        return {
+            "label": label,
+            "turnover_penalty": penalty,
+            "years": years,
+            "ann_return": ann_ret,
+            "sharpe": sharpe,
+            "sortino": sortino,
+            "max_drawdown": dd,
+            "brokerage_bps_per_year": brk_bps,
+            "cgt_bps_per_year": cgt_bps,
+            "spy_ann_return": spy_ann,
+            "alpha_vs_spy": alpha,
+            "n_executed": n_executed,
+            "n_skipped": n_skipped,
+            "tlh_events": tlh_n,
+            "elapsed_sec": elapsed,
+        }
+
+    # === DEV sweep ===
+    print("\n[turnover-sweep] running DEV sweep (5 values × walk-forward)...")
+    dev_results: list[dict] = []
+    for tp in SWEEP_VALUES:
+        r = _eval_window("DEV", DEV_OOS_START, DEV_OOS_END, tp)
+        if r:
+            dev_results.append(r)
+            print(f"[turnover-sweep] DEV γ={tp:g}: "
+                  f"ann_ret {r['ann_return']*100:+.2f}%  "
+                  f"Sharpe {r['sharpe']:.2f}  "
+                  f"MaxDD {r['max_drawdown']*100:+.2f}%  "
+                  f"CGT {r['cgt_bps_per_year']:.0f}bps/y  "
+                  f"exec/skip {r['n_executed']}/{r['n_skipped']}  "
+                  f"({r['elapsed_sec']:.1f}s)")
+
+    if not dev_results:
+        print("[turnover-sweep] no dev results; aborting.")
+        return 1
+
+    # === DEV results table ===
+    print("\n" + "=" * 88)
+    print("DEV SWEEP RESULTS (only used for picking the winner)")
+    print("=" * 88)
+    print(f"  {'γ':>9} {'Ann Ret':>9} {'Sharpe':>7} {'Sortino':>8} "
+          f"{'MaxDD':>8} {'Brok':>7} {'CGT':>8} {'α(SPY)':>8} "
+          f"{'Exec':>5} {'Skip':>5} {'TLH':>4}")
+    print(f"  {'-'*9} {'-'*9} {'-'*7} {'-'*8} {'-'*8} "
+          f"{'-'*7} {'-'*8} {'-'*8} {'-'*5} {'-'*5} {'-'*4}")
+    for r in dev_results:
+        print(f"  {r['turnover_penalty']:>9g} "
+              f"{r['ann_return']*100:>+8.2f}% "
+              f"{r['sharpe']:>7.2f} "
+              f"{r['sortino']:>8.2f} "
+              f"{r['max_drawdown']*100:>+7.2f}% "
+              f"{r['brokerage_bps_per_year']:>5.0f}bps "
+              f"{r['cgt_bps_per_year']:>6.0f}bps "
+              f"{r['alpha_vs_spy']*100:>+7.2f}% "
+              f"{r['n_executed']:>5} {r['n_skipped']:>5} {r['tlh_events']:>4}")
+
+    # === Pick winner: max Sharpe, ann_ret as tiebreaker ===
+    winner = max(dev_results, key=lambda r: (round(r['sharpe'], 3), r['ann_return']))
+    baseline = next((r for r in dev_results if r['turnover_penalty'] == 0.0), None)
+    print(f"\n[turnover-sweep] DEV WINNER → γ={winner['turnover_penalty']:g} "
+          f"(Sharpe {winner['sharpe']:.2f}, ann_ret {winner['ann_return']*100:+.2f}%)")
+    if baseline and winner['turnover_penalty'] != 0.0:
+        d_sharpe = winner['sharpe'] - baseline['sharpe']
+        d_ann = winner['ann_return'] - baseline['ann_return']
+        d_cgt = winner['cgt_bps_per_year'] - baseline['cgt_bps_per_year']
+        print(f"[turnover-sweep] vs DEV baseline (γ=0): ΔSharpe {d_sharpe:+.3f}, "
+              f"Δann_ret {d_ann*100:+.2f}%, ΔCGT {d_cgt:+.0f} bps/yr")
+
+    # === Validation lock-box: ONE shot on winner ===
+    print("\n" + "=" * 88)
+    print(f"VALIDATION LOCK-BOX — opening once on winning γ={winner['turnover_penalty']:g}")
+    print("=" * 88)
+    val_winner = _eval_window("VALIDATION", VAL_OOS_START, VAL_OOS_END,
+                              winner['turnover_penalty'])
+    if not val_winner:
+        print("[turnover-sweep] validation evaluation failed; aborting.")
+        return 1
+    print(f"[turnover-sweep] VAL γ={winner['turnover_penalty']:g}: "
+          f"ann_ret {val_winner['ann_return']*100:+.2f}%  "
+          f"Sharpe {val_winner['sharpe']:.2f}  "
+          f"MaxDD {val_winner['max_drawdown']*100:+.2f}%  "
+          f"CGT {val_winner['cgt_bps_per_year']:.0f}bps/y  "
+          f"α(SPY) {val_winner['alpha_vs_spy']*100:+.2f}%  "
+          f"({val_winner['elapsed_sec']:.1f}s)")
+
+    val_baseline = _eval_window("VAL_BASELINE", VAL_OOS_START, VAL_OOS_END, 0.0)
+    if val_baseline:
+        print(f"[turnover-sweep] VAL γ=0 (baseline): "
+              f"ann_ret {val_baseline['ann_return']*100:+.2f}%  "
+              f"Sharpe {val_baseline['sharpe']:.2f}  "
+              f"CGT {val_baseline['cgt_bps_per_year']:.0f}bps/y  "
+              f"α(SPY) {val_baseline['alpha_vs_spy']*100:+.2f}%")
+        val_d_sharpe = val_winner['sharpe'] - val_baseline['sharpe']
+        val_d_ann = val_winner['ann_return'] - val_baseline['ann_return']
+        val_d_cgt = val_winner['cgt_bps_per_year'] - val_baseline['cgt_bps_per_year']
+        print(f"[turnover-sweep] VAL uplift (winner vs γ=0): "
+              f"ΔSharpe {val_d_sharpe:+.3f}, Δann_ret {val_d_ann*100:+.2f}%, "
+              f"ΔCGT {val_d_cgt:+.0f} bps/yr")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    if val_baseline:
+        dev_uplift = winner['sharpe'] - (baseline['sharpe'] if baseline else winner['sharpe'])
+        val_uplift = val_winner['sharpe'] - val_baseline['sharpe']
+        print(f"  DEV uplift (chosen γ vs 0):    ΔSharpe {dev_uplift:+.3f}")
+        print(f"  VAL uplift (chosen γ vs 0):    ΔSharpe {val_uplift:+.3f}")
+        if val_uplift > 0.05:
+            print(f"  Reading: Generalises — cost-aware solver improves validation Sharpe.")
+            print(f"  Recommend: set engine default turnover_penalty = {winner['turnover_penalty']:g}")
+        elif val_uplift > -0.05:
+            print(f"  Reading: Roughly neutral on validation. Marginal change.")
+            print(f"  Recommend: keep turnover_penalty = 0 unless dev uplift > 0.10 Sharpe.")
+        else:
+            print(f"  Reading: DOES NOT generalise. Dev gain was overfit to that window.")
+            print(f"  Recommend: keep turnover_penalty = 0.")
+    else:
+        print(f"  (validation baseline failed — can't quote generalisation)")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "sweep_values": SWEEP_VALUES,
+            "dev_results": dev_results,
+            "dev_winner_turnover_penalty": winner['turnover_penalty'],
+            "val_winner": val_winner,
+            "val_baseline": val_baseline,
+        }
+        json_path = APP_DIR / "turnover_sweep_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n[turnover-sweep] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[turnover-sweep] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("TURNOVER-PENALTY SWEEP COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--turnover-penalty-sweep" in sys.argv:
+    _exit_code = _run_turnover_penalty_sweep()
     sys.exit(_exit_code)
 
 
