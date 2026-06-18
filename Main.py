@@ -19,6 +19,29 @@ def _setup_logging():
         else os.path.dirname(os.path.abspath(__file__))
     log_path = os.path.join(base_dir, "run.log")
 
+    # Rotate prior run.log files: run.log -> run.log.1, .1 -> .2, ..., keep last 7.
+    # Lets us go back and diff against a working run if today's break.
+    KEEP = 7
+    try:
+        for i in range(KEEP - 1, 0, -1):
+            src = os.path.join(base_dir, f"run.log.{i}" if i > 0 else "run.log")
+            dst = os.path.join(base_dir, f"run.log.{i+1}")
+            if os.path.exists(src):
+                if os.path.exists(dst):
+                    try: os.remove(dst)
+                    except Exception: pass
+                try: os.rename(src, dst)
+                except Exception: pass
+        if os.path.exists(log_path):
+            dst = os.path.join(base_dir, "run.log.1")
+            if os.path.exists(dst):
+                try: os.remove(dst)
+                except Exception: pass
+            try: os.rename(log_path, dst)
+            except Exception: pass
+    except Exception:
+        pass  # rotation is best-effort; never block startup
+
     try:
         log_fh = open(log_path, "w", encoding="utf-8", buffering=1)
     except Exception:
