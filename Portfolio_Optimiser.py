@@ -123,8 +123,16 @@ if _SCALE_ANALYSIS_MODE:
 _DEV_VALIDATION_MODE = "--dev-validation" in sys.argv
 if _DEV_VALIDATION_MODE:
     print("[devval] --dev-validation detected; will skip dialog + live pipeline")
-# All three diagnostic modes follow the same skip-everything-heavy path.
-_SKIP_LIVE_PIPELINE = _STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE or _DEV_VALIDATION_MODE
+# `--rebal-skip-sweep`: dev-only sweep of SKIP_REBAL_DELTA at 3/4/5/6/7%
+# to find the highest-Sharpe knob value, then open VALIDATION lock-box ONCE
+# on the winner. Used to test if higher skip-delta improves net Sharpe via
+# more 12-month-LT-discount qualifications.
+_REBAL_SKIP_SWEEP_MODE = "--rebal-skip-sweep" in sys.argv
+if _REBAL_SKIP_SWEEP_MODE:
+    print("[skip-sweep] --rebal-skip-sweep detected; will skip dialog + live pipeline")
+# All diagnostic modes follow the same skip-everything-heavy path.
+_SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
+                       or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE)
 
 
 # =====================================================================
@@ -6341,6 +6349,7 @@ def run_oos_ensemble_walk_forward(
     sortino_halflife_days: int = 60,
     forward_signal_alpha: float = 0.5,
     starting_nav_aud: float = 1_000_000.0,
+    skip_rebal_delta: float | None = None,
 ) -> dict:
     """Ensemble walk-forward: solve 5 candidates per rebalance, softmax-blend
     by rolling 12M Sortino, hold the blended portfolio for 1 month.
@@ -6569,13 +6578,15 @@ def run_oos_ensemble_walk_forward(
         # --- Conditional skip: if target weight change is tiny, hold prior
         # weights — saves brokerage + CGT realisation on no-op re-trims.
         skip_rebal = False
-        if not _prev_blend_w.empty and SKIP_REBAL_DELTA > 0:
+        _skip_delta_eff = float(SKIP_REBAL_DELTA if skip_rebal_delta is None
+                                 else skip_rebal_delta)
+        if not _prev_blend_w.empty and _skip_delta_eff > 0:
             union_idx = sorted(set(_prev_blend_w.index).union(w_blend.index))
             delta_sum = float(
                 (w_blend.reindex(union_idx).fillna(0.0)
                  - _prev_blend_w.reindex(union_idx).fillna(0.0)).abs().sum()
             )
-            if delta_sum < SKIP_REBAL_DELTA:
+            if delta_sum < _skip_delta_eff:
                 skip_rebal = True
                 w_blend = _prev_blend_w.copy()
 
@@ -7569,6 +7580,241 @@ def _run_dev_validation() -> int:
 
 if "--dev-validation" in sys.argv:
     _exit_code = _run_dev_validation()
+    sys.exit(_exit_code)
+
+
+# === SKIP_REBAL_DELTA sweep (--rebal-skip-sweep) ============================
+# Dev-only sweep of the skip-rebalance threshold to find the value that
+# maximises net Sharpe on the dev window. The hypothesis is that a higher
+# threshold (5-7% vs the current 3%) lets more positions cross the 12-month
+# LT-discount line before being trimmed, reducing CGT drag. After picking
+# the winner on DEV, we open the VALIDATION lock-box ONCE on the winner to
+# confirm the choice generalises (per the dev/validation discipline in
+# ARCHITECTURE.md §10).
+def _run_rebal_skip_sweep() -> int:
+    print("\n" + "=" * 88)
+    print("SKIP_REBAL_DELTA SWEEP — dev-window tuning")
+    print("=" * 88)
+
+    SWEEP_VALUES = [0.03, 0.04, 0.05, 0.06, 0.07]  # 3% baseline → 7%
+    TRAIN_MONTHS = 24
+    DEV_OOS_START = pd.Timestamp("2015-01-01")
+    DEV_OOS_END   = pd.Timestamp("2020-02-19")
+    VAL_OOS_START = pd.Timestamp("2020-02-20")
+    VAL_OOS_END   = pd.Timestamp.now().normalize()
+
+    _sw_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[skip-sweep] universe: {len(_sw_tickers)} tickers")
+    print(f"[skip-sweep] downloading full history (max)...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_sw_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[skip-sweep] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+
+    def _eval_window(label: str, oos_start, oos_end, skip_delta: float) -> dict:
+        data_start = pd.Timestamp(oos_start) - pd.DateOffset(months=TRAIN_MONTHS)
+        slice_px = px_aud.loc[data_start:oos_end]
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(
+            slice_px,
+            train_window_months=TRAIN_MONTHS,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            starting_nav_aud=1_000_000.0,
+            skip_rebal_delta=skip_delta,
+        )
+        strat_rets = out["blended_returns"]
+        if strat_rets.empty:
+            return {}
+        years = max(len(strat_rets) / ANNUAL_TRADING_DAYS, 1e-6)
+        nav_curve = (1.0 + strat_rets).cumprod()
+        ann_ret = float(nav_curve.iloc[-1] ** (1.0 / years) - 1.0)
+        vol = float(strat_rets.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        sharpe = ann_ret / vol if vol > 0 else 0.0
+        downside = strat_rets[strat_rets < 0].std() * np.sqrt(ANNUAL_TRADING_DAYS)
+        sortino = ann_ret / float(downside) if float(downside) > 0 else 0.0
+        dd = float((nav_curve / nav_curve.cummax() - 1.0).min())
+
+        cost_ser = out.get("rebalance_costs", pd.Series(dtype=float))
+        tax_ser = out.get("rebalance_taxes", pd.Series(dtype=float))
+        brk_bps = float(cost_ser.sum() / years * 10_000) if not cost_ser.empty else 0.0
+        cgt_bps = float(tax_ser.sum() / years * 10_000) if not tax_ser.empty else 0.0
+
+        spy_window = spy_ret_full.reindex(strat_rets.index).fillna(0.0)
+        spy_nav = (1.0 + spy_window).cumprod()
+        spy_ann = float(spy_nav.iloc[-1] ** (1.0 / years) - 1.0)
+        alpha = ann_ret - spy_ann
+
+        n_executed = int(out.get("n_executed", 0))
+        n_skipped = int(out.get("n_skipped", 0))
+        tlh_n = len(out.get("tlh_events", []) or [])
+        elapsed = time.perf_counter() - t1
+        return {
+            "label": label,
+            "skip_delta": skip_delta,
+            "years": years,
+            "ann_return": ann_ret,
+            "sharpe": sharpe,
+            "sortino": sortino,
+            "max_drawdown": dd,
+            "brokerage_bps_per_year": brk_bps,
+            "cgt_bps_per_year": cgt_bps,
+            "spy_ann_return": spy_ann,
+            "alpha_vs_spy": alpha,
+            "n_executed": n_executed,
+            "n_skipped": n_skipped,
+            "tlh_events": tlh_n,
+            "elapsed_sec": elapsed,
+        }
+
+    # === DEV sweep ===
+    print("\n[skip-sweep] running DEV sweep (5 values × walk-forward)...")
+    dev_results: list[dict] = []
+    for sd in SWEEP_VALUES:
+        r = _eval_window("DEV", DEV_OOS_START, DEV_OOS_END, sd)
+        if r:
+            dev_results.append(r)
+            print(f"[skip-sweep] DEV δ={sd*100:.0f}%: "
+                  f"ann_ret {r['ann_return']*100:+.2f}%  "
+                  f"Sharpe {r['sharpe']:.2f}  "
+                  f"MaxDD {r['max_drawdown']*100:+.2f}%  "
+                  f"CGT {r['cgt_bps_per_year']:.0f}bps/y  "
+                  f"exec/skip {r['n_executed']}/{r['n_skipped']}  "
+                  f"({r['elapsed_sec']:.1f}s)")
+
+    if not dev_results:
+        print("[skip-sweep] no dev results; aborting.")
+        return 1
+
+    # === DEV results table ===
+    print("\n" + "=" * 88)
+    print("DEV SWEEP RESULTS (only used for picking the winner)")
+    print("=" * 88)
+    print(f"  {'δ':>5} {'Ann Ret':>9} {'Sharpe':>7} {'Sortino':>8} "
+          f"{'MaxDD':>8} {'Brok':>7} {'CGT':>8} {'α(SPY)':>8} "
+          f"{'Exec':>5} {'Skip':>5} {'TLH':>4}")
+    print(f"  {'-'*5} {'-'*9} {'-'*7} {'-'*8} {'-'*8} "
+          f"{'-'*7} {'-'*8} {'-'*8} {'-'*5} {'-'*5} {'-'*4}")
+    for r in dev_results:
+        print(f"  {r['skip_delta']*100:>4.0f}% "
+              f"{r['ann_return']*100:>+8.2f}% "
+              f"{r['sharpe']:>7.2f} "
+              f"{r['sortino']:>8.2f} "
+              f"{r['max_drawdown']*100:>+7.2f}% "
+              f"{r['brokerage_bps_per_year']:>5.0f}bps "
+              f"{r['cgt_bps_per_year']:>6.0f}bps "
+              f"{r['alpha_vs_spy']*100:>+7.2f}% "
+              f"{r['n_executed']:>5} {r['n_skipped']:>5} {r['tlh_events']:>4}")
+
+    # === Pick winner: max Sharpe, ann_ret as tiebreaker ===
+    winner = max(dev_results, key=lambda r: (round(r['sharpe'], 3), r['ann_return']))
+    print(f"\n[skip-sweep] DEV WINNER → δ={winner['skip_delta']*100:.0f}% "
+          f"(Sharpe {winner['sharpe']:.2f}, ann_ret {winner['ann_return']*100:+.2f}%)")
+    baseline = next((r for r in dev_results if r['skip_delta'] == 0.03), None)
+    if baseline and winner['skip_delta'] != 0.03:
+        d_sharpe = winner['sharpe'] - baseline['sharpe']
+        d_ann = winner['ann_return'] - baseline['ann_return']
+        print(f"[skip-sweep] vs DEV baseline (δ=3%): ΔSharpe {d_sharpe:+.3f}, "
+              f"Δann_ret {d_ann*100:+.2f}%")
+
+    # === Validation lock-box: ONE shot on winner ===
+    print("\n" + "=" * 88)
+    print(f"VALIDATION LOCK-BOX — opening once on winning δ={winner['skip_delta']*100:.0f}%")
+    print("=" * 88)
+    val_winner = _eval_window("VALIDATION", VAL_OOS_START, VAL_OOS_END,
+                              winner['skip_delta'])
+    if not val_winner:
+        print("[skip-sweep] validation evaluation failed; aborting.")
+        return 1
+    print(f"[skip-sweep] VAL δ={winner['skip_delta']*100:.0f}%: "
+          f"ann_ret {val_winner['ann_return']*100:+.2f}%  "
+          f"Sharpe {val_winner['sharpe']:.2f}  "
+          f"MaxDD {val_winner['max_drawdown']*100:+.2f}%  "
+          f"CGT {val_winner['cgt_bps_per_year']:.0f}bps/y  "
+          f"α(SPY) {val_winner['alpha_vs_spy']*100:+.2f}%  "
+          f"({val_winner['elapsed_sec']:.1f}s)")
+
+    # Also evaluate validation at baseline 3% so we can quote the generalised gain.
+    val_baseline = _eval_window("VAL_BASELINE", VAL_OOS_START, VAL_OOS_END, 0.03)
+    if val_baseline:
+        print(f"[skip-sweep] VAL δ=3% (baseline): "
+              f"ann_ret {val_baseline['ann_return']*100:+.2f}%  "
+              f"Sharpe {val_baseline['sharpe']:.2f}  "
+              f"CGT {val_baseline['cgt_bps_per_year']:.0f}bps/y  "
+              f"α(SPY) {val_baseline['alpha_vs_spy']*100:+.2f}%")
+        val_d_sharpe = val_winner['sharpe'] - val_baseline['sharpe']
+        val_d_ann = val_winner['ann_return'] - val_baseline['ann_return']
+        print(f"[skip-sweep] VAL uplift (winner vs δ=3%): "
+              f"ΔSharpe {val_d_sharpe:+.3f}, Δann_ret {val_d_ann*100:+.2f}%")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    if val_baseline:
+        dev_uplift = winner['sharpe'] - (baseline['sharpe'] if baseline else winner['sharpe'])
+        val_uplift = val_winner['sharpe'] - val_baseline['sharpe']
+        print(f"  DEV uplift (chosen δ vs 3%):     ΔSharpe {dev_uplift:+.3f}")
+        print(f"  VAL uplift (chosen δ vs 3%):     ΔSharpe {val_uplift:+.3f}")
+        if val_uplift > 0.05:
+            print(f"  Reading: Generalises — winning δ improves validation Sharpe.")
+            print(f"  Recommend: set SKIP_REBAL_DELTA = {winner['skip_delta']}")
+        elif val_uplift > -0.05:
+            print(f"  Reading: Roughly neutral on validation. Marginal change.")
+            print(f"  Recommend: stay at 3% unless dev uplift > 0.10 Sharpe.")
+        else:
+            print(f"  Reading: DOES NOT generalise. Dev gain was overfit to that window.")
+            print(f"  Recommend: stay at SKIP_REBAL_DELTA = 0.03.")
+    else:
+        print(f"  (validation baseline failed — can't quote generalisation)")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "sweep_values": SWEEP_VALUES,
+            "dev_results": dev_results,
+            "dev_winner_skip_delta": winner['skip_delta'],
+            "val_winner": val_winner,
+            "val_baseline": val_baseline,
+        }
+        json_path = APP_DIR / "rebal_skip_sweep_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n[skip-sweep] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[skip-sweep] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("REBAL-SKIP SWEEP COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--rebal-skip-sweep" in sys.argv:
+    _exit_code = _run_rebal_skip_sweep()
     sys.exit(_exit_code)
 
 
