@@ -340,6 +340,8 @@ See [AUDIT.md](AUDIT.md) for the full list of refactor candidates triaged by pri
 | `4680-4710` | Holdings dialog invocation + post-dialog FF5 rebuild |
 | `5540-6520` | OOS walk-forward + ensemble engine + metrics |
 | `6520-6700` | GFC stress test (gated on `--stress-test`) |
+| `6780-7000` | Scale analysis (gated on `--scale-analysis`) |
+| `7000-7250` | Dev/validation split (gated on `--dev-validation`) |
 | `7600-7700` | Live ensemble + recommendation log |
 | `7700-7770` | Drift tracker (fills + NAV + DD warnings) |
 | `7770-7830` | Cash ledger |
@@ -350,7 +352,43 @@ Use this map when grep'ing for a specific behaviour.
 
 ---
 
-## 10. Glossary
+## 10. Tuning discipline (dev/validation lock-box)
+
+**The problem.** Every meta-parameter in the ensemble — slot menu, `lambda_temp`, `gaussian_width`, `backward_alpha`, halflife, weight caps, the choice of IR-vs-Sortino for scoring — was selected because it produced good results on the 2016-2026 window. Even though the walk-forward engine is honest *per-day* (no look-ahead inside the OOS loop), the *design itself* was tuned on the same window we report metrics from. That is silent pseudo-overfitting at the meta-parameter level. Reported Sharpe on 2016-2026 is **not** evidence of generalisation.
+
+**The fix.** Treat the historical record as two disjoint boxes:
+
+| Box | Window | Use |
+|---|---|---|
+| **Dev** | `2015-01-01 → 2020-02-19` (SPY pre-COVID ATH) | All tuning, experimentation, knob-twiddling, parameter grid search. Run as often as needed. |
+| **Validation** | `2020-02-20 → today` | **LOCK BOX.** Opened sparingly — once per change. Used only to confirm the change generalises. Never tuned against. |
+
+When the validation box has been opened enough times that it's effectively been peeked at, expand dev to include it and carve a new lock box from `today → forward 12-24mo`.
+
+**How to apply.** Before merging any change that touches an ensemble meta-parameter, signal, slot definition, or scoring rule, run:
+
+```powershell
+& ".\.venv\Scripts\python.exe" Portfolio_Optimiser.py --dev-validation
+```
+
+This runs the OOS engine twice — same universe, same engine config, same `lambda_temp`, only the window changes. It prints a side-by-side table of Sharpe / Sortino / MaxDD / α-vs-SPY for both windows and computes the gap. The verdict block interprets the gap:
+
+| Sharpe gap (val − dev) | Reading |
+|---|---|
+| `< -0.30` | LARGE degradation. Strong overfit signal — revert or rework. |
+| `-0.30` to `-0.15` | Moderate degradation. Investigate which knobs are responsible. |
+| `-0.15` to `+0.05` | Stable. Change generalises across regimes. |
+| `> +0.05` | Validation better than dev — likely regime-driven, not overfit. |
+
+Artefacts: `dev_validation_summary.json` (machine-readable metrics) and `dev_validation_chart.png` (rebased NAV curves with SPY overlay on each window).
+
+**Why this matters.** The 2016-2026 window is heavily bullish — SPY +15.6%/yr in AUD. The GFC stress test (`--stress-test`) shows the engine takes 68% of SPY's GFC drawdown, but no 2008-class event sits inside 2016-2026 to exercise that defence. The dev/validation split is the *only* discipline we have for distinguishing "design we chose because of luck on this window" from "design that actually generalises."
+
+See [`project-scale-analysis-2026-06-18`] memory for the user's framing.
+
+---
+
+## 11. Glossary
 
 | Term | Meaning |
 |---|---|

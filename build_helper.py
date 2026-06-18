@@ -158,7 +158,29 @@ def build():
 
     print("\nRunning build:\n", " ".join(cmd))
     subprocess.run(cmd, check=True)
-    print("\n✅ Build complete. Check the 'dist' folder for your new .exe.")
+
+    # Post-build: copy runtime data files next to the .exe. These are loaded
+    # via APP_DIR at runtime which (when frozen) resolves to dist/, so they
+    # need to sit alongside the executable rather than be unpacked from the
+    # PyInstaller --add-data temp dir.
+    dist_dir = root / "dist"
+    runtime_data_files = [
+        "tlh_pairs.json",
+        "regions.json",
+    ]
+    for name in runtime_data_files:
+        src = root / name
+        if src.exists():
+            dst = dist_dir / name
+            try:
+                shutil.copy2(src, dst)
+                print(f"[build] copied runtime data: {name} → {dst}")
+            except Exception as e:
+                print(f"[build] WARNING: failed to copy {name}: {e}")
+        else:
+            print(f"[build] skip runtime data {name}: source not found")
+
+    print("\n[OK] Build complete. Check the 'dist' folder for your new .exe.")
 
 if __name__ == "__main__":
     build()

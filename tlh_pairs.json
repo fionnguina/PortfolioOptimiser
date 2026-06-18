@@ -1,0 +1,15 @@
+{
+  "_doc": "Tax-loss harvesting substitute pairs. Each key is a ticker; value is a substitute with near-identical exposure but distinct legal identity. Used by --tlh pass to swap losing positions for substitutes without changing economic exposure. AU has no formal wash-sale rule but TR 2008/1 anti-avoidance applies: the substitute must be a genuinely different security. Pairs here are conservative — same/near-same index, different issuer or domicile.",
+  "pairs": {
+    "IVV": "SPY",
+    "SPY": "IVV",
+    "QQQ": "NDQ.AX",
+    "NDQ.AX": "QQQ",
+    "VAS.AX": "A200.AX",
+    "A200.AX": "VAS.AX",
+    "VEU.AX": "VGS.AX",
+    "VGS.AX": "VEU.AX",
+    "VAP.AX": "REIT.AX",
+    "REIT.AX": "VAP.AX"
+  }
+}

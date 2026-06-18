@@ -116,8 +116,15 @@ if _STRESS_TEST_MODE:
 _SCALE_ANALYSIS_MODE = "--scale-analysis" in sys.argv
 if _SCALE_ANALYSIS_MODE:
     print("[scale] --scale-analysis detected; will skip dialog + live pipeline")
-# Both modes follow the same skip-everything-heavy path.
-_SKIP_LIVE_PIPELINE = _STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
+# `--dev-validation`: skip dialog + run OOS twice (dev window vs locked-box
+# validation window) to expose meta-parameter overfitting. See
+# _run_dev_validation(). Lock box: 2020-02-20 → today; dev: 2015-01-01 →
+# 2020-02-19 (SPY pre-COVID ATH).
+_DEV_VALIDATION_MODE = "--dev-validation" in sys.argv
+if _DEV_VALIDATION_MODE:
+    print("[devval] --dev-validation detected; will skip dialog + live pipeline")
+# All three diagnostic modes follow the same skip-everything-heavy path.
+_SKIP_LIVE_PIPELINE = _STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE or _DEV_VALIDATION_MODE
 
 
 # =====================================================================
@@ -462,6 +469,54 @@ SKIP_REBAL_DELTA          = 0.03   # 3% summed |Δw|
 EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
 EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
 
+# ============================================================================
+# TAX-LOSS HARVESTING (TLH)
+# ----------------------------------------------------------------------------
+# At each rebalance, scan current lots for unrealised losses ≥ TLH_MIN_LOSS_PCT.
+# For each loss lot whose ticker has a substitute defined in tlh_pairs.json:
+# sell the loss lot (realises the loss into the FY bucket → offsets gains),
+# buy equivalent dollar value of the substitute (same economic exposure).
+# Cooldown prevents immediate swap-back (ATO anti-avoidance under TR 2008/1).
+#
+#   TLH_ENABLED            Master switch; False fully disables the pass.
+#   TLH_MIN_LOSS_PCT       Threshold for a lot to be swap-eligible. Conservative
+#                          default avoids harvesting noise-level losses where
+#                          the brokerage cost would exceed the tax benefit.
+#   TLH_COOLDOWN_DAYS      Min days between a ticker being swapped OUT and being
+#                          swapped back IN. AU has no formal wash-sale rule but
+#                          this satisfies the anti-avoidance test in TR 2008/1.
+#   TLH_PAIRS              Substitute mapping. Loaded from tlh_pairs.json at
+#                          startup; falls back to a baked-in defensive default.
+# ============================================================================
+TLH_ENABLED              = True
+TLH_MIN_LOSS_PCT         = -0.05   # only harvest lots in ≥5% loss
+TLH_COOLDOWN_DAYS        = 31      # ≥30d = comfortably outside US wash-sale and OK under TR 2008/1
+TLH_MIN_LOSS_AUD         = 100.0   # don't bother for absolute losses < $100 (brokerage floor)
+
+def _load_tlh_pairs() -> dict[str, str]:
+    """Load TLH substitute pairs from tlh_pairs.json. Falls back to a small
+    conservative default if file missing/malformed so the engine still runs."""
+    default = {
+        "IVV": "SPY", "SPY": "IVV",
+        "QQQ": "NDQ.AX", "NDQ.AX": "QQQ",
+        "VAS.AX": "A200.AX", "A200.AX": "VAS.AX",
+    }
+    try:
+        pairs_path = APP_DIR / "tlh_pairs.json"
+        if not pairs_path.exists():
+            print(f"[tlh] tlh_pairs.json not found at {pairs_path}; using built-in defaults")
+            return default
+        with pairs_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("pairs", data) if isinstance(data, dict) else {}
+        pairs = {str(k): str(v) for k, v in raw.items() if k != "_doc"}
+        return pairs if pairs else default
+    except Exception as e:
+        print(f"[tlh] Failed to load tlh_pairs.json ({e}); using built-in defaults")
+        return default
+
+TLH_PAIRS = _load_tlh_pairs()
+
 
 # === Config snapshot (L16) ===================================================
 # Dump every operationally-meaningful knob at startup so any run.log is
@@ -486,6 +541,9 @@ def _log_config_snapshot() -> None:
     print(f"[config] DRIFT                 LIVE_START={LIVE_TRADING_START_DATE or '(not set)'}  "
           f"monthly={DRIFT_MONTHLY_THRESH*100:.0f}%  cumulative={DRIFT_CUMULATIVE_THRESH*100:.0f}%  "
           f"DD={DRIFT_DD_ALERT_THRESH*100:+.0f}%  slip={DRIFT_SLIPPAGE_BPS_THRESH:.0f}bps")
+    print(f"[config] TLH                   enabled={TLH_ENABLED}  "
+          f"min_loss={TLH_MIN_LOSS_PCT*100:+.0f}%  min_$=${TLH_MIN_LOSS_AUD:.0f}  "
+          f"cooldown={TLH_COOLDOWN_DAYS}d  pairs={len(TLH_PAIRS)}")
     print(f"[config] TARGET PORTFOLIO      ${TARGET_PORTFOLIO_VALUE_AUD:,.0f} AUD")
     print(f"[config] IBKR LIVE PRICES      enabled={USE_IBKR_LIVE_PRICES}  "
           f"host={IBKR_HOST}:{IBKR_PORT}  client_id={IBKR_CLIENT_ID}  "
@@ -583,6 +641,91 @@ class LotBook:
         """Current units held."""
         return float(sum(lot["units"] for lot in self.lots.get(ticker, [])))
 
+    def unrealised_losses(self, price_snapshot, as_of,
+                          min_loss_pct: float = -0.05,
+                          min_loss_aud: float = 100.0) -> list[dict]:
+        """Return lot-level unrealised losses ≤ min_loss_pct AND ≤ -min_loss_aud.
+
+        Each entry: ticker, lot_idx (within-ticker), units, cost_basis_per_unit,
+        current_price, market_value_aud, loss_aud (positive number), loss_pct
+        (negative fraction), hold_days. Sorted by largest loss_aud first so the
+        TLH pass can prioritise high-value harvests.
+        """
+        out: list[dict] = []
+        ref_date = pd.Timestamp(as_of)
+        for tkr, lot_list in self.lots.items():
+            try:
+                if hasattr(price_snapshot, "get"):
+                    p = float(price_snapshot.get(tkr, np.nan))
+                else:
+                    p = float(price_snapshot[tkr]) if tkr in price_snapshot else float("nan")
+            except Exception:
+                continue
+            if not np.isfinite(p) or p <= 0:
+                continue
+            for idx, lot in enumerate(lot_list):
+                if lot["units"] <= 0:
+                    continue
+                cost = float(lot["cost_basis_per_unit"])
+                mkt = lot["units"] * p
+                loss = (cost - p) * lot["units"]  # positive = loss
+                if cost <= 0:
+                    continue
+                loss_pct = (p - cost) / cost     # negative for loss
+                if loss_pct > min_loss_pct:      # not loss enough
+                    continue
+                if loss < min_loss_aud:          # below absolute floor
+                    continue
+                out.append({
+                    "ticker": tkr,
+                    "lot_idx": idx,
+                    "units": float(lot["units"]),
+                    "cost_basis_per_unit": cost,
+                    "current_price": p,
+                    "market_value_aud": float(mkt),
+                    "loss_aud": float(loss),
+                    "loss_pct": float(loss_pct),
+                    "hold_days": int((ref_date - lot["date"]).days),
+                    "lot_date": lot["date"],
+                })
+        out.sort(key=lambda r: r["loss_aud"], reverse=True)
+        return out
+
+    def sell_lot(self, ticker: str, lot_idx: int, units: float, date,
+                 price: float, cfg: dict | None = None) -> dict:
+        """Sell up to `units` from a SPECIFIC lot (overrides FIFO). Used by the
+        TLH pass to target loss lots without disturbing the rest of the book.
+        Returns the same realised-bucket dict as `sell()` so callers can fold
+        the result straight into the FY accumulators.
+        """
+        if cfg is None:
+            cfg = CGT_CONFIG
+        out = {"st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0}
+        if ticker not in self.lots or units <= 0:
+            return out
+        lot_list = self.lots[ticker]
+        if not (0 <= lot_idx < len(lot_list)):
+            return out
+        lot = lot_list[lot_idx]
+        qty = min(float(lot["units"]), float(units))
+        if qty <= 0:
+            return out
+        lt_threshold = int(cfg["lt_holding_days"])
+        proceeds = qty * float(price)
+        cost_base = qty * float(lot["cost_basis_per_unit"])
+        gain = proceeds - cost_base
+        is_lt = (pd.Timestamp(date) - lot["date"]).days >= lt_threshold
+        if gain >= 0:
+            out["lt_gain" if is_lt else "st_gain"] += gain
+        else:
+            out["lt_loss" if is_lt else "st_loss"] += -gain
+        if qty >= float(lot["units"]) - 1e-9:
+            # Removed entirely
+            del lot_list[lot_idx]
+        else:
+            lot["units"] = float(lot["units"]) - qty
+        return out
+
 
 def compute_cgt_for_rebalance(realised: dict, cfg: dict | None = None) -> float:
     """Tax owed on a single rebalance's realised gains, with within-rebalance
@@ -617,6 +760,130 @@ def compute_cgt_for_rebalance(realised: dict, cfg: dict | None = None) -> float:
     if lt_net > 0:
         tax += lt_net * _effective_cgt_rate(short_term=False, cfg=cfg)
     return float(tax)
+
+
+def _run_tlh_pass(
+    lot_book: "LotBook",
+    price_snapshot,
+    as_of,
+    cooldown_state: dict,
+    pairs: dict | None = None,
+    min_loss_pct: float | None = None,
+    min_loss_aud: float | None = None,
+    cooldown_days: int | None = None,
+    cfg: dict | None = None,
+    nav_aud: float | None = None,
+) -> dict:
+    """One pass of tax-loss harvesting. Mutates `lot_book` and `cooldown_state`.
+
+    For each lot in unrealised loss ≥ min_loss_pct (and ≥ min_loss_aud absolute):
+      1. Look up its substitute in `pairs`. Skip if no pair, substitute price
+         unavailable, or substitute is itself within the cooldown window
+         (recently sold via TLH → buying it back here is a wash-swap).
+      2. Sell the specific loss lot (realises loss into the FY bucket).
+      3. Buy equivalent dollar value of the substitute at current price.
+      4. Record the ticker we sold in cooldown_state[ticker] = as_of so it
+         can't be the substitute of another TLH swap for cooldown_days.
+
+    Returns dict with:
+      events           List of event dicts (date, ticker_sold, lot_date,
+                       units_sold, sale_price, cost_basis_per_unit, loss_aud,
+                       ticker_bought, units_bought, buy_price, holding).
+      realised         {st_gain, lt_gain, st_loss, lt_loss} totals — caller
+                       folds into FY accumulator.
+      total_loss_aud   Sum of |loss| realised this pass (positive).
+      n_events         Count.
+    """
+    pairs = pairs if pairs is not None else TLH_PAIRS
+    min_loss_pct = TLH_MIN_LOSS_PCT if min_loss_pct is None else min_loss_pct
+    min_loss_aud = TLH_MIN_LOSS_AUD if min_loss_aud is None else min_loss_aud
+    cooldown_days = TLH_COOLDOWN_DAYS if cooldown_days is None else cooldown_days
+    as_of_ts = pd.Timestamp(as_of)
+
+    result = {
+        "events": [],
+        "realised": {"st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0},
+        "total_loss_aud": 0.0,
+        "n_events": 0,
+    }
+    if not TLH_ENABLED or not pairs:
+        return result
+
+    # Take a SNAPSHOT of loss lots first — we mutate the book during the loop
+    # (sell_lot deletes/edits entries), so iterating live would be unsafe.
+    losses = lot_book.unrealised_losses(
+        price_snapshot=price_snapshot,
+        as_of=as_of_ts,
+        min_loss_pct=min_loss_pct,
+        min_loss_aud=min_loss_aud,
+    )
+    # Re-fetch lot_idx by (ticker, lot_date, cost_basis) at sell time because
+    # earlier sells may shift indices within the same ticker.
+    def _find_lot_idx(tkr: str, lot_date, cost: float) -> int:
+        for i, l in enumerate(lot_book.lots.get(tkr, [])):
+            if l["date"] == lot_date and abs(l["cost_basis_per_unit"] - cost) < 1e-9:
+                return i
+        return -1
+
+    for lossrec in losses:
+        tkr = lossrec["ticker"]
+        sub = pairs.get(tkr)
+        if not sub:
+            continue
+        # Substitute price must exist + be positive.
+        try:
+            if hasattr(price_snapshot, "get"):
+                p_sub = float(price_snapshot.get(sub, np.nan))
+            else:
+                p_sub = float(price_snapshot[sub]) if sub in price_snapshot else float("nan")
+        except Exception:
+            continue
+        if not np.isfinite(p_sub) or p_sub <= 0:
+            continue
+        # Cooldown: substitute can't be a ticker we recently TLH-sold.
+        if sub in cooldown_state:
+            since = (as_of_ts - pd.Timestamp(cooldown_state[sub])).days
+            if since < cooldown_days:
+                continue
+        # Re-locate the lot (indices may have shifted from earlier sells).
+        idx = _find_lot_idx(tkr, lossrec["lot_date"], lossrec["cost_basis_per_unit"])
+        if idx < 0:
+            continue
+        units = lossrec["units"]
+        sale_price = lossrec["current_price"]
+        sale_value = units * sale_price
+
+        realised = lot_book.sell_lot(
+            ticker=tkr, lot_idx=idx, units=units,
+            date=as_of_ts, price=sale_price, cfg=cfg,
+        )
+        for k in result["realised"]:
+            result["realised"][k] += realised[k]
+
+        units_bought = sale_value / p_sub
+        lot_book.buy(sub, units_bought, as_of_ts, p_sub)
+        cooldown_state[tkr] = as_of_ts
+
+        loss_real = float(realised.get("st_loss", 0.0) + realised.get("lt_loss", 0.0))
+        result["total_loss_aud"] += loss_real
+        result["events"].append({
+            "date": as_of_ts,
+            "ticker_sold": tkr,
+            "lot_date": lossrec["lot_date"],
+            "units_sold": float(units),
+            "sale_price": float(sale_price),
+            "cost_basis_per_unit": float(lossrec["cost_basis_per_unit"]),
+            "loss_aud": loss_real,
+            "loss_pct": float(lossrec["loss_pct"]),
+            "hold_days": int(lossrec["hold_days"]),
+            "ticker_bought": sub,
+            "units_bought": float(units_bought),
+            "buy_price": float(p_sub),
+            "swap_value_aud": float(sale_value),
+            "nav_aud": float(nav_aud) if nav_aud else None,
+        })
+        result["n_events"] += 1
+    return result
 
 
 def _is_us_ticker(t) -> bool:
@@ -5542,8 +5809,9 @@ except Exception as _e_seed:
 
 # ---- 10B) Combined dialog (holdings + tilts) ----
 if _SKIP_LIVE_PIPELINE:
-    # Stress-test / scale-analysis mode: bypass the modal dialog so the run can
-    # reach the downstream gate. Use sheet seeds (same as user cancelling).
+    # Diagnostic mode (stress-test / scale-analysis / dev-validation): bypass
+    # the modal dialog so the run can reach the downstream gate. Use sheet
+    # seeds (same as user cancelling).
     print("[skip-pipeline] bypassing holdings dialog (using sheet seeds)")
     res = None
 else:
@@ -6163,6 +6431,10 @@ def run_oos_ensemble_walk_forward(
     _fy_buckets = {"st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0}
     _carried_losses = {"st_loss": 0.0, "lt_loss": 0.0}
     _current_fy_end: pd.Timestamp | None = None
+    # TLH state — cooldown maps ticker → last TLH-sell date; events accumulate
+    # for the engine return dict (consumed by Excel/PPT/log writers).
+    _tlh_cooldown: dict[str, pd.Timestamp] = {}
+    _tlh_events_all: list[dict] = []
 
     def _fy_end_for(date: pd.Timestamp) -> pd.Timestamp:
         d = pd.Timestamp(date)
@@ -6338,9 +6610,15 @@ def run_oos_ensemble_walk_forward(
         # rebalance — that overestimates because it ignores intra-FY loss
         # offsetting. Tax is applied at FY-end (below) on net taxable.
         # Skipped rebalances do NOT update the lot book (no trades occurred).
-        if not skip_rebal:
+        # Resolve price snapshot once: needed below by both the rebalance lot
+        # update and the TLH pass.
+        try:
+            px_at_t = px.loc[:t].iloc[-1]
+        except Exception:
+            px_at_t = None
+
+        if not skip_rebal and px_at_t is not None:
             try:
-                px_at_t = px.loc[:t].iloc[-1]
                 tickers_traded = sorted(set(_prev_blend_w.index).union(w_blend.index))
                 for tkr in tickers_traded:
                     p = float(px_at_t.get(tkr, np.nan))
@@ -6357,6 +6635,28 @@ def run_oos_ensemble_walk_forward(
                         for k in _fy_buckets:
                             _fy_buckets[k] += out[k]
             except Exception:
+                pass
+
+        # TLH pass: scan current lots for unrealised losses, swap to substitute
+        # (sells loss lot, buys substitute at same dollar value). Runs even on
+        # skipped rebalances — a position may have drifted into harvestable
+        # loss without the optimiser wanting to trim it. Losses fold straight
+        # into the FY bucket so they offset gains at FY-end netting.
+        if TLH_ENABLED and px_at_t is not None:
+            try:
+                tlh_out = _run_tlh_pass(
+                    lot_book=_lot_book,
+                    price_snapshot=px_at_t,
+                    as_of=t,
+                    cooldown_state=_tlh_cooldown,
+                    nav_aud=_running_nav,
+                )
+                for k in _fy_buckets:
+                    _fy_buckets[k] += tlh_out["realised"][k]
+                if tlh_out["n_events"]:
+                    _tlh_events_all.extend(tlh_out["events"])
+            except Exception as _e:
+                # TLH is non-essential — never break the backtest on it.
                 pass
 
         # FY-end tax check: if this rebalance falls in a NEW financial year
@@ -6418,6 +6718,7 @@ def run_oos_ensemble_walk_forward(
         "n_early_triggered": n_early_triggered,
         "n_skipped": n_skipped,
         "n_executed": n_executed,
+        "tlh_events": _tlh_events_all,
     }
 
 
@@ -6998,6 +7299,279 @@ if "--scale-analysis" in sys.argv:
     sys.exit(_exit_code)
 
 
+# === Dev/validation split (--dev-validation) ================================
+# Re-run the same engine on two disjoint OOS windows to expose meta-parameter
+# overfitting. The ensemble design (slot menu, lambda_temp, gaussian_width,
+# halflife, weight caps, scoring rule) was selected on 2016-2026 data — so
+# good 2016-2026 OOS Sharpe is not honest evidence of generalisation. The
+# discipline going forward: tune on the DEV window only, then open the
+# VALIDATION lock-box at most once per change. A big dev→validation gap means
+# the change was overfit.
+#
+#   Dev OOS:        2015-01-01 → 2020-02-19  (SPY pre-COVID ATH)
+#   Validation OOS: 2020-02-20 → today       (LOCK BOX)
+#
+# The engine derives oos_start = data_start + 24mo, so we pre-roll each data
+# slice by 24 months to make the OOS evaluation window match exactly.
+def _run_dev_validation() -> int:
+    print("\n" + "=" * 88)
+    print("DEV / VALIDATION SPLIT — meta-parameter overfit gauge")
+    print("=" * 88)
+
+    WINDOWS = [
+        # (label, oos_start, oos_end)
+        ("DEV",        pd.Timestamp("2015-01-01"), pd.Timestamp("2020-02-19")),
+        ("VALIDATION", pd.Timestamp("2020-02-20"), pd.Timestamp.now().normalize()),
+    ]
+    TRAIN_MONTHS = 24
+
+    _dv_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[devval] universe: {len(_dv_tickers)} tickers")
+    print(f"[devval] downloading full history (max) for split eval...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_dv_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[devval] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers, "
+          f"{px_aud.index.min().date()} → {px_aud.index.max().date()}) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+
+    results: list[dict] = []
+    nav_curves: dict[str, pd.Series] = {}
+    spy_curves: dict[str, pd.Series] = {}
+
+    for label, oos_start, oos_end in WINDOWS:
+        data_start = oos_start - pd.DateOffset(months=TRAIN_MONTHS)
+        if px_aud.index.min() > data_start:
+            print(f"[devval] {label}: WARNING — history starts "
+                  f"{px_aud.index.min().date()}, need {data_start.date()} for "
+                  f"{TRAIN_MONTHS}mo preroll. OOS window will start later.")
+        slice_px = px_aud.loc[data_start:oos_end]
+        if slice_px.empty:
+            print(f"[devval] {label}: empty slice, skipping")
+            continue
+        print(f"\n[devval] {label} window: OOS {oos_start.date()} → {oos_end.date()} "
+              f"(data slice {slice_px.index.min().date()} → {slice_px.index.max().date()})")
+
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(
+            slice_px,
+            train_window_months=TRAIN_MONTHS,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            starting_nav_aud=1_000_000.0,
+        )
+        strat_rets = out["blended_returns"]
+        if strat_rets.empty:
+            print(f"[devval] {label}: empty returns, skipping")
+            continue
+
+        days = len(strat_rets)
+        years = max(days / ANNUAL_TRADING_DAYS, 1e-6)
+        nav_curve = (1.0 + strat_rets).cumprod()
+        total_ret = float(nav_curve.iloc[-1] - 1.0)
+        ann_ret = float((1.0 + total_ret) ** (1.0 / years) - 1.0)
+        vol_ann = float(strat_rets.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        sharpe = ann_ret / vol_ann if vol_ann > 0 else 0.0
+        downside = strat_rets[strat_rets < 0].std() * np.sqrt(ANNUAL_TRADING_DAYS)
+        sortino = ann_ret / float(downside) if float(downside) > 0 else 0.0
+        dd = (nav_curve / nav_curve.cummax() - 1.0).min()
+
+        cost_ser = out.get("rebalance_costs", pd.Series(dtype=float))
+        tax_ser = out.get("rebalance_taxes", pd.Series(dtype=float))
+        brokerage_drag_bps = float(cost_ser.sum() / years * 10_000) if not cost_ser.empty else 0.0
+        cgt_drag_bps = float(tax_ser.sum() / years * 10_000) if not tax_ser.empty else 0.0
+
+        # TLH quantification: count events, total realised loss in AUD, and
+        # convert to a tax-saved estimate (loss × effective MTR) → bps/yr drag
+        # offset that we can subtract from CGT to gauge the net benefit.
+        tlh_events = out.get("tlh_events", []) or []
+        tlh_n_events = len(tlh_events)
+        tlh_loss_aud = float(sum(e.get("loss_aud", 0.0) for e in tlh_events))
+        # Approximate tax saved: assume ~half ST (full MTR), half LT (discounted).
+        _eff_st = _effective_cgt_rate(short_term=True)
+        _eff_lt = _effective_cgt_rate(short_term=False)
+        tlh_tax_saved_est = tlh_loss_aud * (_eff_st + _eff_lt) / 2.0
+        tlh_savings_bps = (tlh_tax_saved_est / 1_000_000.0
+                           / years * 10_000)
+
+        spy_window = spy_ret_full.reindex(strat_rets.index).fillna(0.0)
+        spy_nav = (1.0 + spy_window).cumprod()
+        spy_total = float(spy_nav.iloc[-1] - 1.0)
+        spy_ann = float((1.0 + spy_total) ** (1.0 / years) - 1.0)
+        spy_vol = float(spy_window.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        spy_sharpe = spy_ann / spy_vol if spy_vol > 0 else 0.0
+        spy_dd = (spy_nav / spy_nav.cummax() - 1.0).min()
+        alpha_vs_spy = ann_ret - spy_ann
+
+        elapsed = time.perf_counter() - t1
+        nav_curves[label] = nav_curve
+        spy_curves[label] = spy_nav
+
+        results.append({
+            "label": label,
+            "oos_start": str(oos_start.date()),
+            "oos_end": str(oos_end.date()),
+            "years": round(years, 2),
+            "ann_return": round(ann_ret, 6),
+            "ann_volatility": round(vol_ann, 6),
+            "sharpe": round(sharpe, 3),
+            "sortino": round(sortino, 3),
+            "max_drawdown": round(float(dd), 6),
+            "brokerage_drag_bps_per_year": round(brokerage_drag_bps, 1),
+            "cgt_drag_bps_per_year": round(cgt_drag_bps, 1),
+            "tlh_n_events": int(tlh_n_events),
+            "tlh_loss_realised_aud": round(tlh_loss_aud, 2),
+            "tlh_tax_saved_est_aud": round(tlh_tax_saved_est, 2),
+            "tlh_drag_offset_bps_per_year": round(tlh_savings_bps, 1),
+            "spy_ann_return": round(spy_ann, 6),
+            "spy_sharpe": round(spy_sharpe, 3),
+            "spy_max_drawdown": round(float(spy_dd), 6),
+            "alpha_vs_spy": round(alpha_vs_spy, 6),
+            "n_rebalances": int(out.get("n_executed", 0)),
+            "elapsed_sec": round(elapsed, 1),
+        })
+        print(f"[devval] {label}: ann_ret {ann_ret*100:+.2f}%  "
+              f"Sharpe {sharpe:.2f}  Sortino {sortino:.2f}  "
+              f"MaxDD {float(dd)*100:+.2f}%  "
+              f"α(SPY) {alpha_vs_spy*100:+.2f}%  "
+              f"({elapsed:.1f}s)")
+        print(f"[devval] {label}: TLH {tlh_n_events} events  "
+              f"${tlh_loss_aud:,.0f} loss realised  "
+              f"~${tlh_tax_saved_est:,.0f} tax saved  "
+              f"{tlh_savings_bps:+.0f} bps/yr drag offset")
+
+    if len(results) < 2:
+        print("[devval] need both windows to produce a meaningful split; aborting.")
+        return 1
+
+    dev = next(r for r in results if r["label"] == "DEV")
+    val = next(r for r in results if r["label"] == "VALIDATION")
+
+    # === Comparison table ===
+    print("\n" + "=" * 88)
+    print("DEV vs VALIDATION — engine + universe identical, only window changes")
+    print("=" * 88)
+    print(f"  {'Metric':<22} {'DEV':>14} {'VALIDATION':>14} {'Δ (val-dev)':>14}")
+    print(f"  {'-'*22} {'-'*14} {'-'*14} {'-'*14}")
+
+    def _row(name: str, key: str, fmt: str, scale: float = 1.0):
+        d, v = dev[key] * scale, val[key] * scale
+        delta = v - d
+        d_str = format(d, fmt)
+        v_str = format(v, fmt)
+        delta_str = format(delta, fmt)
+        print(f"  {name:<22} {d_str:>14} {v_str:>14} {delta_str:>14}")
+
+    _row("OOS window (yrs)",   "years",                       "+.2f")
+    _row("Ann return (%)",     "ann_return",                  "+.2f", 100.0)
+    _row("Ann volatility (%)", "ann_volatility",              "+.2f", 100.0)
+    _row("Sharpe",             "sharpe",                      "+.2f")
+    _row("Sortino",            "sortino",                     "+.2f")
+    _row("MaxDD (%)",          "max_drawdown",                "+.2f", 100.0)
+    _row("Brokerage (bps/yr)", "brokerage_drag_bps_per_year", "+.0f")
+    _row("CGT (bps/yr)",       "cgt_drag_bps_per_year",       "+.0f")
+    _row("TLH events",         "tlh_n_events",                "+.0f")
+    _row("TLH loss realised",  "tlh_loss_realised_aud",       "+,.0f")
+    _row("TLH tax saved est",  "tlh_tax_saved_est_aud",       "+,.0f")
+    _row("TLH offset (bps/yr)","tlh_drag_offset_bps_per_year","+.0f")
+    _row("SPY ann return (%)", "spy_ann_return",              "+.2f", 100.0)
+    _row("SPY Sharpe",         "spy_sharpe",                  "+.2f")
+    _row("α vs SPY (%)",       "alpha_vs_spy",                "+.2f", 100.0)
+    _row("Rebalances",         "n_rebalances",                "+.0f")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    sharpe_gap = val["sharpe"] - dev["sharpe"]
+    alpha_gap = val["alpha_vs_spy"] - dev["alpha_vs_spy"]
+    print(f"  Sharpe degradation:   {sharpe_gap:+.2f}  (dev {dev['sharpe']:.2f} → val {val['sharpe']:.2f})")
+    print(f"  α(SPY) degradation:   {alpha_gap*100:+.2f}%  "
+          f"(dev {dev['alpha_vs_spy']*100:+.2f}% → val {val['alpha_vs_spy']*100:+.2f}%)")
+    if sharpe_gap < -0.30:
+        print(f"  Reading: LARGE degradation. Strong signal of meta-parameter overfit.")
+    elif sharpe_gap < -0.15:
+        print(f"  Reading: Moderate degradation. Some overfit risk — investigate which knobs.")
+    elif sharpe_gap < 0.05:
+        print(f"  Reading: Stable. Engine generalises well across the two windows.")
+    else:
+        print(f"  Reading: Validation BETTER than dev — likely regime-driven, not overfit.")
+    print(f"  Going forward: tune on DEV only; open VALIDATION at most once per change.")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "train_window_months": TRAIN_MONTHS,
+            "windows": results,
+            "sharpe_gap": round(sharpe_gap, 3),
+            "alpha_gap": round(alpha_gap, 6),
+        }
+        json_path = APP_DIR / "dev_validation_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n[devval] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[devval] summary JSON save failed: {e}")
+
+    # Chart: NAV curves on dev and validation, with SPY overlay on each
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        for ax, label in zip(axes, ["DEV", "VALIDATION"]):
+            if label not in nav_curves:
+                continue
+            n = nav_curves[label]
+            s = spy_curves[label]
+            ax.plot(n.index, (n / n.iloc[0]) * 100.0,
+                    color="C0", linewidth=2, label="Strategy")
+            ax.plot(s.index, (s / s.iloc[0]) * 100.0,
+                    color="red", linestyle="--", alpha=0.7, label="SPY (AUD)")
+            r = next(x for x in results if x["label"] == label)
+            ax.set_title(f"{label}: Sharpe {r['sharpe']:.2f}, α {r['alpha_vs_spy']*100:+.2f}%")
+            ax.set_ylabel("NAV (rebased = 100)")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        fig.suptitle("Dev vs Validation OOS — same engine, disjoint windows", fontsize=12)
+        fig.tight_layout()
+        chart_path = APP_DIR / "dev_validation_chart.png"
+        fig.savefig(chart_path, dpi=120)
+        plt.close(fig)
+        print(f"[devval] chart → {chart_path}")
+    except Exception as e:
+        print(f"[devval] chart save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("DEV / VALIDATION SPLIT COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--dev-validation" in sys.argv:
+    _exit_code = _run_dev_validation()
+    sys.exit(_exit_code)
+
+
 # === Rebuild core analytics ===
 prices_aud_for_returns, df_melt, df_cov_wide, Sigma_daily, mu_ann_geo = _rebuild_core_from_prices(prices)
 globals()["returns_wide_df"] = df_cov_wide.copy()
@@ -7057,6 +7631,9 @@ if bool(CFG.get("oos_validation", True)):
         globals()["oos_per_candidate_weights"] = ensemble_out["per_candidate_weights"]
         globals()["oos_rebalance_costs"] = ensemble_out.get("rebalance_costs", pd.Series(dtype=float))
         globals()["oos_rebalance_taxes"] = ensemble_out.get("rebalance_taxes", pd.Series(dtype=float))
+        # TLH events from the OOS engine — consumed by the Excel TLH_Log writer
+        # and the PPT scorecard row. Empty list if TLH_ENABLED is False.
+        globals()["oos_tlh_events"] = ensemble_out.get("tlh_events", []) or []
         # Report annualised drag from brokerage + CGT separately (informative).
         _cost_ser = ensemble_out.get("rebalance_costs", pd.Series(dtype=float))
         _tax_ser = ensemble_out.get("rebalance_taxes", pd.Series(dtype=float))
@@ -7077,6 +7654,24 @@ if bool(CFG.get("oos_validation", True)):
                   f"~{_ann_tax_bps:.0f} bps/year")
             print(f"[oos] TOTAL drag (brokerage + CGT): "
                   f"~{_ann_cost_bps + _ann_tax_bps:.0f} bps/year (NET in metrics)")
+        # TLH summary for the live OOS run: quantifies harvesting activity over
+        # the full backtested window. Gross headline tax-saved figure assumes
+        # 100% utilisation against future gains — see dev-validation output for
+        # the realistic net impact on Sharpe.
+        _tlh_events_live = ensemble_out.get("tlh_events", []) or []
+        if _tlh_events_live:
+            _tlh_loss = float(sum(e.get("loss_aud", 0.0) for e in _tlh_events_live))
+            _eff_st = _effective_cgt_rate(short_term=True)
+            _eff_lt = _effective_cgt_rate(short_term=False)
+            _tlh_tax_est = _tlh_loss * (_eff_st + _eff_lt) / 2.0
+            _tlh_bps = _tlh_tax_est / 1_000_000.0 / _years * 10_000
+            print(f"[tlh] {len(_tlh_events_live)} events over window, "
+                  f"${_tlh_loss:,.0f} loss realised, "
+                  f"~${_tlh_tax_est:,.0f} gross tax saved est "
+                  f"(~{_tlh_bps:.0f} bps/yr; gross — actual net depends on FY-end netting)")
+        elif TLH_ENABLED:
+            print(f"[tlh] enabled but 0 events triggered over window "
+                  f"(threshold={TLH_MIN_LOSS_PCT*100:+.0f}%, ${TLH_MIN_LOSS_AUD:.0f} min)")
         _oos_t1 = time.perf_counter()
         if not oos_returns_daily.empty:
             print(
@@ -8621,6 +9216,56 @@ if USE_XLWINGS:
             except Exception as _e_oos:
                 print(f"[excel] OOS_Validation write skipped: {_e_oos}")
 
+            # TLH_Log sheet — every harvesting swap fired by the walk-forward
+            # engine across the OOS window. Top rows summarise; below is the
+            # per-event ledger. Empty sheet if TLH disabled or no events.
+            try:
+                _tlh_events = globals().get("oos_tlh_events", []) or []
+                _tlh_sht = get_or_clear_sheet(wb, 'TLH_Log')
+                if _tlh_events:
+                    _tlh_df = pd.DataFrame(_tlh_events)
+                    # Coerce dates to date-only strings for clean Excel display.
+                    for _dc in ("date", "lot_date"):
+                        if _dc in _tlh_df.columns:
+                            _tlh_df[_dc] = pd.to_datetime(_tlh_df[_dc]).dt.strftime("%Y-%m-%d")
+                    _tlh_loss_total = float(_tlh_df["loss_aud"].sum())
+                    _eff_st = _effective_cgt_rate(short_term=True)
+                    _eff_lt = _effective_cgt_rate(short_term=False)
+                    _tax_saved_est = _tlh_loss_total * (_eff_st + _eff_lt) / 2.0
+                    _years_tlh = max(len(oos_returns_daily) / ANNUAL_TRADING_DAYS, 1e-6) \
+                                 if isinstance(oos_returns_daily, pd.Series) else 1.0
+                    _bps_yr = _tax_saved_est / 1_000_000.0 / _years_tlh * 10_000
+                    # Header summary rows
+                    _tlh_sht.range("A1").value = "Tax-Loss Harvesting — backtest engine activity"
+                    _tlh_sht.range("A2").value = "TLH events"
+                    _tlh_sht.range("B2").value = int(len(_tlh_events))
+                    _tlh_sht.range("A3").value = "Total loss realised (AUD)"
+                    _tlh_sht.range("B3").value = round(_tlh_loss_total, 2)
+                    _tlh_sht.range("A4").value = "Tax saved (gross est, AUD)"
+                    _tlh_sht.range("B4").value = round(_tax_saved_est, 2)
+                    _tlh_sht.range("A5").value = "Drag offset (bps/yr, gross)"
+                    _tlh_sht.range("B5").value = round(_bps_yr, 1)
+                    _tlh_sht.range("A6").value = ("Note: gross figure assumes 100% loss utilisation. "
+                                                  "Net Sharpe impact is typically smaller because FY-end "
+                                                  "netting already offsets most realised gains.")
+                    # Per-event detail starting row 8
+                    _tlh_sht.range("A8").options(pd.DataFrame, index=False, header=True).value = _tlh_df
+                    _tlh_sht.autofit()
+                    print(f"[excel] TLH_Log: {len(_tlh_events)} events written "
+                          f"(${_tlh_loss_total:,.0f} loss, ~${_tax_saved_est:,.0f} gross tax saved)")
+                else:
+                    _tlh_sht.range("A1").value = "Tax-Loss Harvesting — backtest engine activity"
+                    _tlh_sht.range("A2").value = ("No TLH events triggered over the OOS window "
+                                                  if TLH_ENABLED else "TLH disabled in config ")
+                    _tlh_sht.range("A3").value = (f"(threshold={TLH_MIN_LOSS_PCT*100:+.0f}%, "
+                                                  f"min=${TLH_MIN_LOSS_AUD:.0f}, "
+                                                  f"cooldown={TLH_COOLDOWN_DAYS}d, "
+                                                  f"pairs={len(TLH_PAIRS)})")
+                    _tlh_sht.autofit()
+                    print(f"[excel] TLH_Log: 0 events (TLH_ENABLED={TLH_ENABLED})")
+            except Exception as _e_tlh:
+                print(f"[excel] TLH_Log write skipped: {_e_tlh}")
+
             # ---- Update Lots and overwrite Holdings with target units (for next run) ----
             UPDATED_LOTS = _update_lots_after_trades(lots_df, trade_rec, pd.Timestamp(prices.index[-1]), fx_map_all)
             sht_lots = get_or_clear_sheet(wb, 'Lots')
@@ -9338,6 +9983,46 @@ def export_to_ppt(results, trades, charts=None):
                 pm.alignment = PP_ALIGN.LEFT
         except Exception as _e_mix:
             print(f"[pptx] Slide 2 regime mix annotation skipped: {_e_mix}")
+
+    # --- TLH scorecard line (one-liner with cumulative harvest activity) ---
+    # Positioned between the dark header band and the trade-plan table (which
+    # starts at top=Cm(4.0)). Uses dark text so it's visible on the light body
+    # background — the header-band white-text boxes above sit in the blue band
+    # but anything below ~y=3.1cm needs dark text.
+    try:
+        _tlh_events_ppt = globals().get("oos_tlh_events", []) or []
+        if TLH_ENABLED:
+            if _tlh_events_ppt:
+                _tlh_loss = float(sum(e.get("loss_aud", 0.0) for e in _tlh_events_ppt))
+                _eff_st = _effective_cgt_rate(short_term=True)
+                _eff_lt = _effective_cgt_rate(short_term=False)
+                _tax_est = _tlh_loss * (_eff_st + _eff_lt) / 2.0
+                _oos_rets = globals().get("oos_returns_daily", pd.Series(dtype=float))
+                _yrs = max(len(_oos_rets) / ANNUAL_TRADING_DAYS, 1e-6) if isinstance(_oos_rets, pd.Series) else 1.0
+                _bps = _tax_est / 1_000_000.0 / _yrs * 10_000
+                _tlh_text = (f"Tax-loss harvesting: {len(_tlh_events_ppt)} events over backtest  ·  "
+                             f"${_tlh_loss:,.0f} loss realised  ·  "
+                             f"~${_tax_est:,.0f} gross tax-saved est ({_bps:.0f} bps/yr drag offset; "
+                             f"gross — net depends on FY-end netting)")
+            else:
+                _tlh_text = (f"Tax-loss harvesting: enabled, 0 events triggered  ·  "
+                             f"threshold {TLH_MIN_LOSS_PCT*100:+.0f}%, "
+                             f"${TLH_MIN_LOSS_AUD:.0f} min, {TLH_COOLDOWN_DAYS}d cooldown")
+            tlh_box = slide.shapes.add_textbox(Cm(1.10), Cm(3.50), Cm(23.80), Cm(0.50))
+            tft = tlh_box.text_frame
+            tft.clear()
+            tft.word_wrap = False
+            tft.margin_left = 0
+            tft.margin_top = 0
+            pt_ = tft.paragraphs[0]
+            pt_.text = _tlh_text
+            pt_.font.size = Pt(10)
+            pt_.font.italic = True
+            pt_.font.color.rgb = RGBColor(60, 60, 60)
+            pt_.alignment = PP_ALIGN.LEFT
+            print(f"[pptx] Slide 2 TLH scorecard added: {len(_tlh_events_ppt)} events")
+    except Exception as _e_tlh_ppt:
+        print(f"[pptx] Slide 2 TLH scorecard skipped: {_e_tlh_ppt}")
 
     # --- Draw Trade Plan table ---
     if trades is not None and not trades.empty:
