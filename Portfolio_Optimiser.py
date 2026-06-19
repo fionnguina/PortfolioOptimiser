@@ -7425,6 +7425,37 @@ def _run_gfc_stress_test() -> int:
                        if nav_strat_gfc_s is not None and not nav_strat_gfc_s.empty
                        else float("nan"))
 
+        # === Third run: Stretch-only + crash hedge ON ===
+        print(f"\n[stress-stretch-hedge] running Stretch-only WITH crash hedge "
+              f"(trigger={CRASH_HEDGE_DD_TRIGGER*100:+.0f}%, "
+              f"release={CRASH_HEDGE_DD_RELEASE*100:+.0f}%)")
+        t3 = time.perf_counter()
+        out_sh = run_oos_ensemble_walk_forward(
+            px_aud,
+            train_window_months=24,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            slot_weights_override={stretch_slot: 1.0},
+            crash_hedge=True,
+        )
+        strat_rets_sh = out_sh["blended_returns"]
+        n_hedge_triggers = int(out_sh.get("hedge_n_triggers", 0))
+        n_hedge_active = int(out_sh.get("hedge_active_rebals", 0))
+        print(f"[stress-stretch-hedge] walk-forward done in {time.perf_counter()-t3:.1f}s")
+        print(f"[stress-stretch-hedge] hedge fired {n_hedge_triggers}× across full window, "
+              f"active on {n_hedge_active} rebalances")
+
+        strat_gfc_sh = strat_rets_sh[(strat_rets_sh.index >= gfc_start)
+                                       & (strat_rets_sh.index <= gfc_end)]
+        nav_strat_gfc_sh = (1 + strat_gfc_sh).cumprod() if not strat_gfc_sh.empty else None
+        dd_strat_sh = (float((nav_strat_gfc_sh / nav_strat_gfc_sh.cummax() - 1).min())
+                       if nav_strat_gfc_sh is not None else float("nan"))
+        total_ret_sh = (float(nav_strat_gfc_sh.iloc[-1] - 1.0)
+                        if nav_strat_gfc_sh is not None and not nav_strat_gfc_sh.empty
+                        else float("nan"))
+
         # Side-by-side print
         print(f"\n  {'Config':<30}  {'GFC TotRet':>11}  {'GFC MaxDD':>11}  "
               f"{'Defence vs SPY':>15}")
@@ -7447,6 +7478,10 @@ def _run_gfc_stress_test() -> int:
               f"{total_ret_s*100:>+10.2f}%  "
               f"{dd_strat_s*100:>+10.2f}%  "
               f"{_def_pct(dd_strat_s, dd_spy_gfc):>14.1f}%")
+        print(f"  {'Stretch-only + crash hedge':<30}  "
+              f"{total_ret_sh*100:>+10.2f}%  "
+              f"{dd_strat_sh*100:>+10.2f}%  "
+              f"{_def_pct(dd_strat_sh, dd_spy_gfc):>14.1f}%")
         print(f"  {'SPY (AUD) benchmark':<30}  "
               f"{float(((1 + spy_gfc).cumprod().iloc[-1] - 1) * 100):>+10.2f}%  "
               f"{dd_spy_gfc*100:>+10.2f}%  "
@@ -7457,18 +7492,26 @@ def _run_gfc_stress_test() -> int:
         print("\n" + "=" * 80)
         print("VERDICT — GFC defence comparison")
         print("=" * 80)
-        delta_dd = dd_strat_s - dd_strat_blend
-        if delta_dd < -0.05:
-            print(f"  Stretch-only takes {delta_dd*100:+.1f}% deeper drawdown than 5-slot blend.")
-            print(f"  The intrinsic defence from slot blending IS material in tail events.")
-            print(f"  Recommend: KEEP 5-slot blend for GFC protection, despite modern alpha cost.")
-        elif delta_dd < 0.02:
-            print(f"  Stretch-only ≈ 5-slot blend in GFC ({delta_dd*100:+.1f}% diff).")
-            print(f"  No meaningful tail-protection trade-off — Stretch-only is ship-ready.")
+        delta_dd_s = dd_strat_s - dd_strat_blend
+        delta_dd_sh = dd_strat_sh - dd_strat_blend
+        hedge_saves = dd_strat_sh - dd_strat_s  # negative = hedge protects further
+        print(f"  Stretch-only vs 5-slot blend:        ΔMaxDD {delta_dd_s*100:+.1f}%")
+        print(f"  Stretch+hedge vs 5-slot blend:       ΔMaxDD {delta_dd_sh*100:+.1f}%")
+        print(f"  Hedge's actual contribution:         {hedge_saves*100:+.1f}% "
+              f"({'better' if hedge_saves < 0 else 'worse'} than Stretch-only)")
+        if dd_strat_sh < dd_strat_blend + 0.02:
+            print(f"\n  Reading: Stretch + hedge MATCHES 5-slot defence "
+                  f"(MaxDD {dd_strat_sh*100:.1f}% vs blend {dd_strat_blend*100:.1f}%).")
+            print(f"  This IS the synthesis we were hunting — modern alpha + tail protection.")
+            print(f"  Recommend: ship Stretch-only + crash hedge as production config.")
+        elif hedge_saves < -0.03:
+            print(f"\n  Reading: hedge meaningfully helps Stretch ({hedge_saves*100:+.1f}% MaxDD) "
+                  f"but still trails 5-slot blend by {delta_dd_sh*100:+.1f}%.")
+            print(f"  Partial fix — could be acceptable depending on modern uplift weight.")
         else:
-            print(f"  Stretch-only actually has SHALLOWER drawdown than 5-slot? "
-                  f"({delta_dd*100:+.1f}%)")
-            print(f"  Unexpected — verify result before acting.")
+            print(f"\n  Reading: hedge doesn't close the gap. Stretch+hedge MaxDD "
+                  f"{dd_strat_sh*100:.1f}% vs 5-slot {dd_strat_blend*100:.1f}%.")
+            print(f"  Recommend: KEEP 5-slot blend if GFC defence matters more than +4%/yr modern alpha.")
 
         # Append to JSON
         try:
@@ -7476,8 +7519,14 @@ def _run_gfc_stress_test() -> int:
                 "stretch_total_return_pct": float(total_ret_s * 100),
                 "stretch_max_dd_pct": float(dd_strat_s * 100),
                 "stretch_defence_pct": _def_pct(dd_strat_s, dd_spy_gfc),
+                "stretch_hedge_total_return_pct": float(total_ret_sh * 100),
+                "stretch_hedge_max_dd_pct": float(dd_strat_sh * 100),
+                "stretch_hedge_defence_pct": _def_pct(dd_strat_sh, dd_spy_gfc),
+                "stretch_hedge_n_triggers": n_hedge_triggers,
                 "blend_defence_pct": _def_pct(dd_strat_blend, dd_spy_gfc),
-                "delta_dd_pct": float(delta_dd * 100),
+                "delta_dd_stretch_vs_blend_pct": float(delta_dd_s * 100),
+                "delta_dd_stretchhedge_vs_blend_pct": float(delta_dd_sh * 100),
+                "hedge_saves_pct": float(hedge_saves * 100),
             }
             json_path = APP_DIR / "gfc_stress_summary.json"
             with open(json_path, "w", encoding="utf-8") as f:
