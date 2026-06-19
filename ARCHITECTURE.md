@@ -448,6 +448,34 @@ PRODUCTION_CRASH_HEDGE   = False   # disable crash hedge overlay
 
 No other code changes needed — the live OOS run and the live recommendation will automatically follow the constants.
 
+### Metrics history + regression warnings
+
+Every live OOS run appends a JSON snapshot to `metrics_history.jsonl` capturing:
+- `timestamp`, `git_sha`, `build_time`
+- `config`: PRODUCTION_* flags, rebal freq, broker/CGT profiles, hedge thresholds
+- `horizons`: 3Y/5Y/10Y Strategy + SPY (Sharpe, MaxDD, Alpha, Ann Return, Sortino)
+- `tlh_events`, `n_rebal_executed`, `n_rebal_skipped`
+- `live_regime_mix`, `live_top5_positions`
+
+After each run, the snapshot is compared against the prior run. The console + run.log prints `[metrics-warn]` lines when the 10Y horizon shows:
+- Sharpe regressed by ≥ 0.10
+- MaxDD deepened by ≥ 5%
+- α vs SPY worsened by ≥ 1%
+
+This was added 2026-06-19 after a config change quietly took the 10Y Sharpe from 0.99 to 0.83 and MaxDD from -20.5% to -34.4% — invisible without persistent run-to-run tracking. Reverted in commit `a660598`.
+
+**View history:**
+
+```powershell
+& ".\.venv\Scripts\python.exe" Portfolio_Optimiser.py --show-metrics-history
+# or the .exe:
+& ".\dist\Portfolio Optimiser.exe" --show-metrics-history
+```
+
+Prints the last 12 runs as a table: git SHA, slot config, hedge on/off, 10Y Sharpe/MaxDD/α/Return, TLH events, plus the latest-vs-prior delta. Doesn't run the engine — pure file read.
+
+The log lives at `APP_DIR / metrics_history.jsonl` (project root, NOT dist/), so it persists across rebuilds and is shared between dev script and dist exe.
+
 ---
 
 ## 12. Glossary

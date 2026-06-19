@@ -174,6 +174,11 @@ if _STRETCH_ONLY_TEST_MODE:
 _STRETCH_HEDGE_SWEEP_MODE = "--stretch-hedge-sweep" in sys.argv
 if _STRETCH_HEDGE_SWEEP_MODE:
     print("[stretch-hedge] --stretch-hedge-sweep detected; will skip dialog + live pipeline")
+# `--show-metrics-history`: print the metrics_history.jsonl as a comparison
+# table so we can spot regressions across versions at a glance.
+_SHOW_METRICS_HISTORY_MODE = "--show-metrics-history" in sys.argv
+if _SHOW_METRICS_HISTORY_MODE:
+    print("[metrics-history] --show-metrics-history detected; will print history then exit")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
@@ -181,7 +186,8 @@ _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _ATTRIBUTION_MODE or _CRASH_HEDGE_TEST_MODE
                        or _CRASH_HEDGE_RELEASE_SWEEP_MODE
                        or _STRETCH_ONLY_TEST_MODE
-                       or _STRETCH_HEDGE_SWEEP_MODE)
+                       or _STRETCH_HEDGE_SWEEP_MODE
+                       or _SHOW_METRICS_HISTORY_MODE)
 
 
 # =====================================================================
@@ -684,6 +690,238 @@ def _log_config_snapshot() -> None:
 
 
 _log_config_snapshot()
+
+
+def _show_metrics_history(max_rows: int = 12) -> int:
+    """Print the last N entries from metrics_history.jsonl as a table.
+
+    Designed for quick visual diff across builds: shows git_sha, timestamp,
+    production config flags, and 10Y Strategy Sharpe / MaxDD / Alpha. The
+    most recent run is the bottom row so the eye reads time-forward.
+    """
+    path = APP_DIR / "metrics_history.jsonl"
+    if not path.exists():
+        print(f"[metrics-history] no log yet at {path} — run the live pipeline once to populate.")
+        return 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            entries = [json.loads(ln) for ln in f if ln.strip()]
+    except Exception as e:
+        print(f"[metrics-history] failed to read {path}: {e}")
+        return 1
+    if not entries:
+        print(f"[metrics-history] {path} is empty.")
+        return 0
+    entries = entries[-max_rows:]
+    print("\n" + "=" * 116)
+    print(f"METRICS HISTORY — last {len(entries)} runs (most recent at bottom)")
+    print("=" * 116)
+    print(f"  {'When':<19} {'Git SHA':<14} {'Slot':<24} {'Hedge':<6} "
+          f"{'10Y Sh':>7} {'10Y MaxDD':>10} {'10Y α':>8} {'10Y Ret':>8} {'TLH':>4}")
+    print(f"  {'-'*19} {'-'*14} {'-'*24} {'-'*6} {'-'*7} {'-'*10} {'-'*8} {'-'*8} {'-'*4}")
+    for e in entries:
+        ts = str(e.get("timestamp", ""))[:19]
+        sha = str(e.get("git_sha", ""))[:14]
+        cfg = e.get("config", {}) or {}
+        slot = cfg.get("production_slot_override")
+        slot_label = (next(iter(slot.keys())) if isinstance(slot, dict) and slot
+                      else "5-slot blend")
+        slot_label = slot_label[:24]
+        hedge = "ON" if cfg.get("production_crash_hedge") else "off"
+        # Find 10Y horizon
+        h10 = next((h for h in (e.get("horizons") or [])
+                     if h.get("horizon") == "10Y"), None)
+        if h10:
+            sh = h10.get("strategy_sharpe")
+            dd = h10.get("strategy_max_drawdown")
+            al = h10.get("strategy_alpha_vs_spy")
+            rt = h10.get("strategy_ann_return")
+            sh_s = f"{sh:+.2f}" if sh is not None else "  ?  "
+            dd_s = f"{dd*100:+.2f}%" if dd is not None else "    ?    "
+            al_s = f"{al*100:+.2f}%" if al is not None else "   ?   "
+            rt_s = f"{rt*100:+.2f}%" if rt is not None else "   ?   "
+        else:
+            sh_s = dd_s = al_s = rt_s = "  -  "
+        tlh = e.get("tlh_events", 0)
+        print(f"  {ts:<19} {sha:<14} {slot_label:<24} {hedge:<6} "
+              f"{sh_s:>7} {dd_s:>10} {al_s:>8} {rt_s:>8} {tlh:>4}")
+    print()
+    # Latest vs prior delta
+    if len(entries) >= 2:
+        prev = entries[-2]
+        cur = entries[-1]
+        prv_10 = next((h for h in (prev.get("horizons") or []) if h.get("horizon") == "10Y"), None)
+        cur_10 = next((h for h in (cur.get("horizons") or []) if h.get("horizon") == "10Y"), None)
+        if prv_10 and cur_10:
+            d_sh = (cur_10.get("strategy_sharpe") or 0) - (prv_10.get("strategy_sharpe") or 0)
+            d_dd = (cur_10.get("strategy_max_drawdown") or 0) - (prv_10.get("strategy_max_drawdown") or 0)
+            d_al = (cur_10.get("strategy_alpha_vs_spy") or 0) - (prv_10.get("strategy_alpha_vs_spy") or 0)
+            print(f"  Latest vs prior:  ΔSharpe {d_sh:+.3f}   "
+                  f"ΔMaxDD {d_dd*100:+.2f}%   "
+                  f"Δα {d_al*100:+.2f}%")
+    print(f"\n  Full log: {path}")
+    return 0
+
+
+if _SHOW_METRICS_HISTORY_MODE:
+    _exit_code = _show_metrics_history()
+    sys.exit(_exit_code)
+
+
+# === Metrics history (run-over-run regression tracking) ====================
+# Append one JSON line per live run to `metrics_history.jsonl` capturing the
+# build/config/key metrics so we can spot regressions across versions.
+# Added 2026-06-19 after a Stretch+hedge ship was reverted because the live
+# full-period MaxDD blew out from -20.5% to -34.4% without my noticing — the
+# sweep-mean MaxDD looked fine in isolation but full-period peak-to-trough
+# was much worse. Without a persistent log, that kind of regression is
+# invisible run-to-run.
+def _append_metrics_snapshot(metrics_table, ensemble_mix_live, w_ensemble_live,
+                              tlh_events_n: int = 0, tlh_loss_aud: float = 0.0,
+                              n_executed: int = 0, n_skipped: int = 0) -> None:
+    """Append a metrics snapshot to metrics_history.jsonl + warn on regressions.
+
+    Captures git_sha + build_time + PRODUCTION_* config + 3Y/5Y/10Y Strategy
+    Sharpe/MaxDD/Alpha/AnnReturn (and SPY benchmark). Compares to the prior
+    snapshot and prints [metrics-warn] lines if 10Y Sharpe regressed by
+    ≥0.10, MaxDD deepened by ≥5%, or alpha worsened by ≥1%. Non-fatal —
+    purely diagnostic.
+    """
+    try:
+        if metrics_table is None or metrics_table.empty:
+            print("[metrics] snapshot skipped — empty metrics_table")
+            return
+        # Resolve git SHA / build time from the build stamp module if frozen,
+        # else fall back to git command on the source tree.
+        gsha, btime = "unknown", "unknown"
+        try:
+            gsha = str(_BUILD_GIT_SHA)
+            btime = str(_BUILD_TIME)
+        except Exception:
+            pass
+
+        # Extract per-horizon Strategy + SPY metrics. The metrics_table is a
+        # DataFrame with MultiIndex columns (horizon, series). The series we
+        # care about: Strategy and SPY (AUD).
+        def _get(metric_name, horizon_label, series_label):
+            try:
+                return float(metrics_table.loc[metric_name, (horizon_label, series_label)])
+            except Exception:
+                return None
+
+        horizons = []
+        # The horizons depend on what was passed to compute_oos_metrics; cover the
+        # standard 3Y / 5Y / 10Y. Skip any horizon that produced no data.
+        for hz in ["3Y", "5Y", "10Y"]:
+            row = {
+                "horizon": hz,
+                "strategy_ann_return": _get("Annualised Return", hz, "Strategy"),
+                "strategy_sharpe":     _get("Sharpe Ratio",      hz, "Strategy"),
+                "strategy_sortino":    _get("Sortino Ratio",     hz, "Strategy"),
+                "strategy_max_drawdown": _get("Max Drawdown",    hz, "Strategy"),
+                "strategy_alpha_vs_spy": _get("Alpha vs SPY (ann)", hz, "Strategy"),
+                "spy_ann_return":     _get("Annualised Return", hz, "SPY (AUD)"),
+                "spy_sharpe":         _get("Sharpe Ratio",      hz, "SPY (AUD)"),
+                "spy_max_drawdown":   _get("Max Drawdown",      hz, "SPY (AUD)"),
+            }
+            # Skip horizon if all None (e.g. <3y of data)
+            if all(v is None for k, v in row.items() if k != "horizon"):
+                continue
+            horizons.append(row)
+
+        # Live recommendation snapshot (top 5)
+        live_top5 = {}
+        try:
+            if isinstance(w_ensemble_live, pd.Series) and not w_ensemble_live.empty:
+                live_top5 = {str(k): float(v) for k, v in
+                              w_ensemble_live.nlargest(5).items()}
+        except Exception:
+            pass
+
+        # Regime mix snapshot
+        live_mix = {}
+        try:
+            if isinstance(ensemble_mix_live, pd.Series) and not ensemble_mix_live.empty:
+                live_mix = {str(k): float(v) for k, v in ensemble_mix_live.items()}
+        except Exception:
+            pass
+
+        snapshot = {
+            "timestamp": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "git_sha": gsha,
+            "build_time": btime,
+            "config": {
+                "production_slot_override": (
+                    PRODUCTION_SLOT_OVERRIDE if PRODUCTION_SLOT_OVERRIDE else None
+                ),
+                "production_crash_hedge": bool(PRODUCTION_CRASH_HEDGE),
+                "rebalance_freq": REBALANCE_FREQ,
+                "skip_rebal_delta": SKIP_REBAL_DELTA,
+                "tlh_enabled": TLH_ENABLED,
+                "crash_hedge_trigger_dd": CRASH_HEDGE_DD_TRIGGER,
+                "crash_hedge_release_dd": CRASH_HEDGE_DD_RELEASE,
+                "broker_profile": ACTIVE_BROKER_PROFILE,
+                "cgt_profile": ACTIVE_CGT_PROFILE,
+            },
+            "horizons": horizons,
+            "tlh_events": int(tlh_events_n),
+            "tlh_loss_realised_aud": float(tlh_loss_aud),
+            "n_rebal_executed": int(n_executed),
+            "n_rebal_skipped": int(n_skipped),
+            "live_regime_mix": live_mix,
+            "live_top5_positions": live_top5,
+        }
+
+        path = APP_DIR / "metrics_history.jsonl"
+        # Read prior snapshot for regression check BEFORE appending.
+        prior = None
+        try:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
+                    lines = [ln for ln in f if ln.strip()]
+                if lines:
+                    prior = json.loads(lines[-1])
+        except Exception:
+            prior = None
+
+        # Append the new snapshot.
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(snapshot) + "\n")
+        print(f"[metrics] snapshot → {path}")
+
+        # Regression warnings (10Y horizon is the canonical pitch number).
+        if prior:
+            cur_10y = next((h for h in horizons if h["horizon"] == "10Y"), None)
+            prv_10y = next((h for h in (prior.get("horizons") or [])
+                             if h.get("horizon") == "10Y"), None)
+            if cur_10y and prv_10y:
+                warns = []
+                def _d(key, sign=1):
+                    cv = cur_10y.get(key); pv = prv_10y.get(key)
+                    if cv is None or pv is None:
+                        return None
+                    return (cv - pv) * sign
+                d_sh = _d("strategy_sharpe")
+                d_dd = _d("strategy_max_drawdown")  # more negative = worse
+                d_al = _d("strategy_alpha_vs_spy")
+                if d_sh is not None and d_sh <= -0.10:
+                    warns.append(f"10Y Sharpe regressed {d_sh:+.3f} "
+                                  f"({prv_10y['strategy_sharpe']:.2f} → {cur_10y['strategy_sharpe']:.2f})")
+                if d_dd is not None and d_dd <= -0.05:
+                    warns.append(f"10Y MaxDD deepened by {d_dd*100:+.1f}% "
+                                  f"({prv_10y['strategy_max_drawdown']*100:+.1f}% → {cur_10y['strategy_max_drawdown']*100:+.1f}%)")
+                if d_al is not None and d_al <= -0.01:
+                    warns.append(f"10Y α vs SPY worsened by {d_al*100:+.2f}% "
+                                  f"({prv_10y['strategy_alpha_vs_spy']*100:+.2f}% → {cur_10y['strategy_alpha_vs_spy']*100:+.2f}%)")
+                if warns:
+                    print(f"[metrics-warn] REGRESSION vs prior run (git {prior.get('git_sha','?')[:8]} at {prior.get('timestamp','?')[:19]}):")
+                    for w in warns:
+                        print(f"[metrics-warn]   • {w}")
+                else:
+                    print(f"[metrics] no material regression vs prior run "
+                          f"(git {prior.get('git_sha','?')[:8]} at {prior.get('timestamp','?')[:10]})")
+    except Exception as e:
+        print(f"[metrics] snapshot write failed: {e}")
 
 
 def _effective_cgt_rate(short_term: bool = True, cfg: dict | None = None) -> float:
@@ -10374,6 +10612,25 @@ if not oos_returns_daily.empty and not oos_prices_aud_long.empty:
     except Exception as _e:
         print(f"[oos] metrics computation failed: {_e}")
 globals()["oos_metrics_table"] = oos_metrics_table
+
+# Persist a metrics snapshot to metrics_history.jsonl + warn on regressions.
+# Compares 10Y Sharpe / MaxDD / α-vs-SPY to the prior run. Non-fatal —
+# diagnostic only. See _append_metrics_snapshot() for thresholds.
+try:
+    _tlh_events_for_log = globals().get("oos_tlh_events", []) or []
+    _tlh_loss_for_log = float(sum(e.get("loss_aud", 0.0) for e in _tlh_events_for_log))
+    _ens_out_local = globals().get("ensemble_out", {})
+    _append_metrics_snapshot(
+        metrics_table=oos_metrics_table,
+        ensemble_mix_live=globals().get("ensemble_mix_live", pd.Series(dtype=float)),
+        w_ensemble_live=globals().get("W_ENSEMBLE_SER", pd.Series(dtype=float)),
+        tlh_events_n=len(_tlh_events_for_log),
+        tlh_loss_aud=_tlh_loss_for_log,
+        n_executed=int(_ens_out_local.get("n_executed", 0)) if isinstance(_ens_out_local, dict) else 0,
+        n_skipped=int(_ens_out_local.get("n_skipped", 0)) if isinstance(_ens_out_local, dict) else 0,
+    )
+except Exception as _e_metrics:
+    print(f"[metrics] snapshot call failed: {_e_metrics}")
 
 # === Crash-diagnostic checkpoints (added 2026-06-19 to chase a silent dist
 # exe crash that died between [oos] metrics computed and Excel write). Keep
