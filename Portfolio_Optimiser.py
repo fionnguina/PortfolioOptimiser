@@ -604,6 +604,27 @@ CRASH_HEDGE_DD_RELEASE   = -0.05  # release hedge when DD recovers above -5%
 CRASH_HEDGE_LOOKBACK_DAYS = 252   # rolling 1y peak for DD calculation
 CRASH_HEDGE_BASKET       = {"HBRD.AX": 0.60, "GOLD.AX": 0.40}
 
+# ============================================================================
+# PRODUCTION CONFIG (THE shipped engine setup)
+# ----------------------------------------------------------------------------
+# Empirically chosen from session-long testing (commits a4f0053 → 34195f3):
+# attribution showed defensive slots are alpha tax (Modest α = -5.5%/yr,
+# Stretch α = +4.8%); 10-fold walk-forward CV confirmed Stretch-only beats
+# 5-slot blend by +3.6% modern alpha; GFC stress test showed crash hedge
+# overlay closes the 8% tail-drawdown gap (Stretch+hedge GFC MaxDD -26%
+# matches 5-slot blend -25%). The synthesis ships.
+#
+#   PRODUCTION_SLOT_OVERRIDE  Forces all softmax weight onto a single slot.
+#                             None → full 5-slot ensemble (legacy default).
+#                             {"Stretch (SPY+25%)": 1.0} → ship Stretch-only.
+#   PRODUCTION_CRASH_HEDGE    Enables asymmetric crash hedge overlay in the
+#                             live OOS run and trade-plan generation.
+#
+# To revert to the 5-slot blend without hedge, set both to None / False.
+# ============================================================================
+PRODUCTION_SLOT_OVERRIDE = {"Stretch (SPY+25%)": 1.0}
+PRODUCTION_CRASH_HEDGE   = True
+
 
 # === Config snapshot (L16) ===================================================
 # Dump every operationally-meaningful knob at startup so any run.log is
@@ -636,6 +657,10 @@ def _log_config_snapshot() -> None:
           f"release={CRASH_HEDGE_DD_RELEASE*100:+.0f}%DD  "
           f"lookback={CRASH_HEDGE_LOOKBACK_DAYS}d  "
           f"basket={CRASH_HEDGE_BASKET}")
+    _prod_slot_str = (next(iter(PRODUCTION_SLOT_OVERRIDE.keys()))
+                       if PRODUCTION_SLOT_OVERRIDE else "5-slot blend")
+    print(f"[config] PRODUCTION ENGINE     slot={_prod_slot_str}  "
+          f"crash_hedge={PRODUCTION_CRASH_HEDGE}")
     print(f"[config] TARGET PORTFOLIO      ${TARGET_PORTFOLIO_VALUE_AUD:,.0f} AUD")
     print(f"[config] IBKR LIVE PRICES      enabled={USE_IBKR_LIVE_PRICES}  "
           f"host={IBKR_HOST}:{IBKR_PORT}  client_id={IBKR_CLIENT_ID}  "
@@ -10120,6 +10145,11 @@ if bool(CFG.get("oos_validation", True)):
             benchmark_ticker="SPY",
             score_lookback_days=252,
             lambda_temp=3.0,
+            # PRODUCTION CONFIG: the metrics shown in PPT/Excel must match
+            # what the live trade plan actually trades. See PRODUCTION_*
+            # constants at the top of the file for the empirical rationale.
+            slot_weights_override=PRODUCTION_SLOT_OVERRIDE,
+            crash_hedge=PRODUCTION_CRASH_HEDGE,
         )
         oos_returns_daily = ensemble_out["blended_returns"]
         oos_weights_history = ensemble_out["blended_weights"]
@@ -10239,6 +10269,17 @@ try:
             forward_weights=_fwd_live,
             backward_alpha=0.5,
         )
+    # PRODUCTION CONFIG override: force ensemble_mix_live to the shipped
+    # allocation (e.g. 100% Stretch) instead of the softmax+forward blend.
+    # See PRODUCTION_* constants for the empirical rationale.
+    if PRODUCTION_SLOT_OVERRIDE:
+        _override = pd.Series(PRODUCTION_SLOT_OVERRIDE).reindex(
+            ENSEMBLE_SLOT_NAMES, fill_value=0.0).astype(float)
+        _ovs = float(_override.sum())
+        if _ovs > 0:
+            ensemble_mix_live = _override / _ovs
+            print(f"[ensemble] PRODUCTION override applied: "
+                  f"{dict(PRODUCTION_SLOT_OVERRIDE)}")
     # Blend
     _ticker_idx = sorted(set().union(*[set(c.index) for c in _cand_live.values() if not c.empty]))
     if _ticker_idx and not ensemble_mix_live.empty:
@@ -10254,6 +10295,38 @@ try:
         w_ensemble_live = w_ensemble_live[w_ensemble_live > 1e-6]
         if not w_ensemble_live.empty and w_ensemble_live.sum() > 0:
             w_ensemble_live = w_ensemble_live / w_ensemble_live.sum()
+    # PRODUCTION CONFIG crash-hedge: check trigger NOW; if active, replace
+    # w_ensemble_live with hedge basket. Mirrors the engine's per-rebalance
+    # hedge check so the live trade plan reflects current crash-hedge status.
+    if PRODUCTION_CRASH_HEDGE and "SPY" in oos_prices_aud_long.columns:
+        try:
+            _live_hedge_state = {"active": False}
+            _is_crashing = _check_crash_trigger(
+                spy_history=oos_prices_aud_long["SPY"],
+                as_of=oos_prices_aud_long.index.max(),
+                state=_live_hedge_state,
+            )
+            if _is_crashing:
+                _avail = oos_prices_aud_long.columns
+                w_with_basket = w_ensemble_live.reindex(
+                    w_ensemble_live.index.union(CRASH_HEDGE_BASKET.keys())
+                ).fillna(0.0)
+                w_ensemble_live = _apply_crash_hedge(
+                    weights=w_with_basket,
+                    basket=CRASH_HEDGE_BASKET,
+                    available_tickers=_avail,
+                )
+                w_ensemble_live = w_ensemble_live[w_ensemble_live > 1e-6]
+                if not w_ensemble_live.empty and w_ensemble_live.sum() > 0:
+                    w_ensemble_live = w_ensemble_live / w_ensemble_live.sum()
+                print(f"[ensemble] PRODUCTION crash hedge ACTIVE — "
+                      f"portfolio overridden to hedge basket "
+                      f"(SPY DD {_live_hedge_state.get('last_dd', 0.0)*100:+.1f}%)")
+            else:
+                print(f"[ensemble] PRODUCTION crash hedge armed, not triggered "
+                      f"(SPY DD {_live_hedge_state.get('last_dd', 0.0)*100:+.1f}%)")
+        except Exception as _eh:
+            print(f"[ensemble] PRODUCTION crash hedge check failed: {_eh}")
     _mix_str = ", ".join(
         f"{n.split(' ')[0]}={float(ensemble_mix_live.get(n,0))*100:.0f}%"
         for n in ENSEMBLE_SLOT_NAMES

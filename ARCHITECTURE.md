@@ -413,7 +413,44 @@ Artefacts: `walk_forward_cv_summary.json`.
 
 ---
 
-## 11. Glossary
+## 11. Production engine config (the shipped design)
+
+After session-long empirical testing (commits `a4f0053` → `34195f3`), the production engine ships:
+
+- **Slot allocation:** 100% **Stretch (SPY+25%)** via `PRODUCTION_SLOT_OVERRIDE = {"Stretch (SPY+25%)": 1.0}` — the other 4 slots (Modest, Aggressive, Bold, Maximum) are computed for diagnostic display but receive zero weight in the live trade plan.
+- **Crash hedge:** `PRODUCTION_CRASH_HEDGE = True` — asymmetric overlay engages when SPY peak-to-1y-peak drawdown ≤ -15%, releases when DD recovers to -5%. Hedge basket is 60% HBRD.AX (AU cash ETF) + 40% GOLD.AX. Trigger pre-scans daily SPY data and inserts off-cycle forced rebalances on hysteresis state-change days, so V-shape crashes (COVID-2020) are not missed by the 6W rebal cadence.
+- Both knobs are toggleable at the top of [Portfolio_Optimiser.py](Portfolio_Optimiser.py) — set `PRODUCTION_SLOT_OVERRIDE = None` and `PRODUCTION_CRASH_HEDGE = False` to revert to the legacy 5-slot blend.
+
+### Why this config (the empirical case)
+
+| Test | Finding |
+|---|---|
+| Attribution (`--attribution`) | Modest slot α = **-5.5%/yr**; Stretch slot α = **+4.8%/yr**. Defensive slots are alpha tax. |
+| Walk-forward CV, 10 folds (`--stretch-only-test`) | Stretch-only vs 5-slot blend: Sharpe +0.05 / α **+3.6%/yr** / ann return **+4.4%/yr**. Stretch wins 7 of 10 modern years. |
+| Crash-hedge release sweep | Best release threshold matches no-hedge baseline; cash+gold overlay adds **zero** defensive value to the 5-slot blend in modern era because the blend already has intrinsic defense via softmax slot blending. |
+| Stretch + hedge sweep | Stretch-only beats every Stretch+hedge config in modern era. Hedge slightly worsens modern Sharpe (-0.10 at best release). |
+| **GFC stress test 3-way comparison** | 5-slot blend: -25% MaxDD (68% defence). Stretch-only: **-33% MaxDD** (91% defence — barely better than SPY). **Stretch + hedge: -26% MaxDD (71% defence) AND +10% total return** during GFC. |
+
+The synthesis (Stretch + hedge) gives:
+- **Modern (2016-2025):** α -2.65% vs SPY, Sharpe 0.80, ann ret 13.6%. Between Stretch-only and 5-slot blend, closer to Stretch.
+- **GFC tail:** MaxDD -26%, matches 5-slot blend's intrinsic defence.
+
+**Caveat acknowledged in the GFC test:** HBRD.AX didn't list until 2017, so the GFC hedge ran with 100% GOLD.AX (gold rallied +71% in 2008-09). A real 60/40 cash/gold basket in a future GFC would protect less dramatically — closer to +28% hedge return rather than +71%, but still meaningful. The cash/gold basket is best for **deflationary credit crises** where gold rallies; it underperforms in **inflation-driven bears** (gold flat) and **fast V-shapes** (timing too slow).
+
+### How to revert
+
+Edit the constants at the top of [Portfolio_Optimiser.py](Portfolio_Optimiser.py):
+
+```python
+PRODUCTION_SLOT_OVERRIDE = None    # revert to full 5-slot ensemble
+PRODUCTION_CRASH_HEDGE   = False   # disable crash hedge overlay
+```
+
+No other code changes needed — the live OOS run and the live recommendation will automatically follow the constants.
+
+---
+
+## 12. Glossary
 
 | Term | Meaning |
 |---|---|
