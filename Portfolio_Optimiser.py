@@ -169,13 +169,19 @@ if _CRASH_HEDGE_RELEASE_SWEEP_MODE:
 _STRETCH_ONLY_TEST_MODE = "--stretch-only-test" in sys.argv
 if _STRETCH_ONLY_TEST_MODE:
     print("[stretch] --stretch-only-test detected; will skip dialog + live pipeline")
+# `--stretch-hedge-sweep`: Stretch-only + crash hedge across release values.
+# The synthesis test — bull alpha from Stretch + tail protection from hedge.
+_STRETCH_HEDGE_SWEEP_MODE = "--stretch-hedge-sweep" in sys.argv
+if _STRETCH_HEDGE_SWEEP_MODE:
+    print("[stretch-hedge] --stretch-hedge-sweep detected; will skip dialog + live pipeline")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
                        or _TURNOVER_SWEEP_MODE or _WALK_FORWARD_CV_MODE
                        or _ATTRIBUTION_MODE or _CRASH_HEDGE_TEST_MODE
                        or _CRASH_HEDGE_RELEASE_SWEEP_MODE
-                       or _STRETCH_ONLY_TEST_MODE)
+                       or _STRETCH_ONLY_TEST_MODE
+                       or _STRETCH_HEDGE_SWEEP_MODE)
 
 
 # =====================================================================
@@ -9629,6 +9635,275 @@ def _run_stretch_only_test() -> int:
 
 if "--stretch-only-test" in sys.argv:
     _exit_code = _run_stretch_only_test()
+    sys.exit(_exit_code)
+
+
+# === Stretch + hedge synthesis sweep (--stretch-hedge-sweep) ================
+# THE synthesis test: Stretch-only base (proven +3.6% alpha in modern era)
+# combined with crash hedge overlay at multiple release thresholds. The
+# Stretch base lacks intrinsic defense — so the hedge has more headroom
+# to add value here than it did on the 5-slot blend (where slot blending
+# was already providing defense).
+def _run_stretch_hedge_sweep() -> int:
+    print("\n" + "=" * 88)
+    print("STRETCH + CRASH HEDGE SYNTHESIS SWEEP")
+    print("=" * 88)
+    SWEEP_RELEASES = [-0.03, -0.05, -0.08, -0.10, -0.12]
+    TRIGGER_FIXED = CRASH_HEDGE_DD_TRIGGER  # -0.15
+    TRAIN_MONTHS = 24
+    MIN_OOS_YEAR = 2016
+    MIN_FOLD_DAYS = 150
+    print(f"  base = Stretch-only (slot_weights_override)")
+    print(f"  hedge trigger fixed at {TRIGGER_FIXED*100:+.0f}% DD; "
+          f"sweeping release ∈ {[f'{r*100:+.0f}%' for r in SWEEP_RELEASES]}")
+    print(f"  basket: {CRASH_HEDGE_BASKET}")
+
+    stretch_slot = None
+    for name in ENSEMBLE_SLOT_NAMES:
+        if "Stretch" in name:
+            stretch_slot = name
+            break
+    if not stretch_slot:
+        print("[stretch-hedge] no Stretch slot found; aborting.")
+        return 1
+    stretch_override = {stretch_slot: 1.0}
+
+    _sh_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    for tkr in CRASH_HEDGE_BASKET.keys():
+        if tkr not in _sh_tickers:
+            _sh_tickers.append(tkr)
+    print(f"[stretch-hedge] universe: {len(_sh_tickers)} tickers, "
+          f"OOS folds: year ≥ {MIN_OOS_YEAR}")
+    print(f"[stretch-hedge] downloading full history (max)...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_sh_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[stretch-hedge] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+
+    def _run(stretch_only: bool, hedge: bool, release: float | None):
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(
+            px_aud,
+            train_window_months=TRAIN_MONTHS,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            starting_nav_aud=1_000_000.0,
+            crash_hedge=hedge,
+            crash_hedge_dd_release=release,
+            slot_weights_override=(stretch_override if stretch_only else None),
+        )
+        elapsed = time.perf_counter() - t1
+        strat_rets = out["blended_returns"]
+        tax_ser = out.get("rebalance_taxes", pd.Series(dtype=float))
+        info = {
+            "elapsed_sec": elapsed,
+            "n_triggers": int(out.get("hedge_n_triggers", 0)),
+            "n_active_rebals": int(out.get("hedge_active_rebals", 0)),
+        }
+        if not tax_ser.empty and not strat_rets.empty:
+            years = max(len(strat_rets) / ANNUAL_TRADING_DAYS, 1e-6)
+            info["cgt_bps_per_year"] = float(tax_ser.sum() / years * 10_000)
+        else:
+            info["cgt_bps_per_year"] = 0.0
+        return strat_rets, info
+
+    def _fold_metrics(rets: pd.Series) -> list[dict]:
+        if rets.empty:
+            return []
+        folds = []
+        for yr in sorted(set(rets.index.year)):
+            if yr < MIN_OOS_YEAR:
+                continue
+            mask = (rets.index.year == yr)
+            chunk = rets.loc[mask]
+            if len(chunk) < MIN_FOLD_DAYS:
+                continue
+            chunk_nav = (1.0 + chunk).cumprod()
+            yic = len(chunk) / ANNUAL_TRADING_DAYS
+            ann_ret = float(chunk_nav.iloc[-1] ** (1.0 / yic) - 1.0)
+            vol = float(chunk.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+            sharpe = ann_ret / vol if vol > 0 else 0.0
+            dd = float((chunk_nav / chunk_nav.cummax() - 1.0).min())
+            spy_chunk = spy_ret_full.reindex(chunk.index).fillna(0.0)
+            spy_nav = (1.0 + spy_chunk).cumprod()
+            spy_ann = float(spy_nav.iloc[-1] ** (1.0 / yic) - 1.0)
+            folds.append({
+                "year": int(yr),
+                "ann_return": ann_ret,
+                "sharpe": sharpe,
+                "max_drawdown": dd,
+                "alpha_vs_spy": ann_ret - spy_ann,
+            })
+        return folds
+
+    def _aggregate(folds: list[dict]) -> dict:
+        sh = np.array([r["sharpe"] for r in folds])
+        al = np.array([r["alpha_vs_spy"] for r in folds])
+        dd = np.array([r["max_drawdown"] for r in folds])
+        rt = np.array([r["ann_return"] for r in folds])
+        return {
+            "mean_sharpe": float(sh.mean()),
+            "std_sharpe": float(sh.std(ddof=1)),
+            "mean_alpha": float(al.mean()),
+            "mean_ann_return": float(rt.mean()),
+            "mean_max_drawdown": float(dd.mean()),
+            "worst_max_drawdown": float(dd.min()),
+        }
+
+    # === Baselines ===
+    print(f"\n[stretch-hedge] running baseline #1: 5-slot blend (no hedge)...")
+    bl5_rets, bl5_info = _run(stretch_only=False, hedge=False, release=None)
+    bl5_folds = _fold_metrics(bl5_rets)
+    bl5_agg = _aggregate(bl5_folds) if bl5_folds else {}
+    print(f"[stretch-hedge] 5-slot done in {bl5_info['elapsed_sec']:.1f}s")
+
+    print(f"\n[stretch-hedge] running baseline #2: Stretch-only (no hedge)...")
+    bls_rets, bls_info = _run(stretch_only=True, hedge=False, release=None)
+    bls_folds = _fold_metrics(bls_rets)
+    bls_agg = _aggregate(bls_folds) if bls_folds else {}
+    print(f"[stretch-hedge] Stretch-only done in {bls_info['elapsed_sec']:.1f}s")
+
+    # === Stretch + hedge sweep ===
+    treatments: list[dict] = []
+    for rel in SWEEP_RELEASES:
+        print(f"\n[stretch-hedge] running Stretch + hedge release={rel*100:+.0f}%...")
+        rets, info = _run(stretch_only=True, hedge=True, release=rel)
+        folds = _fold_metrics(rets)
+        if not folds:
+            continue
+        agg = _aggregate(folds)
+        treatments.append({
+            "release": rel,
+            "folds": folds,
+            "agg": agg,
+            "info": info,
+        })
+        print(f"[stretch-hedge] release={rel*100:+.0f}%: "
+              f"Sharpe {agg['mean_sharpe']:+.2f}±{agg['std_sharpe']:.2f}  "
+              f"α {agg['mean_alpha']*100:+.2f}%  "
+              f"MaxDD {agg['mean_max_drawdown']*100:+.2f}%  "
+              f"triggers={info['n_triggers']}  "
+              f"({info['elapsed_sec']:.1f}s)")
+
+    # === Aggregate table ===
+    print("\n" + "=" * 88)
+    print("AGGREGATE RESULTS — all configs vs both baselines")
+    print(f"({len(bls_folds)} modern folds, 2016-2025)")
+    print("=" * 88)
+    print(f"  {'Config':>26}  {'Sharpe':>14}  {'α vs SPY':>12}  {'Ann Ret':>9}  "
+          f"{'MaxDD':>9}  {'Trigs':>6}")
+    print(f"  {'-'*26}  {'-'*14}  {'-'*12}  {'-'*9}  {'-'*9}  {'-'*6}")
+    _bl5_sh_cell = f"{bl5_agg['mean_sharpe']:+.2f}±{bl5_agg['std_sharpe']:.2f}"
+    _bl5_al_cell = f"{bl5_agg['mean_alpha']*100:+.2f}%"
+    _bl5_rt_cell = f"{bl5_agg['mean_ann_return']*100:+.2f}%"
+    _bl5_dd_cell = f"{bl5_agg['mean_max_drawdown']*100:+.2f}%"
+    print(f"  {'5-slot blend (current)':>26}  {_bl5_sh_cell:>14}  {_bl5_al_cell:>12}  "
+          f"{_bl5_rt_cell:>9}  {_bl5_dd_cell:>9}  {'-':>6}")
+    # Print Stretch-only baseline
+    _bls_sh = f"{bls_agg['mean_sharpe']:+.2f}±{bls_agg['std_sharpe']:.2f}"
+    _bls_al = f"{bls_agg['mean_alpha']*100:+.2f}%"
+    _bls_rt = f"{bls_agg['mean_ann_return']*100:+.2f}%"
+    _bls_dd = f"{bls_agg['mean_max_drawdown']*100:+.2f}%"
+    print(f"  {'Stretch-only (no hedge)':>26}  {_bls_sh:>14}  {_bls_al:>12}  "
+          f"{_bls_rt:>9}  {_bls_dd:>9}  {'-':>6}")
+    # Print each treatment
+    for tr in treatments:
+        rel = tr["release"]
+        a = tr["agg"]
+        label = f"Stretch + hedge rel={rel*100:+.0f}%"
+        sh_cell = f"{a['mean_sharpe']:+.2f}±{a['std_sharpe']:.2f}"
+        al_cell = f"{a['mean_alpha']*100:+.2f}%"
+        rt_cell = f"{a['mean_ann_return']*100:+.2f}%"
+        dd_cell = f"{a['mean_max_drawdown']*100:+.2f}%"
+        print(f"  {label:>26}  {sh_cell:>14}  {al_cell:>12}  "
+              f"{rt_cell:>9}  {dd_cell:>9}  {tr['info']['n_triggers']:>6}")
+
+    # === Winner pick ===
+    if treatments:
+        winner = max(treatments, key=lambda t: (round(t["agg"]["mean_sharpe"], 3),
+                                                t["agg"]["mean_alpha"]))
+        print(f"\n[stretch-hedge] BEST hedge config: release={winner['release']*100:+.0f}%  "
+              f"Sharpe {winner['agg']['mean_sharpe']:+.2f}")
+        # Compare to both baselines
+        d_vs_5slot = winner["agg"]["mean_sharpe"] - bl5_agg.get("mean_sharpe", 0.0)
+        d_vs_stretch = winner["agg"]["mean_sharpe"] - bls_agg.get("mean_sharpe", 0.0)
+        print(f"  vs 5-slot blend:    ΔSharpe {d_vs_5slot:+.2f}")
+        print(f"  vs Stretch-only:    ΔSharpe {d_vs_stretch:+.2f}")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    if treatments and winner:
+        d_alpha_vs_stretch = winner["agg"]["mean_alpha"] - bls_agg.get("mean_alpha", 0.0)
+        d_dd_vs_stretch = winner["agg"]["mean_max_drawdown"] - bls_agg.get("mean_max_drawdown", 0.0)
+        if d_vs_stretch > 0.05:
+            print(f"  Reading: hedge ADDS value on top of Stretch ({d_vs_stretch:+.2f} Sharpe). "
+                  f"Recommend: ship Stretch + hedge (release={winner['release']*100:+.0f}%).")
+        elif d_vs_stretch > -0.05:
+            print(f"  Reading: hedge ≈ neutral vs Stretch ({d_vs_stretch:+.2f} Sharpe). "
+                  f"MaxDD impact: {d_dd_vs_stretch*100:+.1f}%. Marginal.")
+        else:
+            print(f"  Reading: even best hedge HURTS Stretch ({d_vs_stretch:+.2f} Sharpe). "
+                  f"Stretch alone is the right answer for modern era.")
+        print(f"  Note: ALL configs in this window have no GFC-class crash to test "
+              f"tail protection. Stress test (--stress-test) remains the only "
+              f"true-tail evidence we have.")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "trigger_dd": TRIGGER_FIXED,
+            "basket": CRASH_HEDGE_BASKET,
+            "baselines": {
+                "5_slot_no_hedge": {"folds": bl5_folds, "agg": bl5_agg},
+                "stretch_only_no_hedge": {"folds": bls_folds, "agg": bls_agg},
+            },
+            "treatments": [
+                {"release": tr["release"], "agg": tr["agg"], "info": tr["info"],
+                 "folds": tr["folds"]}
+                for tr in treatments
+            ],
+            "winner_release": (winner["release"] if treatments else None),
+        }
+        json_path = APP_DIR / "stretch_hedge_sweep_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n[stretch-hedge] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[stretch-hedge] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("STRETCH + HEDGE SWEEP COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--stretch-hedge-sweep" in sys.argv:
+    _exit_code = _run_stretch_hedge_sweep()
     sys.exit(_exit_code)
 
 
