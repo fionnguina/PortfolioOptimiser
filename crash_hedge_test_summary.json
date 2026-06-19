@@ -1,0 +1,266 @@
+{
+  "run_at": "2026-06-19T13:17:58",
+  "config": {
+    "dd_trigger": -0.15,
+    "dd_release": -0.05,
+    "lookback_days": 252,
+    "basket": {
+      "HBRD.AX": 0.6,
+      "GOLD.AX": 0.4
+    }
+  },
+  "baseline": {
+    "info": {
+      "elapsed_sec": 77.94490979996044,
+      "n_executed": 280,
+      "n_skipped": 79,
+      "hedge_active_rebals": 0,
+      "hedge_n_triggers": 0,
+      "hedge_events": [],
+      "cgt_bps_per_year": 159.7584400171571
+    },
+    "folds": [
+      {
+        "year": 2016,
+        "ann_return": 0.020695070413357497,
+        "sharpe": 0.1897435317718504,
+        "max_drawdown": -0.07885632124046804,
+        "spy_ann_return": 0.12458169144797027,
+        "alpha_vs_spy": -0.10388662103461277
+      },
+      {
+        "year": 2017,
+        "ann_return": 0.13348577896080482,
+        "sharpe": 1.2654654980401554,
+        "max_drawdown": -0.08355544949187144,
+        "spy_ann_return": 0.1270205609083399,
+        "alpha_vs_spy": 0.006465218052464916
+      },
+      {
+        "year": 2018,
+        "ann_return": -0.06268135823095844,
+        "sharpe": -0.4231063876845673,
+        "max_drawdown": -0.20436836204341224,
+        "spy_ann_return": 0.05451460435849609,
+        "alpha_vs_spy": -0.11719596258945453
+      },
+      {
+        "year": 2019,
+        "ann_return": 0.2597728195700617,
+        "sharpe": 2.0965674410441895,
+        "max_drawdown": -0.12676331443480326,
+        "spy_ann_return": 0.3118554952630679,
+        "alpha_vs_spy": -0.052082675693006175
+      },
+      {
+        "year": 2020,
+        "ann_return": 0.15056697579228606,
+        "sharpe": 0.9571776224467013,
+        "max_drawdown": -0.12469722837726749,
+        "spy_ann_return": 0.07528529343648804,
+        "alpha_vs_spy": 0.07528168235579802
+      },
+      {
+        "year": 2021,
+        "ann_return": 0.25825645667574615,
+        "sharpe": 1.5305189132674675,
+        "max_drawdown": -0.1016887251162718,
+        "spy_ann_return": 0.35388155810376465,
+        "alpha_vs_spy": -0.0956251014280185
+      },
+      {
+        "year": 2022,
+        "ann_return": -0.1495361303462751,
+        "sharpe": -1.0334292699217578,
+        "max_drawdown": -0.1967642782534177,
+        "spy_ann_return": -0.12055940451007507,
+        "alpha_vs_spy": -0.028976725836200035
+      },
+      {
+        "year": 2023,
+        "ann_return": 0.08631177716302885,
+        "sharpe": 0.7360991415892154,
+        "max_drawdown": -0.07202770667980585,
+        "spy_ann_return": 0.2451826885258117,
+        "alpha_vs_spy": -0.15887091136278286
+      },
+      {
+        "year": 2024,
+        "ann_return": 0.2961595303325095,
+        "sharpe": 1.7502316051928883,
+        "max_drawdown": -0.159490921446386,
+        "spy_ann_return": 0.3589710645242923,
+        "alpha_vs_spy": -0.06281153419178276
+      },
+      {
+        "year": 2025,
+        "ann_return": 0.2904373351978906,
+        "sharpe": 1.8469579510817218,
+        "max_drawdown": -0.14375701531619967,
+        "spy_ann_return": 0.09091834121430176,
+        "alpha_vs_spy": 0.19951899398358885
+      }
+    ],
+    "aggregate": {
+      "mean_sharpe": 0.892,
+      "std_sharpe": 1.033,
+      "mean_alpha": -0.033818,
+      "mean_max_drawdown": -0.129197
+    }
+  },
+  "hedge": {
+    "info": {
+      "elapsed_sec": 77.51982429996133,
+      "n_executed": 223,
+      "n_skipped": 136,
+      "hedge_active_rebals": 80,
+      "hedge_n_triggers": 5,
+      "cgt_bps_per_year": 172.95697218560525
+    },
+    "events": [
+      {
+        "date": "1998-09-03",
+        "transition": "ON",
+        "spy_dd": -0.1687
+      },
+      {
+        "date": "1998-11-16",
+        "transition": "OFF",
+        "spy_dd": -0.0346
+      },
+      {
+        "date": "2000-12-21",
+        "transition": "ON",
+        "spy_dd": -0.1656
+      },
+      {
+        "date": "2003-06-23",
+        "transition": "OFF",
+        "spy_dd": -0.0284
+      },
+      {
+        "date": "2008-01-28",
+        "transition": "ON",
+        "spy_dd": -0.172
+      },
+      {
+        "date": "2010-01-11",
+        "transition": "OFF",
+        "spy_dd": -0.0389
+      },
+      {
+        "date": "2011-08-22",
+        "transition": "ON",
+        "spy_dd": -0.1837
+      },
+      {
+        "date": "2012-02-06",
+        "transition": "OFF",
+        "spy_dd": -0.0487
+      },
+      {
+        "date": "2022-06-13",
+        "transition": "ON",
+        "spy_dd": -0.1921
+      },
+      {
+        "date": "2023-02-20",
+        "transition": "OFF",
+        "spy_dd": -0.0314
+      }
+    ],
+    "folds": [
+      {
+        "year": 2016,
+        "ann_return": 0.020827976626628386,
+        "sharpe": 0.18974226036074412,
+        "max_drawdown": -0.08724349085027894,
+        "spy_ann_return": 0.12458169144797027,
+        "alpha_vs_spy": -0.10375371482134188
+      },
+      {
+        "year": 2017,
+        "ann_return": 0.1437520333145228,
+        "sharpe": 1.3654334346590185,
+        "max_drawdown": -0.08171532949671556,
+        "spy_ann_return": 0.1270205609083399,
+        "alpha_vs_spy": 0.01673147240618289
+      },
+      {
+        "year": 2018,
+        "ann_return": -0.07017429524852026,
+        "sharpe": -0.4739845610046145,
+        "max_drawdown": -0.20450511894776435,
+        "spy_ann_return": 0.05451460435849609,
+        "alpha_vs_spy": -0.12468889960701635
+      },
+      {
+        "year": 2019,
+        "ann_return": 0.2597129468371524,
+        "sharpe": 2.0959296460870256,
+        "max_drawdown": -0.12676496511143087,
+        "spy_ann_return": 0.3118554952630679,
+        "alpha_vs_spy": -0.05214254842591548
+      },
+      {
+        "year": 2020,
+        "ann_return": 0.15055520852208693,
+        "sharpe": 0.9570997616203591,
+        "max_drawdown": -0.12469863022907168,
+        "spy_ann_return": 0.07528529343648804,
+        "alpha_vs_spy": 0.07526991508559888
+      },
+      {
+        "year": 2021,
+        "ann_return": 0.2582486843144105,
+        "sharpe": 1.5304711274315541,
+        "max_drawdown": -0.10168906756067841,
+        "spy_ann_return": 0.35388155810376465,
+        "alpha_vs_spy": -0.09563287378935414
+      },
+      {
+        "year": 2022,
+        "ann_return": -0.08983434648290478,
+        "sharpe": -0.7669845443936752,
+        "max_drawdown": -0.16324513869845714,
+        "spy_ann_return": -0.12055940451007507,
+        "alpha_vs_spy": 0.030725058027170293
+      },
+      {
+        "year": 2023,
+        "ann_return": 0.07589869774196667,
+        "sharpe": 0.6558910607797478,
+        "max_drawdown": -0.07202770667980585,
+        "spy_ann_return": 0.2451826885258117,
+        "alpha_vs_spy": -0.16928399078384504
+      },
+      {
+        "year": 2024,
+        "ann_return": 0.2944292019296908,
+        "sharpe": 1.7363111595376604,
+        "max_drawdown": -0.16064561324169968,
+        "spy_ann_return": 0.3589710645242923,
+        "alpha_vs_spy": -0.06454186259460148
+      },
+      {
+        "year": 2025,
+        "ann_return": 0.29044586610906986,
+        "sharpe": 1.8470279671041099,
+        "max_drawdown": -0.14375652802978822,
+        "spy_ann_return": 0.09091834121430176,
+        "alpha_vs_spy": 0.1995275248947681
+      }
+    ],
+    "aggregate": {
+      "mean_sharpe": 0.914,
+      "std_sharpe": 0.993,
+      "mean_alpha": -0.028779,
+      "mean_max_drawdown": -0.126629
+    }
+  },
+  "uplift": {
+    "sharpe": 0.022,
+    "alpha": 0.005039,
+    "max_drawdown": 0.002568
+  }
+}

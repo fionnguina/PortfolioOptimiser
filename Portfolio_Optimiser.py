@@ -152,11 +152,16 @@ if _WALK_FORWARD_CV_MODE:
 _ATTRIBUTION_MODE = "--attribution" in sys.argv
 if _ATTRIBUTION_MODE:
     print("[attr] --attribution detected; will skip dialog + live pipeline")
+# `--crash-hedge-test`: walk-forward CV with crash hedge ON vs OFF.
+# Reports per-fold uplift to test the asymmetric defensive overlay.
+_CRASH_HEDGE_TEST_MODE = "--crash-hedge-test" in sys.argv
+if _CRASH_HEDGE_TEST_MODE:
+    print("[hedge] --crash-hedge-test detected; will skip dialog + live pipeline")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
                        or _TURNOVER_SWEEP_MODE or _WALK_FORWARD_CV_MODE
-                       or _ATTRIBUTION_MODE)
+                       or _ATTRIBUTION_MODE or _CRASH_HEDGE_TEST_MODE)
 
 
 # =====================================================================
@@ -549,6 +554,36 @@ def _load_tlh_pairs() -> dict[str, str]:
 
 TLH_PAIRS = _load_tlh_pairs()
 
+# ============================================================================
+# CRASH HEDGE (asymmetric defensive overlay)
+# ----------------------------------------------------------------------------
+# Attribution showed the engine's defensive slots and assets bleed in bull
+# regimes without providing real crash protection — the "vol-managed beta"
+# framing was actually two different concepts (low-vol smoothing vs true
+# tail hedge) conflated. The crash hedge is the *true tail hedge*: stays
+# OFF in normal regimes (zero carry cost) and engages only when a SPY peak-
+# to-current drawdown trigger fires.
+#
+#   CRASH_HEDGE_ENABLED       Master switch.
+#   CRASH_HEDGE_DD_TRIGGER    DD level at which hedge engages (negative).
+#   CRASH_HEDGE_DD_RELEASE    DD level at which hedge releases (negative,
+#                             less negative than trigger → hysteresis).
+#   CRASH_HEDGE_LOOKBACK_DAYS Rolling window for peak detection.
+#   CRASH_HEDGE_BASKET        Target weights when active. Must sum to 1.
+#                             Default: 60% cash (HBRD.AX) + 40% gold
+#                             (GOLD.AX). Deliberately avoids inverse ETFs
+#                             (BEAR/BBUS) — first-cut conservatism.
+#
+# Hysteresis avoids whipsaw around the threshold: enter at -15%, exit when
+# recovery to -5%. In 2016-2025, this triggers on COVID-2020 + 2022 bear +
+# minor 2018 + minor 2025-Apr — designed to fire well before bottoms.
+# ============================================================================
+CRASH_HEDGE_ENABLED      = False  # off by default; turned on via --crash-hedge-test or live config
+CRASH_HEDGE_DD_TRIGGER   = -0.15  # engage hedge at SPY peak-to-current DD ≤ -15%
+CRASH_HEDGE_DD_RELEASE   = -0.05  # release hedge when DD recovers above -5%
+CRASH_HEDGE_LOOKBACK_DAYS = 252   # rolling 1y peak for DD calculation
+CRASH_HEDGE_BASKET       = {"HBRD.AX": 0.60, "GOLD.AX": 0.40}
+
 
 # === Config snapshot (L16) ===================================================
 # Dump every operationally-meaningful knob at startup so any run.log is
@@ -576,6 +611,11 @@ def _log_config_snapshot() -> None:
     print(f"[config] TLH                   enabled={TLH_ENABLED}  "
           f"min_loss={TLH_MIN_LOSS_PCT*100:+.0f}%  min_$=${TLH_MIN_LOSS_AUD:.0f}  "
           f"cooldown={TLH_COOLDOWN_DAYS}d  pairs={len(TLH_PAIRS)}")
+    print(f"[config] CRASH HEDGE           enabled={CRASH_HEDGE_ENABLED}  "
+          f"trigger={CRASH_HEDGE_DD_TRIGGER*100:+.0f}%DD  "
+          f"release={CRASH_HEDGE_DD_RELEASE*100:+.0f}%DD  "
+          f"lookback={CRASH_HEDGE_LOOKBACK_DAYS}d  "
+          f"basket={CRASH_HEDGE_BASKET}")
     print(f"[config] TARGET PORTFOLIO      ${TARGET_PORTFOLIO_VALUE_AUD:,.0f} AUD")
     print(f"[config] IBKR LIVE PRICES      enabled={USE_IBKR_LIVE_PRICES}  "
           f"host={IBKR_HOST}:{IBKR_PORT}  client_id={IBKR_CLIENT_ID}  "
@@ -916,6 +956,92 @@ def _run_tlh_pass(
         })
         result["n_events"] += 1
     return result
+
+
+def _check_crash_trigger(spy_history, as_of, state: dict,
+                          dd_trigger: float | None = None,
+                          dd_release: float | None = None,
+                          lookback_days: int | None = None) -> bool:
+    """Asymmetric crash hedge trigger with hysteresis.
+
+    Enters HEDGE-ON state when SPY peak-to-current drawdown crosses below
+    dd_trigger (e.g. -15%). Stays ON until drawdown recovers above
+    dd_release (e.g. -5%). The hysteresis prevents whipsaw oscillation
+    around the threshold.
+
+    `state` is a mutable dict carried across calls — initial state should
+    be `{"active": False}`. The function mutates state["active"] in place
+    and also returns the new active flag.
+
+    spy_history: pd.Series of SPY prices, indexed by date.
+    as_of: pd.Timestamp — current evaluation date.
+    """
+    dd_trigger = CRASH_HEDGE_DD_TRIGGER if dd_trigger is None else dd_trigger
+    dd_release = CRASH_HEDGE_DD_RELEASE if dd_release is None else dd_release
+    lookback_days = CRASH_HEDGE_LOOKBACK_DAYS if lookback_days is None else lookback_days
+
+    if spy_history is None or spy_history.empty:
+        return state.get("active", False)
+    hist = spy_history.loc[:as_of]
+    if hist.empty:
+        return state.get("active", False)
+    window = hist.tail(lookback_days)
+    if window.empty:
+        return state.get("active", False)
+    rolling_peak = float(window.max())
+    current = float(window.iloc[-1])
+    if rolling_peak <= 0:
+        return state.get("active", False)
+    dd = (current - rolling_peak) / rolling_peak  # negative for drawdown
+
+    active = bool(state.get("active", False))
+    if not active and dd <= dd_trigger:
+        active = True
+    elif active and dd >= dd_release:
+        active = False
+    state["active"] = active
+    state["last_dd"] = dd
+    return active
+
+
+def _apply_crash_hedge(weights: pd.Series, basket: dict[str, float] | None = None,
+                       available_tickers: pd.Index | None = None) -> pd.Series:
+    """Replace `weights` with the crash-hedge basket.
+
+    If a basket ticker isn't in `available_tickers` (e.g. HBRD.AX before
+    its 2017 listing), its weight is reallocated proportionally to the
+    remaining tickers. Returns a normalised Series indexed like `weights`
+    (zero-weight on non-basket tickers).
+    """
+    basket = CRASH_HEDGE_BASKET if basket is None else basket
+    if not basket:
+        return weights
+    # Filter basket to tickers we actually have data for.
+    if available_tickers is not None:
+        usable = {k: v for k, v in basket.items() if k in available_tickers}
+    else:
+        usable = dict(basket)
+    if not usable:
+        # No basket tickers available — fall back to original weights
+        # rather than zero portfolio (defensive against missing data).
+        return weights
+    total = sum(usable.values())
+    if total <= 0:
+        return weights
+    usable = {k: v / total for k, v in usable.items()}
+    # Build a zero series on the original ticker index, then set basket weights.
+    out = pd.Series(0.0, index=weights.index)
+    for tkr, w in usable.items():
+        if tkr in out.index:
+            out[tkr] = w
+        else:
+            # Ticker not in original weight index — extend index
+            out[tkr] = w
+    # Renormalise (safety against rounding)
+    s = out.sum()
+    if s > 0:
+        out = out / s
+    return out
 
 
 def _is_us_ticker(t) -> bool:
@@ -6401,6 +6527,7 @@ def run_oos_ensemble_walk_forward(
     starting_nav_aud: float = 1_000_000.0,
     skip_rebal_delta: float | None = None,
     turnover_penalty: float = 0.0,
+    crash_hedge: bool = False,
 ) -> dict:
     """Ensemble walk-forward: solve 5 candidates per rebalance, softmax-blend
     by rolling 12M Sortino, hold the blended portfolio for 1 month.
@@ -6495,6 +6622,11 @@ def run_oos_ensemble_walk_forward(
     # for the engine return dict (consumed by Excel/PPT/log writers).
     _tlh_cooldown: dict[str, pd.Timestamp] = {}
     _tlh_events_all: list[dict] = []
+    # Crash-hedge state: hysteresis flag (mutated by _check_crash_trigger).
+    _hedge_state: dict = {"active": False, "last_dd": 0.0}
+    _hedge_active_rebals = 0  # count of rebalances where hedge was active
+    _hedge_n_triggers = 0     # count of OFF→ON transitions
+    _hedge_events: list[dict] = []  # state-change log
 
     def _fy_end_for(date: pd.Timestamp) -> pd.Timestamp:
         d = pd.Timestamp(date)
@@ -6629,6 +6761,41 @@ def run_oos_ensemble_walk_forward(
         if w_blend.empty or w_blend.sum() <= 0:
             continue
         w_blend = w_blend / w_blend.sum()
+
+        # Crash-hedge overlay: if SPY is in a deep enough drawdown (with
+        # hysteresis), override the engine's blended target with the hedge
+        # basket. Runs only if `crash_hedge=True` was passed to the engine.
+        if crash_hedge and benchmark_ticker in px.columns:
+            was_active = bool(_hedge_state.get("active", False))
+            is_active = _check_crash_trigger(
+                spy_history=px[benchmark_ticker],
+                as_of=t,
+                state=_hedge_state,
+            )
+            if is_active:
+                _hedge_active_rebals += 1
+                # Replace blended target with hedge basket. Extend ticker
+                # index so hedge tickers are present even if engine wasn't
+                # holding them.
+                avail = px.columns
+                hedge_w = _apply_crash_hedge(
+                    weights=w_blend.reindex(w_blend.index.union(CRASH_HEDGE_BASKET.keys()))
+                                .fillna(0.0),
+                    basket=CRASH_HEDGE_BASKET,
+                    available_tickers=avail,
+                )
+                hedge_w = hedge_w[hedge_w > 1e-6]
+                if not hedge_w.empty and hedge_w.sum() > 0:
+                    w_blend = hedge_w / hedge_w.sum()
+            # Log state transitions (OFF→ON and ON→OFF) for diagnostics.
+            if is_active != was_active:
+                _hedge_events.append({
+                    "date": t,
+                    "transition": "ON" if is_active else "OFF",
+                    "spy_dd": float(_hedge_state.get("last_dd", 0.0)),
+                })
+                if is_active:
+                    _hedge_n_triggers += 1
 
         # --- Conditional skip: if target weight change is tiny, hold prior
         # weights — saves brokerage + CGT realisation on no-op re-trims.
@@ -6785,6 +6952,9 @@ def run_oos_ensemble_walk_forward(
         "n_skipped": n_skipped,
         "n_executed": n_executed,
         "tlh_events": _tlh_events_all,
+        "hedge_events": _hedge_events,
+        "hedge_active_rebals": _hedge_active_rebals,
+        "hedge_n_triggers": _hedge_n_triggers,
     }
 
 
@@ -8672,6 +8842,269 @@ def _run_attribution() -> int:
 
 if "--attribution" in sys.argv:
     _exit_code = _run_attribution()
+    sys.exit(_exit_code)
+
+
+# === Crash-hedge A/B test (--crash-hedge-test) ==============================
+# Walk-forward CV with crash hedge ON vs OFF. Per-fold uplift table +
+# aggregate verdict. Used to test the asymmetric defensive overlay against
+# the unguarded engine baseline.
+def _run_crash_hedge_test() -> int:
+    print("\n" + "=" * 88)
+    print("CRASH-HEDGE A/B TEST — walk-forward CV (hedge ON vs OFF)")
+    print("=" * 88)
+    print(f"  trigger:  SPY DD ≤ {CRASH_HEDGE_DD_TRIGGER*100:+.0f}% (rolling 1y peak)")
+    print(f"  release:  SPY DD ≥ {CRASH_HEDGE_DD_RELEASE*100:+.0f}% (hysteresis)")
+    print(f"  basket:   {CRASH_HEDGE_BASKET}")
+
+    TRAIN_MONTHS = 24
+    MIN_OOS_YEAR = 2016
+    MIN_FOLD_DAYS = 150
+
+    _hh_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    # Ensure hedge basket tickers are in the universe
+    for tkr in CRASH_HEDGE_BASKET.keys():
+        if tkr not in _hh_tickers:
+            print(f"[hedge-test] WARNING: hedge basket ticker {tkr} not in universe — will be auto-added")
+            _hh_tickers.append(tkr)
+    print(f"[hedge-test] universe: {len(_hh_tickers)} tickers, OOS folds: year ≥ {MIN_OOS_YEAR}")
+    print(f"[hedge-test] downloading full history (max)...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_hh_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[hedge-test] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+
+    def _run_and_fold(hedge_on: bool) -> tuple[pd.Series, dict]:
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(
+            px_aud,
+            train_window_months=TRAIN_MONTHS,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            starting_nav_aud=1_000_000.0,
+            crash_hedge=hedge_on,
+        )
+        elapsed = time.perf_counter() - t1
+        info = {
+            "elapsed_sec": elapsed,
+            "n_executed": int(out.get("n_executed", 0)),
+            "n_skipped": int(out.get("n_skipped", 0)),
+            "hedge_active_rebals": int(out.get("hedge_active_rebals", 0)),
+            "hedge_n_triggers": int(out.get("hedge_n_triggers", 0)),
+            "hedge_events": out.get("hedge_events", []) or [],
+            "cgt_bps_per_year": 0.0,
+        }
+        # CGT drag
+        tax_ser = out.get("rebalance_taxes", pd.Series(dtype=float))
+        strat_rets = out["blended_returns"]
+        if not tax_ser.empty and not strat_rets.empty:
+            years = max(len(strat_rets) / ANNUAL_TRADING_DAYS, 1e-6)
+            info["cgt_bps_per_year"] = float(tax_ser.sum() / years * 10_000)
+        return strat_rets, info
+
+    def _fold_metrics(rets: pd.Series, min_year: int) -> list[dict]:
+        if rets.empty:
+            return []
+        folds = []
+        for yr in sorted(set(rets.index.year)):
+            if yr < min_year:
+                continue
+            mask = (rets.index.year == yr)
+            chunk = rets.loc[mask]
+            if len(chunk) < MIN_FOLD_DAYS:
+                continue
+            chunk_nav = (1.0 + chunk).cumprod()
+            n_days = len(chunk)
+            years_in_chunk = n_days / ANNUAL_TRADING_DAYS
+            ann_ret = float(chunk_nav.iloc[-1] ** (1.0 / years_in_chunk) - 1.0)
+            vol = float(chunk.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+            sharpe = ann_ret / vol if vol > 0 else 0.0
+            dd = float((chunk_nav / chunk_nav.cummax() - 1.0).min())
+            spy_chunk = spy_ret_full.reindex(chunk.index).fillna(0.0)
+            spy_nav = (1.0 + spy_chunk).cumprod()
+            spy_ann = float(spy_nav.iloc[-1] ** (1.0 / years_in_chunk) - 1.0)
+            alpha = ann_ret - spy_ann
+            folds.append({
+                "year": int(yr),
+                "ann_return": ann_ret,
+                "sharpe": sharpe,
+                "max_drawdown": dd,
+                "spy_ann_return": spy_ann,
+                "alpha_vs_spy": alpha,
+            })
+        return folds
+
+    # === Baseline: hedge OFF ===
+    print(f"\n[hedge-test] running BASELINE (hedge OFF)...")
+    base_rets, base_info = _run_and_fold(hedge_on=False)
+    print(f"[hedge-test] baseline done in {base_info['elapsed_sec']:.1f}s "
+          f"({len(base_rets)} OOS days)")
+    base_folds = _fold_metrics(base_rets, MIN_OOS_YEAR)
+
+    # === Treatment: hedge ON ===
+    print(f"\n[hedge-test] running TREATMENT (hedge ON)...")
+    hedge_rets, hedge_info = _run_and_fold(hedge_on=True)
+    print(f"[hedge-test] treatment done in {hedge_info['elapsed_sec']:.1f}s "
+          f"({len(hedge_rets)} OOS days)")
+    print(f"[hedge-test] hedge triggered {hedge_info['hedge_n_triggers']}× "
+          f"(OFF→ON transitions), active on {hedge_info['hedge_active_rebals']} rebalances")
+    if hedge_info["hedge_events"]:
+        print(f"[hedge-test] state transitions:")
+        for e in hedge_info["hedge_events"][:20]:
+            print(f"  {pd.Timestamp(e['date']).date()}  {e['transition']:<3}  "
+                  f"(SPY DD {e['spy_dd']*100:+.1f}%)")
+        if len(hedge_info["hedge_events"]) > 20:
+            print(f"  ... and {len(hedge_info['hedge_events']) - 20} more")
+    hedge_folds = _fold_metrics(hedge_rets, MIN_OOS_YEAR)
+
+    if len(base_folds) < 3 or len(hedge_folds) < 3:
+        print("[hedge-test] insufficient folds; aborting.")
+        return 1
+
+    # Align folds by year
+    base_by_year = {r["year"]: r for r in base_folds}
+    hedge_by_year = {r["year"]: r for r in hedge_folds}
+    common_years = sorted(set(base_by_year.keys()) & set(hedge_by_year.keys()))
+
+    # === Per-fold comparison table ===
+    print("\n" + "=" * 88)
+    print(f"PER-FOLD COMPARISON ({len(common_years)} years)")
+    print("=" * 88)
+    print(f"  {'Year':>5}    {'Baseline':>20}    {'+ Crash Hedge':>20}    {'Δ':>15}")
+    print(f"  {'':>5}    {'Sharpe / α / MaxDD':>20}    {'Sharpe / α / MaxDD':>20}    "
+          f"{'ΔSharpe Δα':>15}")
+    print(f"  {'-'*5}    {'-'*20}    {'-'*20}    {'-'*15}")
+    for yr in common_years:
+        b = base_by_year[yr]
+        h = hedge_by_year[yr]
+        d_sh = h["sharpe"] - b["sharpe"]
+        d_al = h["alpha_vs_spy"] - b["alpha_vs_spy"]
+        print(f"  {yr:>5}    "
+              f"{b['sharpe']:>+5.2f} / {b['alpha_vs_spy']*100:>+5.1f}% / {b['max_drawdown']*100:>+5.1f}%    "
+              f"{h['sharpe']:>+5.2f} / {h['alpha_vs_spy']*100:>+5.1f}% / {h['max_drawdown']*100:>+5.1f}%    "
+              f"{d_sh:>+5.2f}   {d_al*100:>+5.1f}%")
+
+    # === Aggregate ===
+    base_sh = np.array([r["sharpe"] for r in base_folds if r["year"] in common_years])
+    hedge_sh = np.array([r["sharpe"] for r in hedge_folds if r["year"] in common_years])
+    base_al = np.array([r["alpha_vs_spy"] for r in base_folds if r["year"] in common_years])
+    hedge_al = np.array([r["alpha_vs_spy"] for r in hedge_folds if r["year"] in common_years])
+    base_dd = np.array([r["max_drawdown"] for r in base_folds if r["year"] in common_years])
+    hedge_dd = np.array([r["max_drawdown"] for r in hedge_folds if r["year"] in common_years])
+
+    print("\n" + "=" * 88)
+    print("AGGREGATE (mean ± std across folds)")
+    print("=" * 88)
+    print(f"  Sharpe:        baseline {base_sh.mean():+.2f} ± {base_sh.std(ddof=1):.2f}   "
+          f"hedge {hedge_sh.mean():+.2f} ± {hedge_sh.std(ddof=1):.2f}   "
+          f"Δ {hedge_sh.mean() - base_sh.mean():+.2f}")
+    print(f"  α vs SPY:      baseline {base_al.mean()*100:+.2f}% ± {base_al.std(ddof=1)*100:.2f}%   "
+          f"hedge {hedge_al.mean()*100:+.2f}% ± {hedge_al.std(ddof=1)*100:.2f}%   "
+          f"Δ {(hedge_al.mean() - base_al.mean())*100:+.2f}%")
+    print(f"  MaxDD:         baseline {base_dd.mean()*100:+.2f}% (worst {base_dd.min()*100:+.2f}%)   "
+          f"hedge {hedge_dd.mean()*100:+.2f}% (worst {hedge_dd.min()*100:+.2f}%)   "
+          f"Δ {(hedge_dd.mean() - base_dd.mean())*100:+.2f}%")
+    print(f"  CGT bps/yr:    baseline {base_info['cgt_bps_per_year']:.0f}   "
+          f"hedge {hedge_info['cgt_bps_per_year']:.0f}   "
+          f"Δ {hedge_info['cgt_bps_per_year'] - base_info['cgt_bps_per_year']:+.0f}")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    d_sharpe = hedge_sh.mean() - base_sh.mean()
+    d_alpha = hedge_al.mean() - base_al.mean()
+    d_dd = hedge_dd.mean() - base_dd.mean()
+    if d_sharpe > 0.10 and d_dd > 0:
+        print(f"  Reading: hedge IMPROVES Sharpe AND reduces drawdown — keep it on.")
+    elif d_sharpe > 0.05:
+        print(f"  Reading: hedge moderately improves Sharpe. MaxDD impact: {d_dd*100:+.1f}%.")
+    elif d_sharpe > -0.05:
+        print(f"  Reading: hedge ≈ neutral on Sharpe. MaxDD impact: {d_dd*100:+.1f}%.")
+    else:
+        print(f"  Reading: hedge HURTS Sharpe by {d_sharpe:+.2f}. The trigger fires "
+              f"too often or releases too late.")
+    print(f"  N triggers in OOS window: {hedge_info['hedge_n_triggers']}")
+    print(f"  Hedge active on {hedge_info['hedge_active_rebals']} rebalances "
+          f"(out of {hedge_info['n_executed'] + hedge_info['n_skipped']})")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "config": {
+                "dd_trigger": CRASH_HEDGE_DD_TRIGGER,
+                "dd_release": CRASH_HEDGE_DD_RELEASE,
+                "lookback_days": CRASH_HEDGE_LOOKBACK_DAYS,
+                "basket": CRASH_HEDGE_BASKET,
+            },
+            "baseline": {
+                "info": base_info,
+                "folds": base_folds,
+                "aggregate": {
+                    "mean_sharpe": round(float(base_sh.mean()), 3),
+                    "std_sharpe": round(float(base_sh.std(ddof=1)), 3),
+                    "mean_alpha": round(float(base_al.mean()), 6),
+                    "mean_max_drawdown": round(float(base_dd.mean()), 6),
+                },
+            },
+            "hedge": {
+                "info": {k: v for k, v in hedge_info.items() if k != "hedge_events"},
+                "events": [{"date": str(pd.Timestamp(e["date"]).date()),
+                            "transition": e["transition"],
+                            "spy_dd": round(e["spy_dd"], 4)}
+                           for e in hedge_info["hedge_events"]],
+                "folds": hedge_folds,
+                "aggregate": {
+                    "mean_sharpe": round(float(hedge_sh.mean()), 3),
+                    "std_sharpe": round(float(hedge_sh.std(ddof=1)), 3),
+                    "mean_alpha": round(float(hedge_al.mean()), 6),
+                    "mean_max_drawdown": round(float(hedge_dd.mean()), 6),
+                },
+            },
+            "uplift": {
+                "sharpe": round(float(d_sharpe), 3),
+                "alpha": round(float(d_alpha), 6),
+                "max_drawdown": round(float(d_dd), 6),
+            },
+        }
+        json_path = APP_DIR / "crash_hedge_test_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n[hedge-test] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[hedge-test] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("CRASH-HEDGE TEST COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--crash-hedge-test" in sys.argv:
+    _exit_code = _run_crash_hedge_test()
     sys.exit(_exit_code)
 
 
