@@ -622,8 +622,21 @@ CRASH_HEDGE_BASKET       = {"HBRD.AX": 0.60, "GOLD.AX": 0.40}
 #
 # To revert to the 5-slot blend without hedge, set both to None / False.
 # ============================================================================
-PRODUCTION_SLOT_OVERRIDE = {"Stretch (SPY+25%)": 1.0}
-PRODUCTION_CRASH_HEDGE   = True
+# REVERTED 2026-06-19: empirical live run showed the Stretch+hedge config
+# made Sharpe materially WORSE (0.99 → 0.83) and full-window MaxDD MUCH
+# deeper (-20.5% → -34.4%) for negligible return uplift (+0.3%/yr, ~+$11k
+# over 10y on $100k). The sweeps that justified Stretch+hedge used FOLD-
+# MEAN MaxDD which understates multi-year peak-to-trough drawdowns. The
+# GFC stress test also used a GOLD-only basket (HBRD.AX didn't list till
+# 2017) which inflated hedge performance. Both pieces of evidence were
+# measurement artifacts — the live full-period numbers are the truth.
+#
+# Reverted to legacy 5-slot blend with no hedge. To re-enable, set:
+#   PRODUCTION_SLOT_OVERRIDE = {"Stretch (SPY+25%)": 1.0}
+#   PRODUCTION_CRASH_HEDGE   = True
+# (and validate with FULL-PERIOD peak-to-trough MaxDD, not fold-mean).
+PRODUCTION_SLOT_OVERRIDE = None
+PRODUCTION_CRASH_HEDGE   = False
 
 
 # === Config snapshot (L16) ===================================================
@@ -10362,22 +10375,33 @@ if not oos_returns_daily.empty and not oos_prices_aud_long.empty:
         print(f"[oos] metrics computation failed: {_e}")
 globals()["oos_metrics_table"] = oos_metrics_table
 
+# === Crash-diagnostic checkpoints (added 2026-06-19 to chase a silent dist
+# exe crash that died between [oos] metrics computed and Excel write). Keep
+# until the dist run reliably proceeds past these checkpoints.
+print(f"[debug-crash] CHECKPOINT 1: passed OOS metrics block")
 # Tables used later
 n_opt = len(securities_opt)
+print(f"[debug-crash] CHECKPOINT 2: n_opt={n_opt}")
 cov_plus = Sigma_opt.copy()
 cov_plus.loc[:, 'w'] = 0.0
 cov_plus.loc['w', :] = 0.0
 cov_plus.loc['w', 'w'] = 0.0
+print(f"[debug-crash] CHECKPOINT 3: cov_plus shape={cov_plus.shape}")
 exp_ret_df = mu_vec_opt.rename(exp_ret_label).to_frame()
+print(f"[debug-crash] CHECKPOINT 4: exp_ret_df shape={exp_ret_df.shape}")
 
 # FX map used by Holdings + trade plan
 usd_aud    = get_usd_aud_fx()
+print(f"[debug-crash] CHECKPOINT 5: usd_aud={usd_aud}")
 fx_map_all = fx_to_aud_for_tickers(prices.columns, usd_aud)
+print(f"[debug-crash] CHECKPOINT 6: fx_map_all len={len(fx_map_all)}")
 
 # ---- 10D) Reopen Excel and WRITE everything, then close ----
 if USE_XLWINGS:
+    print(f"[debug-crash] CHECKPOINT 7: about to spawn xw.App() — Excel COM")
     try:
         with xw.App(visible=False, add_book=False) as app:
+            print(f"[debug-crash] CHECKPOINT 8: xw.App spawned OK")
             filename = os.path.abspath(filename)
             wb = app.books.open(filename, update_links=False, read_only=False)      
             
@@ -11989,7 +12013,9 @@ if USE_XLWINGS:
             wb.close()
 
     except Exception as e:
+        import traceback as _tb_xl
         print(f"[Excel fallback] xlwings/COM error â†’ exporting CSVs instead: {e}")
+        print(f"[Excel fallback] full traceback:\n{_tb_xl.format_exc()}")
         export_dir = os.path.join(os.path.dirname(filename), "Exports")
         try: os.makedirs(export_dir, exist_ok=True)
         except Exception: pass
