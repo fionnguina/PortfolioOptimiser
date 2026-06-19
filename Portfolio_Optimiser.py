@@ -137,10 +137,19 @@ if _REBAL_SKIP_SWEEP_MODE:
 _TURNOVER_SWEEP_MODE = "--turnover-penalty-sweep" in sys.argv
 if _TURNOVER_SWEEP_MODE:
     print("[turnover-sweep] --turnover-penalty-sweep detected; will skip dialog + live pipeline")
+# `--walk-forward-cv`: run engine once on full history, slice OOS returns
+# into non-overlapping calendar-year folds, report per-fold Sharpe + mean ±
+# std. Gives N independent OOS observations of the current engine config
+# instead of the single point estimate from dev/validation split. Used as
+# the preferred statistical hygiene tool for parameter selection — does NOT
+# burn the validation lock-box budget.
+_WALK_FORWARD_CV_MODE = "--walk-forward-cv" in sys.argv
+if _WALK_FORWARD_CV_MODE:
+    print("[wf-cv] --walk-forward-cv detected; will skip dialog + live pipeline")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
-                       or _TURNOVER_SWEEP_MODE)
+                       or _TURNOVER_SWEEP_MODE or _WALK_FORWARD_CV_MODE)
 
 
 # =====================================================================
@@ -8092,6 +8101,248 @@ def _run_turnover_penalty_sweep() -> int:
 
 if "--turnover-penalty-sweep" in sys.argv:
     _exit_code = _run_turnover_penalty_sweep()
+    sys.exit(_exit_code)
+
+
+# === Walk-forward CV (--walk-forward-cv) ===================================
+# Multi-fold OOS evaluation: slice the walk-forward output into N non-
+# overlapping calendar-year folds and report per-fold Sharpe + mean ± std.
+# Designed as the preferred statistical hygiene tool for parameter
+# selection — does NOT touch the validation lock-box, so it doesn't burn
+# the peek budget documented in ARCHITECTURE.md §10.
+#
+# Each fold gives 1 year of OOS observations (~252 trading days). For
+# 10-year history this yields 7-8 independent Sharpe estimates. Standard
+# error of mean Sharpe scales as 1/sqrt(N), so 8 folds ≈ 35% noise
+# reduction vs single-window evaluation.
+#
+# Future extension: wrap this in a parameter-sweep loop (gamma, lambda_temp,
+# etc.) to do robust parameter selection — winner = max mean Sharpe across
+# folds with reasonable std, NOT max single-window Sharpe.
+def _run_walk_forward_cv() -> int:
+    print("\n" + "=" * 88)
+    print("WALK-FORWARD CV — multi-fold OOS evaluation of current engine config")
+    print("=" * 88)
+
+    TRAIN_MONTHS = 24
+    # Modern universe filter: most .AX ETFs in the engine's universe don't
+    # exist before 2013 (e.g. NDQ.AX listed 2015, MTUM.AX 2014, A200.AX 2018).
+    # Including 1986-2012 folds in the aggregate distorts the mean Sharpe
+    # because the engine ran on a degraded 1-5 ticker subset. Filter to
+    # post-2014 so the 24-month training window starts on full universe and
+    # the first OOS year is 2016 (covering 10 modern folds for ~10y history).
+    MIN_OOS_YEAR = 2016
+    _wf_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[wf-cv] universe: {len(_wf_tickers)} tickers")
+    print(f"[wf-cv] modern-universe filter: OOS folds restricted to year ≥ {MIN_OOS_YEAR}")
+    print(f"[wf-cv] downloading full history (max)...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_wf_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[wf-cv] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers, "
+          f"{px_aud.index.min().date()} → {px_aud.index.max().date()}) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    # Single engine run over the full window — folds are just slices of the
+    # OOS output, not re-runs of the engine. This is cheaper AND preserves
+    # the engine's state-dependent lot-book / TLH / cooldown behaviour,
+    # which is the whole point of walk-forward.
+    print(f"\n[wf-cv] running engine on full history (single walk-forward)...")
+    t1 = time.perf_counter()
+    out = run_oos_ensemble_walk_forward(
+        px_aud,
+        train_window_months=TRAIN_MONTHS,
+        rebalance=REBALANCE_FREQ,
+        benchmark_ticker="SPY",
+        score_lookback_days=252,
+        lambda_temp=3.0,
+        starting_nav_aud=1_000_000.0,
+    )
+    strat_rets = out["blended_returns"]
+    if strat_rets.empty:
+        print("[wf-cv] engine returned empty series; aborting.")
+        return 1
+    print(f"[wf-cv] engine done ({len(strat_rets)} OOS days, "
+          f"{strat_rets.index.min().date()} → {strat_rets.index.max().date()}) "
+          f"in {time.perf_counter()-t1:.1f}s")
+
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+
+    # Build folds: one per calendar year with ≥150 OOS days to keep
+    # annualisation honest. Partial years at start/end are dropped.
+    # Pre-MIN_OOS_YEAR folds are skipped (degraded universe — see above).
+    MIN_FOLD_DAYS = 150
+    years_present = sorted(set(strat_rets.index.year))
+    folds: list[dict] = []
+    skipped_pre_modern = 0
+    for yr in years_present:
+        if yr < MIN_OOS_YEAR:
+            skipped_pre_modern += 1
+            continue
+        mask = (strat_rets.index.year == yr)
+        chunk = strat_rets.loc[mask]
+        if len(chunk) < MIN_FOLD_DAYS:
+            continue
+        chunk_nav = (1.0 + chunk).cumprod()
+        n_days = len(chunk)
+        years_in_chunk = n_days / ANNUAL_TRADING_DAYS
+        ann_ret = float(chunk_nav.iloc[-1] ** (1.0 / years_in_chunk) - 1.0)
+        vol = float(chunk.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        sharpe = ann_ret / vol if vol > 0 else 0.0
+        downside = chunk[chunk < 0].std() * np.sqrt(ANNUAL_TRADING_DAYS)
+        sortino = ann_ret / float(downside) if float(downside) > 0 else 0.0
+        dd = float((chunk_nav / chunk_nav.cummax() - 1.0).min())
+
+        spy_chunk = spy_ret_full.reindex(chunk.index).fillna(0.0)
+        spy_nav = (1.0 + spy_chunk).cumprod()
+        spy_ann = float(spy_nav.iloc[-1] ** (1.0 / years_in_chunk) - 1.0)
+        alpha = ann_ret - spy_ann
+
+        folds.append({
+            "year": int(yr),
+            "n_days": int(n_days),
+            "ann_return": ann_ret,
+            "sharpe": sharpe,
+            "sortino": sortino,
+            "max_drawdown": dd,
+            "spy_ann_return": spy_ann,
+            "alpha_vs_spy": alpha,
+        })
+
+    if len(folds) < 3:
+        print(f"[wf-cv] only {len(folds)} folds with ≥{MIN_FOLD_DAYS} days; "
+              f"need at least 3 for meaningful aggregation. Aborting.")
+        return 1
+
+    if skipped_pre_modern:
+        print(f"\n[wf-cv] skipped {skipped_pre_modern} pre-{MIN_OOS_YEAR} folds "
+              f"(degraded universe — most .AX ETFs did not exist yet)")
+
+    # === Fold-by-fold table ===
+    print("\n" + "=" * 88)
+    print(f"PER-FOLD OOS METRICS ({len(folds)} non-overlapping years, "
+          f"modern universe only)")
+    print("=" * 88)
+    print(f"  {'Year':>5} {'Days':>5} {'Ann Ret':>9} {'Sharpe':>7} "
+          f"{'Sortino':>8} {'MaxDD':>8} {'SPY Ret':>9} {'α(SPY)':>8}")
+    print(f"  {'-'*5} {'-'*5} {'-'*9} {'-'*7} {'-'*8} {'-'*8} {'-'*9} {'-'*8}")
+    for r in folds:
+        print(f"  {r['year']:>5} {r['n_days']:>5} "
+              f"{r['ann_return']*100:>+8.2f}% "
+              f"{r['sharpe']:>7.2f} "
+              f"{r['sortino']:>8.2f} "
+              f"{r['max_drawdown']*100:>+7.2f}% "
+              f"{r['spy_ann_return']*100:>+8.2f}% "
+              f"{r['alpha_vs_spy']*100:>+7.2f}%")
+
+    # === Aggregate stats ===
+    sharpe_arr = np.array([r["sharpe"] for r in folds], dtype=float)
+    alpha_arr = np.array([r["alpha_vs_spy"] for r in folds], dtype=float)
+    ret_arr = np.array([r["ann_return"] for r in folds], dtype=float)
+    dd_arr = np.array([r["max_drawdown"] for r in folds], dtype=float)
+
+    mean_sharpe = float(sharpe_arr.mean())
+    std_sharpe = float(sharpe_arr.std(ddof=1)) if len(sharpe_arr) > 1 else 0.0
+    se_sharpe = std_sharpe / np.sqrt(len(sharpe_arr))
+    t_stat_sharpe = mean_sharpe / se_sharpe if se_sharpe > 0 else 0.0
+
+    mean_alpha = float(alpha_arr.mean())
+    std_alpha = float(alpha_arr.std(ddof=1)) if len(alpha_arr) > 1 else 0.0
+    se_alpha = std_alpha / np.sqrt(len(alpha_arr))
+    t_stat_alpha = mean_alpha / se_alpha if se_alpha > 0 else 0.0
+
+    n_positive_alpha = int((alpha_arr > 0).sum())
+    n_beat_spy_sharpe = int((np.array([r["sharpe"] - (r["spy_ann_return"] /
+                              (np.std([r["ann_return"]]) + 1e-9))
+                              for r in folds]) > 0).sum())
+
+    # === Aggregate report ===
+    print("\n" + "=" * 88)
+    print("AGGREGATE (mean ± std across folds)")
+    print("=" * 88)
+    print(f"  Sharpe:        {mean_sharpe:+.2f} ± {std_sharpe:.2f}   "
+          f"(SE {se_sharpe:.3f}, t-stat {t_stat_sharpe:+.2f})")
+    print(f"  Ann return:    {ret_arr.mean()*100:+.2f}% ± {ret_arr.std(ddof=1)*100:.2f}%")
+    print(f"  α vs SPY:      {mean_alpha*100:+.2f}% ± {std_alpha*100:.2f}%   "
+          f"(SE {se_alpha*100:.2f}%, t-stat {t_stat_alpha:+.2f})")
+    print(f"  MaxDD:         {dd_arr.mean()*100:+.2f}% ± {dd_arr.std(ddof=1)*100:.2f}%   "
+          f"(worst single year: {dd_arr.min()*100:+.2f}%)")
+    print(f"  Years with α > 0: {n_positive_alpha}/{len(folds)}")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    if t_stat_alpha > 2.0:
+        print(f"  α t-stat {t_stat_alpha:+.2f} > 2 → statistically meaningful positive alpha.")
+    elif t_stat_alpha > 1.0:
+        print(f"  α t-stat {t_stat_alpha:+.2f} between 1-2 → weak positive signal, not significant.")
+    elif t_stat_alpha > -1.0:
+        print(f"  α t-stat {t_stat_alpha:+.2f} between -1 and +1 → indistinguishable from zero.")
+    else:
+        print(f"  α t-stat {t_stat_alpha:+.2f} < -1 → meaningful negative alpha vs SPY.")
+    if std_sharpe < 0.30:
+        print(f"  Sharpe std {std_sharpe:.2f} < 0.30 → low fold-to-fold variation, engine stable.")
+    elif std_sharpe < 0.60:
+        print(f"  Sharpe std {std_sharpe:.2f} between 0.30-0.60 → moderate fold variation.")
+    else:
+        print(f"  Sharpe std {std_sharpe:.2f} > 0.60 → high fold variation, regime-dependent.")
+    print(f"  Use this as baseline. For parameter sweeps via walk-forward CV, "
+          f"a candidate must improve MEAN sharpe across folds — not just the best single year.")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "n_folds": len(folds),
+            "folds": folds,
+            "aggregate": {
+                "mean_sharpe": round(mean_sharpe, 3),
+                "std_sharpe": round(std_sharpe, 3),
+                "se_sharpe": round(se_sharpe, 4),
+                "t_stat_sharpe": round(t_stat_sharpe, 3),
+                "mean_alpha_vs_spy": round(mean_alpha, 6),
+                "std_alpha_vs_spy": round(std_alpha, 6),
+                "se_alpha_vs_spy": round(se_alpha, 6),
+                "t_stat_alpha": round(t_stat_alpha, 3),
+                "mean_ann_return": round(float(ret_arr.mean()), 6),
+                "mean_max_drawdown": round(float(dd_arr.mean()), 6),
+                "worst_max_drawdown": round(float(dd_arr.min()), 6),
+                "n_positive_alpha_folds": n_positive_alpha,
+            },
+        }
+        json_path = APP_DIR / "walk_forward_cv_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n[wf-cv] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[wf-cv] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("WALK-FORWARD CV COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--walk-forward-cv" in sys.argv:
+    _exit_code = _run_walk_forward_cv()
     sys.exit(_exit_code)
 
 

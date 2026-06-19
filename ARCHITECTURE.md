@@ -386,6 +386,31 @@ Artefacts: `dev_validation_summary.json` (machine-readable metrics) and `dev_val
 
 See [`project-scale-analysis-2026-06-18`] memory for the user's framing.
 
+### Peek budget (multiple-comparisons hygiene)
+
+Every time the validation lock-box is opened, information about validation behaviour leaks into how we make future decisions — even if we don't intend it. After enough peeks the "lock box" stops being a true blind test. This is the garden-of-forking-paths problem in statistics. Dev/val catches *single-hypothesis* overfitting; it does NOT catch *across-experiments* overfitting from running many sweeps.
+
+**Rules to limit the damage:**
+
+1. **Budget**: at most **7 peeks** against the current validation window before it must be refreshed.
+2. **Bundle changes**: group ≥3 candidate features into ONE peek. Validate the bundle, not each feature separately. A failed bundle gets dissected on the dev window only.
+3. **Prefer walk-forward CV for parameter selection**: use `--walk-forward-cv` to get N independent OOS estimates *within the dev window* (and including validation only after refresh). This does NOT consume peek budget.
+4. **Refresh**: when peeks ≥ 7, expand dev to include current validation, carve new lock-box from `today → today + 12-24 months`. Document the refresh date in this file.
+
+**Current peek count:** 4 used (baseline `--dev-validation`, TLH `--dev-validation`, `--rebal-skip-sweep`, `--turnover-penalty-sweep`). **3 remaining** before refresh.
+
+### Walk-forward CV — preferred parameter-selection tool
+
+```powershell
+& ".\.venv\Scripts\python.exe" Portfolio_Optimiser.py --walk-forward-cv
+```
+
+Runs the engine once on full history, slices OOS into non-overlapping calendar-year folds (~7-8 folds for a 10-year window), reports per-fold Sharpe / α / MaxDD plus mean ± std and t-statistics. Each fold is an independent OOS observation, so 8 folds ≈ 35% noise reduction on the mean Sharpe estimate vs a single-window test.
+
+**For parameter sweeps:** wrap the engine call in a loop over candidate values; winner = max **mean** Sharpe across folds with low std. NOT max single-window Sharpe — that's what we got burned on with the cost-aware solver (DEV winner +0.35 Sharpe, validation -0.14).
+
+Artefacts: `walk_forward_cv_summary.json`.
+
 ---
 
 ## 11. Glossary
