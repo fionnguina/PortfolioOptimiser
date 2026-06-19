@@ -13905,6 +13905,171 @@ def export_to_ppt(results, trades, charts=None):
         except Exception as _e_reorder:
             print(f"[pptx] Roadshow reorder skipped: {_e_reorder}")
 
+        # --- FINAL SLIDE: Headline Metrics Dashboard (dump slide) ---
+        # All the key numbers in one place: build/config stamp, 10Y headline
+        # metrics vs SPY, engine totals (TLH, CGT, brokerage), live regime
+        # mix + top positions. Added 2026-06-19 per user request — useful as
+        # a quick-reference tear sheet without flipping through the deck.
+        try:
+            dump_layout = prs.slide_layouts[20]
+            dump_slide = prs.slides.add_slide(dump_layout)
+            if dump_slide.shapes.title:
+                dump_slide.shapes.title.text = "Engine Metrics Dashboard"
+
+            # Build stamp + production config line (italic, in title ribbon)
+            _prod_slot = (next(iter(PRODUCTION_SLOT_OVERRIDE.keys()))
+                           if PRODUCTION_SLOT_OVERRIDE else "5-slot ensemble blend")
+            _hedge_lbl = "ON" if PRODUCTION_CRASH_HEDGE else "off"
+            _stamp_text = (f"Build {_BUILD_GIT_SHA} at {_BUILD_TIME}    |    "
+                            f"Production: {_prod_slot}  ·  Crash hedge: {_hedge_lbl}  ·  "
+                            f"CGT: {int(CGT_CONFIG['marginal_tax_rate']*100)}% MTR")
+            _stamp_box = dump_slide.shapes.add_textbox(Cm(2.15), Cm(1.85), Cm(21.80), Cm(0.45))
+            _stf = _stamp_box.text_frame
+            _stf.clear()
+            _stf.word_wrap = False
+            _stf.margin_left = 0
+            _stp = _stf.paragraphs[0]
+            _stp.text = _stamp_text
+            _stp.font.size = Pt(10)
+            _stp.font.italic = True
+            _stp.font.color.rgb = RGBColor(255, 255, 255)
+
+            # === HEADLINE METRICS — Strategy vs SPY two-column comparison ===
+            _mt = globals().get("oos_metrics_table", None)
+            def _mt_get(metric, horizon, series):
+                try:
+                    return float(_mt.loc[metric, (horizon, series)])
+                except Exception:
+                    return None
+
+            # Big numbers: 10Y Strategy vs SPY, side-by-side
+            _box_metrics = dump_slide.shapes.add_textbox(Cm(1.5), Cm(3.7), Cm(22.5), Cm(7.0))
+            _mtf = _box_metrics.text_frame
+            _mtf.clear()
+            _mtf.word_wrap = False
+            _mtf.margin_left = Cm(0.3)
+            _mtf.margin_top = Cm(0.3)
+
+            def _add_line(tf, text, size=14, bold=False, color=(40, 40, 40), align=PP_ALIGN.LEFT, first=False):
+                p = tf.paragraphs[0] if first else tf.add_paragraph()
+                p.text = text
+                p.font.size = Pt(size)
+                p.font.bold = bold
+                p.font.color.rgb = RGBColor(*color)
+                p.alignment = align
+                return p
+
+            _add_line(_mtf, "10-YEAR HEADLINE (since OOS start)", size=12, bold=True,
+                       color=(31, 78, 161), first=True)
+            _add_line(_mtf, "", size=8)
+
+            def _row(label, s_val, b_val, fmt="{:+.2f}%", scale=100.0):
+                if s_val is None or b_val is None:
+                    s_str = b_str = "?"
+                else:
+                    s_str = fmt.format(s_val * scale) if scale != 1 else fmt.format(s_val)
+                    b_str = fmt.format(b_val * scale) if scale != 1 else fmt.format(b_val)
+                _add_line(_mtf, f"  {label:<28}  Strategy: {s_str:>10}    SPY (AUD): {b_str:>10}",
+                           size=13, bold=False)
+
+            _row("Annualised Return:",
+                  _mt_get("Annualised Return", "10Y", "Strategy"),
+                  _mt_get("Annualised Return", "10Y", "SPY (AUD)"))
+            _row("Sharpe Ratio:",
+                  _mt_get("Sharpe Ratio", "10Y", "Strategy"),
+                  _mt_get("Sharpe Ratio", "10Y", "SPY (AUD)"),
+                  fmt="{:.2f}", scale=1)
+            _row("Sortino Ratio:",
+                  _mt_get("Sortino Ratio", "10Y", "Strategy"),
+                  _mt_get("Sortino Ratio", "10Y", "SPY (AUD)"),
+                  fmt="{:.2f}", scale=1)
+            _row("Max Drawdown:",
+                  _mt_get("Max Drawdown", "10Y", "Strategy"),
+                  _mt_get("Max Drawdown", "10Y", "SPY (AUD)"))
+            # Alpha vs SPY — Strategy only
+            _alpha_10y = _mt_get("Alpha vs SPY (ann)", "10Y", "Strategy")
+            _alpha_str = f"{_alpha_10y*100:+.2f}%/yr" if _alpha_10y is not None else "?"
+            _add_line(_mtf, f"  {'Alpha vs SPY (annualised):':<28}  Strategy: {_alpha_str:>14}",
+                       size=13, bold=False)
+            _add_line(_mtf, "", size=8)
+            # 3Y / 5Y / 10Y Sharpe quick-glance line
+            _sh3 = _mt_get("Sharpe Ratio", "3Y", "Strategy")
+            _sh5 = _mt_get("Sharpe Ratio", "5Y", "Strategy")
+            _sh10 = _mt_get("Sharpe Ratio", "10Y", "Strategy")
+            _add_line(_mtf,
+                       f"  Sharpe across horizons:    3Y {_sh3:.2f}  ·  5Y {_sh5:.2f}  ·  10Y {_sh10:.2f}"
+                       if all(x is not None for x in (_sh3, _sh5, _sh10))
+                       else "  (horizon Sharpe data unavailable)",
+                       size=12, bold=True, color=(31, 78, 161))
+
+            # === ENGINE TOTALS (10Y OOS) ===
+            _box_engine = dump_slide.shapes.add_textbox(Cm(1.5), Cm(11.0), Cm(22.5), Cm(3.0))
+            _etf = _box_engine.text_frame
+            _etf.clear()
+            _etf.word_wrap = False
+            _etf.margin_left = Cm(0.3)
+
+            _add_line(_etf, "ENGINE TOTALS (10Y OOS window)", size=12, bold=True,
+                       color=(31, 78, 161), first=True)
+            _tlh_events_ds = globals().get("oos_tlh_events", []) or []
+            _tlh_n = len(_tlh_events_ds)
+            _tlh_loss = float(sum(e.get("loss_aud", 0.0) for e in _tlh_events_ds))
+            _eff_st = _effective_cgt_rate(short_term=True)
+            _eff_lt = _effective_cgt_rate(short_term=False)
+            _tax_saved_est = _tlh_loss * (_eff_st + _eff_lt) / 2.0
+            _cost_ser = globals().get("oos_rebalance_costs", pd.Series(dtype=float))
+            _tax_ser = globals().get("oos_rebalance_taxes", pd.Series(dtype=float))
+            _oos_rets = globals().get("oos_returns_daily", pd.Series(dtype=float))
+            _years = max(len(_oos_rets) / ANNUAL_TRADING_DAYS, 1e-6) if isinstance(_oos_rets, pd.Series) else 1.0
+            _brk_bps = (float(_cost_ser.sum()) / _years * 10_000) if not _cost_ser.empty else 0.0
+            _cgt_bps = (float(_tax_ser.sum()) / _years * 10_000) if not _tax_ser.empty else 0.0
+            _add_line(_etf, f"  TLH events: {_tlh_n}    ·    Loss realised: ${_tlh_loss:,.0f}"
+                              f"    ·    Tax saved est (gross): ${_tax_saved_est:,.0f}", size=11)
+            _add_line(_etf, f"  Brokerage drag: {_brk_bps:.0f} bps/yr"
+                              f"    ·    CGT drag: {_cgt_bps:.0f} bps/yr"
+                              f"    ·    Total cost: {_brk_bps + _cgt_bps:.0f} bps/yr", size=11)
+
+            # === LIVE RECOMMENDATION (today) ===
+            _box_live = dump_slide.shapes.add_textbox(Cm(1.5), Cm(14.3), Cm(22.5), Cm(2.5))
+            _ltf = _box_live.text_frame
+            _ltf.clear()
+            _ltf.word_wrap = True
+            _ltf.margin_left = Cm(0.3)
+
+            _add_line(_ltf, "LIVE RECOMMENDATION (today)", size=12, bold=True,
+                       color=(31, 78, 161), first=True)
+            _mix_live = globals().get("ensemble_mix_live", pd.Series(dtype=float))
+            if isinstance(_mix_live, pd.Series) and not _mix_live.empty:
+                _abbr2 = {"Modest (SPY+0%)": "Modest", "Aggressive (SPY+5%)": "Agg",
+                           "Bold (SPY+10%)": "Bold", "Maximum (SPY+15%)": "Max",
+                           "Stretch (SPY+25%)": "Stretch"}
+                _mix_parts = [f"{_abbr2.get(n, n)} {float(_mix_live.get(n, 0))*100:.0f}%"
+                               for n in ENSEMBLE_SLOT_NAMES if n in _mix_live.index]
+                _add_line(_ltf, f"  Regime mix:  {' · '.join(_mix_parts)}", size=11)
+            _w_live = globals().get("W_ENSEMBLE_SER", pd.Series(dtype=float))
+            if isinstance(_w_live, pd.Series) and not _w_live.empty:
+                _top5 = _w_live.nlargest(5)
+                _top_parts = [f"{str(k).replace('.AX','')} {float(v)*100:.0f}%"
+                               for k, v in _top5.items()]
+                _add_line(_ltf, f"  Top 5 positions:  {' · '.join(_top_parts)}", size=11)
+
+            # === Footer timestamp ===
+            _ftext = (f"Generated {pd.Timestamp.now().isoformat(timespec='seconds')}    ·    "
+                       f"Metrics from {len(_oos_rets)}-day OOS walk-forward")
+            _foot_box = dump_slide.shapes.add_textbox(Cm(1.5), Cm(17.3), Cm(22.5), Cm(0.6))
+            _fft = _foot_box.text_frame
+            _fft.clear()
+            _ffp = _fft.paragraphs[0]
+            _ffp.text = _ftext
+            _ffp.font.size = Pt(9)
+            _ffp.font.italic = True
+            _ffp.font.color.rgb = RGBColor(120, 120, 120)
+            _ffp.alignment = PP_ALIGN.CENTER
+
+            print(f"[pptx] Engine Metrics Dashboard slide added (last position)")
+        except Exception as _e_dump:
+            print(f"[pptx] Dashboard slide skipped: {_e_dump}")
+
         tmp_path = ppt_path.replace(".pptx", ".__tmp__.pptx")
         prs.save(tmp_path)
         os.replace(tmp_path, ppt_path)
