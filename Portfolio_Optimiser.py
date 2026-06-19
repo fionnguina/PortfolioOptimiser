@@ -179,6 +179,12 @@ if _STRETCH_HEDGE_SWEEP_MODE:
 _SHOW_METRICS_HISTORY_MODE = "--show-metrics-history" in sys.argv
 if _SHOW_METRICS_HISTORY_MODE:
     print("[metrics-history] --show-metrics-history detected; will print history then exit")
+# `--factor-recs`: preview the trailing-3M factor-momentum auto-recommendation.
+# Pure preview — no engine impact. Use to see what tilts WOULD be applied if
+# auto-tilts were turned on as a baseline.
+_FACTOR_RECS_MODE = "--factor-recs" in sys.argv
+if _FACTOR_RECS_MODE:
+    print("[factor-recs] --factor-recs detected; will print recommendation table then exit")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
@@ -187,7 +193,8 @@ _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _CRASH_HEDGE_RELEASE_SWEEP_MODE
                        or _STRETCH_ONLY_TEST_MODE
                        or _STRETCH_HEDGE_SWEEP_MODE
-                       or _SHOW_METRICS_HISTORY_MODE)
+                       or _SHOW_METRICS_HISTORY_MODE
+                       or _FACTOR_RECS_MODE)
 
 
 # =====================================================================
@@ -766,6 +773,116 @@ def _show_metrics_history(max_rows: int = 12) -> int:
 if _SHOW_METRICS_HISTORY_MODE:
     _exit_code = _show_metrics_history()
     sys.exit(_exit_code)
+
+
+def _run_factor_recs() -> int:
+    """Preview the auto-recommended factor tilts at multiple lookback windows.
+
+    Downloads US FF5+MOM factor data, computes trailing 3M/6M/12M Sharpe per
+    factor, and prints both the raw stats and the recommended tilt targets at
+    each window. Lets the user eyeball whether the recommender is picking the
+    right horses before any deeper integration into the engine.
+    """
+    print("\n" + "=" * 88)
+    print("FACTOR TILT RECOMMENDATIONS — trailing-window auto-scorer")
+    print("=" * 88)
+    print("  Score: each factor's annualised Sharpe over the trailing window")
+    print(f"  Tilt magnitude: Sharpe × {FACTOR_TILT_SHARPE_TO_MAG:.2f}, "
+          f"clipped to ±{FACTOR_TILT_MAX_MAGNITUDE:.2f}")
+    print(f"  Region: US (most relevant given universe concentration)")
+    print()
+    try:
+        ff = get_ff5_mom_daily(region="US")
+    except Exception as e:
+        print(f"[factor-recs] failed to load FF5+MOM data: {e}")
+        return 1
+    if ff is None or ff.empty:
+        print("[factor-recs] no FF5 data returned; aborting.")
+        return 1
+    last_date = ff.index.max()
+    print(f"  FF5+MOM data: {ff.index.min().date()} → {last_date.date()}  "
+          f"({len(ff)} daily obs)")
+    print()
+
+    LOOKBACK_WINDOWS = [
+        ("3M", 63),
+        ("6M", 126),
+        ("12M", 252),
+    ]
+    # Build per-window stats
+    print(f"  {'Factor':<8} " + "  ".join(
+        f"{lbl + ' AnnRet':>11} {lbl + ' AnnVol':>11} {lbl + ' Sharpe':>11}"
+        for lbl, _ in LOOKBACK_WINDOWS))
+    print(f"  {'-'*8} " + "  ".join(
+        f"{'-'*11} {'-'*11} {'-'*11}" for _ in LOOKBACK_WINDOWS))
+    per_window_stats = {lbl: compute_factor_recent_stats(ff, lookback_days=days)
+                         for lbl, days in LOOKBACK_WINDOWS}
+    for f in FACTOR_NAMES:
+        row_parts = []
+        for lbl, _ in LOOKBACK_WINDOWS:
+            s = per_window_stats[lbl]
+            if f in s.index:
+                r = float(s.loc[f, "ann_return"])
+                v = float(s.loc[f, "ann_vol"])
+                sh = float(s.loc[f, "sharpe"])
+                row_parts.append(f"{r*100:>+10.2f}%  {v*100:>+10.2f}%  {sh:>+11.2f}")
+            else:
+                row_parts.append(f"{'?':>11} {'?':>11} {'?':>11}")
+        print(f"  {f:<8} " + "  ".join(row_parts))
+    print()
+
+    print("=" * 88)
+    print("RECOMMENDED TILT TARGETS (Sharpe-scaled, clipped)")
+    print("=" * 88)
+    print(f"  {'Factor':<8} {'3M tilt':>11} {'6M tilt':>11} {'12M tilt':>11}  Reading")
+    print(f"  {'-'*8} {'-'*11} {'-'*11} {'-'*11}  {'-'*40}")
+    recs_3m = auto_recommend_factor_tilts(ff, lookback_days=63)
+    recs_6m = auto_recommend_factor_tilts(ff, lookback_days=126)
+    recs_12m = auto_recommend_factor_tilts(ff, lookback_days=252)
+    for f in FACTOR_NAMES:
+        t3 = recs_3m.get(f, 0.0)
+        t6 = recs_6m.get(f, 0.0)
+        t12 = recs_12m.get(f, 0.0)
+        # Reading: directional verdict on the 3M view
+        if t3 >= 0.20:
+            reading = "STRONG long tilt — factor running hot"
+        elif t3 >= 0.10:
+            reading = "moderate long tilt"
+        elif t3 >= -0.05:
+            reading = "neutral"
+        elif t3 >= -0.15:
+            reading = "moderate short tilt"
+        else:
+            reading = "STRONG short tilt — factor underperforming"
+        print(f"  {f:<8} {t3:>+10.3f}  {t6:>+10.3f}  {t12:>+10.3f}   {reading}")
+    print()
+
+    print("=" * 88)
+    print("INTERPRETATION")
+    print("=" * 88)
+    # Rank factors by 3M Sharpe
+    s3 = per_window_stats.get("3M", pd.DataFrame())
+    if not s3.empty:
+        ranked = s3["sharpe"].sort_values(ascending=False)
+        top = ranked.head(2)
+        bottom = ranked.tail(2)
+        print(f"  Trailing 3M factor leaders:  "
+              + "  ·  ".join(f"{f} ({sh:+.2f})" for f, sh in top.items()))
+        print(f"  Trailing 3M factor laggards: "
+              + "  ·  ".join(f"{f} ({sh:+.2f})" for f, sh in bottom.items()))
+    print()
+    print("  Next step (if numbers look right):")
+    print("    1) Plumb auto_recommend_factor_tilts() into the dialog as the")
+    print("       default Auto Recommend behaviour.")
+    print("    2) Thread tilt_targets through solve_candidate_portfolios so")
+    print("       each ensemble slot picks up the factor view.")
+    print("    3) Validate with walk-forward CV BEFORE making it production.")
+    print()
+    return 0
+
+
+# Dispatch deferred until after FACTOR_TILT_* constants and
+# auto_recommend_factor_tilts() are defined (~line 2155).
 
 
 # === Metrics history (run-over-run regression tracking) ====================
@@ -1948,6 +2065,97 @@ def get_ff5_mom_daily(region: str = "US") -> pd.DataFrame:
     mom = get_mom_daily(region=region)
     out = ff5.join(mom, how="inner").sort_index()
     return out[["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM", "RF"]]
+
+
+# ============================================================================
+# AUTO-RECOMMEND FACTOR TILTS — trailing-3M factor-momentum scorer
+# ----------------------------------------------------------------------------
+# Picks tilt magnitudes by ranking each of (Mkt-RF, SMB, HML, RMW, CMA, MOM)
+# on trailing N-day annualised Sharpe. Magnitude scales linearly with Sharpe,
+# clipped so no single factor dominates. Use for the dialog's Auto Recommend
+# button or as a baseline for `--factor-recs` CLI inspection.
+#
+# Conservative default magnitudes: a factor with Sharpe ≈ 2.0 → +0.20 tilt.
+# A factor with Sharpe ≈ -2.0 → -0.20 tilt. Clipped at ±0.30 so a runaway
+# factor can't blow out portfolio concentration. Lookback default 63 trading
+# days (~3 calendar months) per the user's choice on 2026-06-19.
+# ============================================================================
+FACTOR_TILT_LOOKBACK_DAYS = 63
+FACTOR_TILT_MAX_MAGNITUDE = 0.30
+FACTOR_TILT_SHARPE_TO_MAG = 0.10  # Sharpe × this = tilt magnitude (before clip)
+FACTOR_NAMES = ("Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM")
+
+
+def compute_factor_recent_stats(ff_data: pd.DataFrame,
+                                 lookback_days: int | None = None) -> pd.DataFrame:
+    """Compute trailing-N-day annualised return, vol, Sharpe per factor.
+
+    Returns a DataFrame indexed by factor name with columns
+    [ann_return, ann_vol, sharpe, recent_n_days]. Excludes RF.
+    """
+    lookback_days = lookback_days or FACTOR_TILT_LOOKBACK_DAYS
+    if ff_data is None or ff_data.empty:
+        return pd.DataFrame()
+    # Strip RF; we score the active factors only.
+    facs = [c for c in FACTOR_NAMES if c in ff_data.columns]
+    if not facs:
+        return pd.DataFrame()
+    tail = ff_data[facs].tail(lookback_days).dropna(how="all")
+    if tail.empty:
+        return pd.DataFrame()
+    rows = []
+    for f in facs:
+        s = pd.to_numeric(tail[f], errors="coerce").dropna()
+        if s.empty:
+            continue
+        # ff5 factors are already daily excess returns (decimals).
+        ann_ret = float(s.mean() * ANNUAL_TRADING_DAYS)
+        ann_vol = float(s.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+        rows.append({
+            "factor": f,
+            "ann_return": ann_ret,
+            "ann_vol": ann_vol,
+            "sharpe": sharpe,
+            "n_days": int(len(s)),
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index("factor")
+
+
+def auto_recommend_factor_tilts(ff_data: pd.DataFrame,
+                                 lookback_days: int | None = None,
+                                 max_magnitude: float | None = None,
+                                 sharpe_to_mag: float | None = None) -> dict[str, float]:
+    """Auto-recommend factor tilt targets from trailing-N-day factor Sharpes.
+
+    Each factor's target = clip(Sharpe × sharpe_to_mag, -max_mag, +max_mag).
+    Returns a dict like {"Mkt-RF": 0.10, "SMB": -0.05, "MOM": +0.18, ...}
+    suitable for passing as `tilt_targets` to solve_frontier_point_cvxpy.
+
+    Empty dict if FF data is missing or insufficient.
+    """
+    max_magnitude = max_magnitude or FACTOR_TILT_MAX_MAGNITUDE
+    sharpe_to_mag = sharpe_to_mag or FACTOR_TILT_SHARPE_TO_MAG
+    stats = compute_factor_recent_stats(ff_data, lookback_days=lookback_days)
+    if stats.empty:
+        return {}
+    out = {}
+    for f, row in stats.iterrows():
+        sharpe = float(row["sharpe"])
+        target = sharpe * sharpe_to_mag
+        target = max(-max_magnitude, min(max_magnitude, target))
+        out[f] = round(target, 4)
+    return out
+
+
+# Dispatch --factor-recs HERE (constants + auto_recommend_factor_tilts now defined).
+# Runs before heavy price download / FF5 universe build that follows.
+if _FACTOR_RECS_MODE:
+    _exit_code = _run_factor_recs()
+    sys.exit(_exit_code)
+
 
 # ---------------------------------------------------------------------
 # Foreign Exchange
