@@ -7199,10 +7199,19 @@ def compute_oos_metrics(strat_returns: pd.Series,
 # Standalone walk-forward over a pre-2006 minimal universe to ask: does the
 # ensemble engine survive a -56% SPY drawdown? Triggered by `--stress-test`
 # on the CLI; exits before the live pipeline runs.
+#
+# Stretch-only comparison: if --stretch-only is also passed, runs BOTH
+# 5-slot blend and Stretch-only allocations side by side, reporting deltas
+# so we can quantify how much of the engine's GFC defence comes from slot
+# blending vs concentration in high-mu assets.
 def _run_gfc_stress_test() -> int:
     print("\n" + "=" * 80)
     print("GFC STRESS TEST — ensemble walk-forward through 2007-09 GFC peak")
     print("=" * 80)
+
+    include_stretch_compare = "--stretch-only" in sys.argv
+    if include_stretch_compare:
+        print("[stress] --stretch-only modifier detected: will run 5-slot AND Stretch-only side-by-side")
 
     STRESS_TICKERS = ["SPY", "IVV", "QQQ", "IEF", "VWO", "GOLD.AX", "^AORD"]
     START_DATE = "2005-10-01"
@@ -7370,6 +7379,112 @@ def _run_gfc_stress_test() -> int:
         print(f"[stress] Summary JSON → {json_path}")
     except Exception as e:
         print(f"[stress] Summary JSON save failed: {e}")
+
+    # --- Stretch-only comparison run (if --stretch-only modifier present) ---
+    if include_stretch_compare:
+        print("\n" + "=" * 80)
+        print("STRETCH-ONLY COMPARISON — same universe, single-slot allocation")
+        print("=" * 80)
+
+        # Find Stretch slot name
+        stretch_slot = None
+        for name in ENSEMBLE_SLOT_NAMES:
+            if "Stretch" in name:
+                stretch_slot = name
+                break
+        if not stretch_slot:
+            print("[stress] no Stretch slot found; skipping comparison")
+            return 0
+        print(f"[stress-stretch] forcing 100% on slot: {stretch_slot}")
+
+        t2 = time.perf_counter()
+        out_s = run_oos_ensemble_walk_forward(
+            px_aud,
+            train_window_months=24,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            slot_weights_override={stretch_slot: 1.0},
+        )
+        strat_rets_s = out_s["blended_returns"]
+        weights_s = out_s["blended_weights"]
+        print(f"[stress-stretch] walk-forward done in {time.perf_counter()-t2:.1f}s")
+
+        if strat_rets_s.empty:
+            print("[stress-stretch] empty returns; aborting comparison.")
+            return 0
+
+        # GFC-window stats for Stretch-only
+        strat_gfc_s = strat_rets_s[(strat_rets_s.index >= gfc_start)
+                                    & (strat_rets_s.index <= gfc_end)]
+        nav_strat_gfc_s = (1 + strat_gfc_s).cumprod() if not strat_gfc_s.empty else None
+        dd_strat_s = (float((nav_strat_gfc_s / nav_strat_gfc_s.cummax() - 1).min())
+                      if nav_strat_gfc_s is not None else float("nan"))
+        total_ret_s = (float(nav_strat_gfc_s.iloc[-1] - 1.0)
+                       if nav_strat_gfc_s is not None and not nav_strat_gfc_s.empty
+                       else float("nan"))
+
+        # Side-by-side print
+        print(f"\n  {'Config':<30}  {'GFC TotRet':>11}  {'GFC MaxDD':>11}  "
+              f"{'Defence vs SPY':>15}")
+        print(f"  {'-'*30}  {'-'*11}  {'-'*11}  {'-'*15}")
+        dd_spy_gfc = float((nav_spy_gfc / nav_spy_gfc.cummax() - 1).min()) \
+                      if nav_spy_gfc is not None else float("nan")
+        total_ret_blend = float(((1 + strat_gfc).cumprod().iloc[-1] - 1.0)) \
+                          if len(strat_gfc) else float("nan")
+        dd_strat_blend = float((nav_strat_gfc / nav_strat_gfc.cummax() - 1).min()) \
+                          if len(strat_gfc) else float("nan")
+        def _def_pct(strat_dd, spy_dd):
+            if np.isnan(strat_dd) or np.isnan(spy_dd) or spy_dd >= 0:
+                return float("nan")
+            return strat_dd / spy_dd * 100
+        print(f"  {'5-slot blend (current)':<30}  "
+              f"{total_ret_blend*100:>+10.2f}%  "
+              f"{dd_strat_blend*100:>+10.2f}%  "
+              f"{_def_pct(dd_strat_blend, dd_spy_gfc):>14.1f}%")
+        print(f"  {'Stretch-only':<30}  "
+              f"{total_ret_s*100:>+10.2f}%  "
+              f"{dd_strat_s*100:>+10.2f}%  "
+              f"{_def_pct(dd_strat_s, dd_spy_gfc):>14.1f}%")
+        print(f"  {'SPY (AUD) benchmark':<30}  "
+              f"{float(((1 + spy_gfc).cumprod().iloc[-1] - 1) * 100):>+10.2f}%  "
+              f"{dd_spy_gfc*100:>+10.2f}%  "
+              f"{'100.0%':>15}")
+        print(f"\n  (Defence vs SPY: lower = better. 100% = no defence, 0% = perfect.)")
+
+        # Verdict
+        print("\n" + "=" * 80)
+        print("VERDICT — GFC defence comparison")
+        print("=" * 80)
+        delta_dd = dd_strat_s - dd_strat_blend
+        if delta_dd < -0.05:
+            print(f"  Stretch-only takes {delta_dd*100:+.1f}% deeper drawdown than 5-slot blend.")
+            print(f"  The intrinsic defence from slot blending IS material in tail events.")
+            print(f"  Recommend: KEEP 5-slot blend for GFC protection, despite modern alpha cost.")
+        elif delta_dd < 0.02:
+            print(f"  Stretch-only ≈ 5-slot blend in GFC ({delta_dd*100:+.1f}% diff).")
+            print(f"  No meaningful tail-protection trade-off — Stretch-only is ship-ready.")
+        else:
+            print(f"  Stretch-only actually has SHALLOWER drawdown than 5-slot? "
+                  f"({delta_dd*100:+.1f}%)")
+            print(f"  Unexpected — verify result before acting.")
+
+        # Append to JSON
+        try:
+            summary["stretch_only_comparison"] = {
+                "stretch_total_return_pct": float(total_ret_s * 100),
+                "stretch_max_dd_pct": float(dd_strat_s * 100),
+                "stretch_defence_pct": _def_pct(dd_strat_s, dd_spy_gfc),
+                "blend_defence_pct": _def_pct(dd_strat_blend, dd_spy_gfc),
+                "delta_dd_pct": float(delta_dd * 100),
+            }
+            json_path = APP_DIR / "gfc_stress_summary.json"
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+            print(f"\n[stress] Updated summary JSON → {json_path}")
+        except Exception as e:
+            print(f"[stress] JSON update failed: {e}")
 
     print("\n" + "=" * 80)
     print("GFC STRESS TEST COMPLETE")
