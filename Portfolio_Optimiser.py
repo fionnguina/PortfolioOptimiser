@@ -185,6 +185,13 @@ if _SHOW_METRICS_HISTORY_MODE:
 _FACTOR_RECS_MODE = "--factor-recs" in sys.argv
 if _FACTOR_RECS_MODE:
     print("[factor-recs] --factor-recs detected; will print recommendation table then exit")
+# `--tilted-ensemble-test`: walk-forward CV with auto-factor-tilts ON vs OFF.
+# Threads dynamic tilt targets (recomputed per rebal from trailing-3M factor
+# Sharpes) through solve_candidate_portfolios so each ensemble slot expresses
+# the factor view. Compares to baseline (no tilts) on the modern OOS window.
+_TILTED_ENSEMBLE_TEST_MODE = "--tilted-ensemble-test" in sys.argv
+if _TILTED_ENSEMBLE_TEST_MODE:
+    print("[tilted-ens] --tilted-ensemble-test detected; will skip dialog + live pipeline")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
@@ -194,7 +201,8 @@ _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _STRETCH_ONLY_TEST_MODE
                        or _STRETCH_HEDGE_SWEEP_MODE
                        or _SHOW_METRICS_HISTORY_MODE
-                       or _FACTOR_RECS_MODE)
+                       or _FACTOR_RECS_MODE
+                       or _TILTED_ENSEMBLE_TEST_MODE)
 
 
 # =====================================================================
@@ -6771,6 +6779,11 @@ def solve_candidate_portfolios(
     slots: tuple[tuple[str, float | None], ...] = ENSEMBLE_SLOTS,
     w_prev: pd.Series | None = None,
     turnover_penalty: float = 0.0,
+    tilt_targets: dict | None = None,
+    tilt_bands: dict | None = None,
+    B: pd.DataFrame | None = None,
+    use_mask: dict | None = None,
+    tilt_mode: str = "soft",
 ) -> dict[str, pd.Series]:
     """Solve all 5 candidate portfolios for a single rebalance.
 
@@ -6810,6 +6823,8 @@ def solve_candidate_portfolios(
             w_arr, ok, _note = solve_frontier_point_cvxpy(
                 mu, Sigma, target_ret, use_inequality=True,
                 w_prev=w_prev, turnover_penalty=turnover_penalty,
+                B=B, tilt_targets=tilt_targets, tilt_bands=tilt_bands,
+                use_mask=use_mask, tilt_mode=tilt_mode,
             )
             if ok and w_arr is not None and len(w_arr) > 0 and np.isfinite(w_arr).all():
                 w = pd.Series(w_arr, index=Sigma.index)
@@ -7035,6 +7050,11 @@ def run_oos_ensemble_walk_forward(
     crash_hedge_dd_trigger: float | None = None,
     crash_hedge_dd_release: float | None = None,
     slot_weights_override: dict | None = None,
+    auto_factor_tilts: bool = False,
+    ff_factors: pd.DataFrame | None = None,
+    factor_betas: pd.DataFrame | None = None,
+    factor_tilt_lookback_days: int | None = None,
+    factor_tilt_band: float = 0.10,
 ) -> dict:
     """Ensemble walk-forward: solve 5 candidates per rebalance, softmax-blend
     by rolling 12M Sortino, hold the blended portfolio for 1 month.
@@ -7220,10 +7240,37 @@ def run_oos_ensemble_walk_forward(
         Sigma = train_rets.cov()
         spy_mu = float(mu[benchmark_ticker]) if benchmark_ticker in mu.index else None
 
+        # If auto factor tilts enabled, compute the trailing-N-day factor
+        # recommendation up to THIS rebalance and pass to candidate solvers.
+        # No look-ahead: we slice ff_factors at t before scoring.
+        _live_tilt_targets = None
+        _live_tilt_bands = None
+        _live_use_mask = None
+        if (auto_factor_tilts and ff_factors is not None
+                and factor_betas is not None and not ff_factors.empty):
+            try:
+                ff_up_to_t = ff_factors.loc[:t]
+                if not ff_up_to_t.empty:
+                    _live_tilt_targets = auto_recommend_factor_tilts(
+                        ff_up_to_t,
+                        lookback_days=factor_tilt_lookback_days,
+                    )
+                    if _live_tilt_targets:
+                        _live_tilt_bands = {f: factor_tilt_band
+                                             for f in _live_tilt_targets}
+                        _live_use_mask = {f: True for f in _live_tilt_targets}
+            except Exception:
+                _live_tilt_targets = None
+
         candidates = solve_candidate_portfolios(
             mu, Sigma, spy_mu,
             w_prev=_prev_blend_w if not _prev_blend_w.empty else None,
             turnover_penalty=float(turnover_penalty),
+            tilt_targets=_live_tilt_targets,
+            tilt_bands=_live_tilt_bands,
+            B=factor_betas,
+            use_mask=_live_use_mask,
+            tilt_mode="soft",
         )
         # All candidates must be solvable to participate; otherwise skip rebalance.
         if all(w.empty for w in candidates.values()):
@@ -10552,6 +10599,274 @@ def _run_stretch_hedge_sweep() -> int:
 
 if "--stretch-hedge-sweep" in sys.argv:
     _exit_code = _run_stretch_hedge_sweep()
+    sys.exit(_exit_code)
+
+
+# === Auto factor-tilt A/B test (--tilted-ensemble-test) =====================
+# Walk-forward CV comparing 5-slot ensemble WITH auto-recommended factor
+# tilts (recomputed per rebal from trailing-3M factor Sharpes) vs the
+# baseline ensemble without tilts. Per-fold + aggregate metrics plus
+# full-period peak-to-trough MaxDD (per the 2026-06-19 measurement lesson).
+def _run_tilted_ensemble_test() -> int:
+    print("\n" + "=" * 88)
+    print("AUTO-TILTED ENSEMBLE A/B TEST — walk-forward CV (tilts ON vs OFF)")
+    print("=" * 88)
+    print(f"  tilt lookback:   {FACTOR_TILT_LOOKBACK_DAYS} days (3M)")
+    print(f"  magnitude scale: Sharpe × {FACTOR_TILT_SHARPE_TO_MAG:.2f}, "
+          f"clipped to ±{FACTOR_TILT_MAX_MAGNITUDE:.2f}")
+    print(f"  tilt band:       ±0.10 (soft slack in solver)")
+    print(f"  region:          US (factor data)")
+
+    TRAIN_MONTHS = 24
+    MIN_OOS_YEAR = 2016
+    MIN_FOLD_DAYS = 150
+
+    _te_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[tilted-ens] universe: {len(_te_tickers)} tickers, "
+          f"OOS folds: year ≥ {MIN_OOS_YEAR}")
+    print(f"[tilted-ens] downloading full history (max)...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_te_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[tilted-ens] data ready ({px_aud.shape[0]} days × "
+          f"{px_aud.shape[1]} tickers) in {time.perf_counter()-t0:.1f}s")
+
+    # FF5+MOM factor data (US region — most relevant given universe).
+    print(f"[tilted-ens] loading FF5+MOM factor data...")
+    try:
+        ff = get_ff5_mom_daily(region="US")
+        ff.index = pd.to_datetime(ff.index).tz_localize(None)
+    except Exception as e:
+        print(f"[tilted-ens] failed to load FF5+MOM data: {e}")
+        return 1
+
+    # B matrix: per-asset factor loadings via the existing Dimson-corrected
+    # OLS routine. Computed ONCE on the full universe's history (factor
+    # loadings are slow-moving so per-rebal rebuilding adds compute for
+    # little signal change).
+    print(f"[tilted-ens] computing factor betas (Dimson OLS, may take ~30s)...")
+    _ret_wide = px_aud.pct_change().dropna(how="all")
+    _bt0 = time.perf_counter()
+    try:
+        B, _alpha, _resvar = compute_ff5_betas(
+            df_returns_wide=_ret_wide,
+            ff5_returns=ff,
+            min_obs=120,
+            n_lags=1,
+        )
+    except Exception as e:
+        print(f"[tilted-ens] factor beta computation failed: {e}")
+        return 1
+    if B is None or B.empty:
+        print(f"[tilted-ens] beta matrix empty; aborting.")
+        return 1
+    B = B.dropna(how="all")  # drop assets that couldn't be regressed
+    print(f"[tilted-ens] B matrix ready ({B.shape[0]} assets × {B.shape[1]} factors) "
+          f"in {time.perf_counter()-_bt0:.1f}s")
+
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+
+    def _run(tilts_on: bool):
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(
+            px_aud,
+            train_window_months=TRAIN_MONTHS,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            starting_nav_aud=1_000_000.0,
+            auto_factor_tilts=tilts_on,
+            ff_factors=ff if tilts_on else None,
+            factor_betas=B if tilts_on else None,
+            factor_tilt_lookback_days=FACTOR_TILT_LOOKBACK_DAYS,
+            factor_tilt_band=0.10,
+        )
+        return out, time.perf_counter() - t1
+
+    def _fold_metrics(rets):
+        if rets is None or rets.empty:
+            return [], None
+        folds = []
+        for yr in sorted(set(rets.index.year)):
+            if yr < MIN_OOS_YEAR:
+                continue
+            mask = (rets.index.year == yr)
+            chunk = rets.loc[mask]
+            if len(chunk) < MIN_FOLD_DAYS:
+                continue
+            chunk_nav = (1.0 + chunk).cumprod()
+            yic = len(chunk) / ANNUAL_TRADING_DAYS
+            ann_ret = float(chunk_nav.iloc[-1] ** (1.0 / yic) - 1.0)
+            vol = float(chunk.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+            sharpe = ann_ret / vol if vol > 0 else 0.0
+            dd = float((chunk_nav / chunk_nav.cummax() - 1.0).min())
+            spy_chunk = spy_ret_full.reindex(chunk.index).fillna(0.0)
+            spy_nav = (1.0 + spy_chunk).cumprod()
+            spy_ann = float(spy_nav.iloc[-1] ** (1.0 / yic) - 1.0)
+            folds.append({
+                "year": int(yr),
+                "ann_return": ann_ret,
+                "sharpe": sharpe,
+                "max_drawdown": dd,
+                "alpha_vs_spy": ann_ret - spy_ann,
+            })
+        # FULL-PERIOD peak-to-trough (the metric that matters per 2026-06-19)
+        modern_mask = rets.index >= pd.Timestamp(f"{MIN_OOS_YEAR}-01-01")
+        modern_rets = rets.loc[modern_mask]
+        full_dd = None
+        if not modern_rets.empty:
+            nav = (1.0 + modern_rets).cumprod()
+            full_dd = float((nav / nav.cummax() - 1.0).min())
+        return folds, full_dd
+
+    # === Baseline: tilts OFF ===
+    print(f"\n[tilted-ens] running BASELINE (tilts OFF)...")
+    base_out, base_t = _run(tilts_on=False)
+    base_folds, base_full_dd = _fold_metrics(base_out.get("blended_returns"))
+    print(f"[tilted-ens] baseline done in {base_t:.1f}s")
+
+    # === Treatment: tilts ON ===
+    print(f"\n[tilted-ens] running TREATMENT (auto factor tilts ON)...")
+    tilt_out, tilt_t = _run(tilts_on=True)
+    tilt_folds, tilt_full_dd = _fold_metrics(tilt_out.get("blended_returns"))
+    print(f"[tilted-ens] treatment done in {tilt_t:.1f}s")
+
+    if len(base_folds) < 3 or len(tilt_folds) < 3:
+        print("[tilted-ens] insufficient folds; aborting.")
+        return 1
+
+    base_by = {r["year"]: r for r in base_folds}
+    tilt_by = {r["year"]: r for r in tilt_folds}
+    common_years = sorted(set(base_by.keys()) & set(tilt_by.keys()))
+
+    # === Per-fold table ===
+    print("\n" + "=" * 88)
+    print(f"PER-FOLD COMPARISON ({len(common_years)} years)")
+    print("=" * 88)
+    print(f"  {'Year':>5}   {'Baseline (no tilts)':>22}     {'Auto tilts ON':>22}     {'Δ':>15}")
+    print(f"  {'':>5}   {'Sharpe / α / MaxDD':>22}     {'Sharpe / α / MaxDD':>22}     "
+          f"{'ΔSharpe Δα':>15}")
+    print(f"  {'-'*5}   {'-'*22}     {'-'*22}     {'-'*15}")
+    for yr in common_years:
+        b = base_by[yr]
+        s = tilt_by[yr]
+        d_sh = s["sharpe"] - b["sharpe"]
+        d_al = s["alpha_vs_spy"] - b["alpha_vs_spy"]
+        print(f"  {yr:>5}   "
+              f"{b['sharpe']:>+5.2f} / {b['alpha_vs_spy']*100:>+6.1f}% / {b['max_drawdown']*100:>+5.1f}%     "
+              f"{s['sharpe']:>+5.2f} / {s['alpha_vs_spy']*100:>+6.1f}% / {s['max_drawdown']*100:>+5.1f}%     "
+              f"{d_sh:>+5.2f}   {d_al*100:>+6.1f}%")
+
+    # === Aggregate (with FULL-PERIOD MaxDD) ===
+    base_sh = np.array([base_by[y]["sharpe"] for y in common_years])
+    tilt_sh = np.array([tilt_by[y]["sharpe"] for y in common_years])
+    base_al = np.array([base_by[y]["alpha_vs_spy"] for y in common_years])
+    tilt_al = np.array([tilt_by[y]["alpha_vs_spy"] for y in common_years])
+    base_rt = np.array([base_by[y]["ann_return"] for y in common_years])
+    tilt_rt = np.array([tilt_by[y]["ann_return"] for y in common_years])
+    base_yr_dd = np.array([base_by[y]["max_drawdown"] for y in common_years])
+    tilt_yr_dd = np.array([tilt_by[y]["max_drawdown"] for y in common_years])
+
+    print("\n" + "=" * 88)
+    print("AGGREGATE — mean across folds + FULL-PERIOD peak-to-trough MaxDD")
+    print("=" * 88)
+    print(f"  Sharpe (mean):           baseline {base_sh.mean():+.2f}±{base_sh.std(ddof=1):.2f}   "
+          f"tilts {tilt_sh.mean():+.2f}±{tilt_sh.std(ddof=1):.2f}   "
+          f"Δ {tilt_sh.mean() - base_sh.mean():+.2f}")
+    print(f"  Ann return (mean):       baseline {base_rt.mean()*100:+.2f}%   "
+          f"tilts {tilt_rt.mean()*100:+.2f}%   "
+          f"Δ {(tilt_rt.mean() - base_rt.mean())*100:+.2f}%")
+    print(f"  α vs SPY (mean):         baseline {base_al.mean()*100:+.2f}%   "
+          f"tilts {tilt_al.mean()*100:+.2f}%   "
+          f"Δ {(tilt_al.mean() - base_al.mean())*100:+.2f}%")
+    print(f"  Worst fold MaxDD:        baseline {base_yr_dd.min()*100:+.2f}%   "
+          f"tilts {tilt_yr_dd.min()*100:+.2f}%   "
+          f"Δ {(tilt_yr_dd.min() - base_yr_dd.min())*100:+.2f}%")
+    print(f"  FULL-PERIOD MaxDD:       baseline {base_full_dd*100:+.2f}%   "
+          f"tilts {tilt_full_dd*100:+.2f}%   "
+          f"Δ {(tilt_full_dd - base_full_dd)*100:+.2f}%   ← key metric")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    d_sh_mean = tilt_sh.mean() - base_sh.mean()
+    d_full_dd = tilt_full_dd - base_full_dd
+    if d_sh_mean > 0.05 and d_full_dd > -0.03:
+        print(f"  Reading: tilts IMPROVE Sharpe (+{d_sh_mean:.2f}) without "
+              f"worsening full-period MaxDD ({d_full_dd*100:+.2f}%). PROCEED.")
+        print(f"  Recommend: set PRODUCTION_AUTO_FACTOR_TILTS = True after one more")
+        print(f"  sanity check (live-pipeline run, then check metrics_history regression).")
+    elif d_sh_mean > -0.05 and d_full_dd > -0.05:
+        print(f"  Reading: tilts ≈ neutral (ΔSharpe {d_sh_mean:+.2f}, "
+              f"ΔMaxDD {d_full_dd*100:+.2f}%). Marginal benefit, may not be worth")
+        print(f"  the added complexity.")
+    else:
+        print(f"  Reading: tilts HURT (ΔSharpe {d_sh_mean:+.2f}, "
+              f"ΔMaxDD {d_full_dd*100:+.2f}%). KEEP OFF — auto-tilts don't")
+        print(f"  generalise. Engine ceiling holds.")
+    print()
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "config": {
+                "lookback_days": FACTOR_TILT_LOOKBACK_DAYS,
+                "sharpe_to_mag": FACTOR_TILT_SHARPE_TO_MAG,
+                "max_magnitude": FACTOR_TILT_MAX_MAGNITUDE,
+                "tilt_band": 0.10,
+            },
+            "baseline": {
+                "folds": base_folds,
+                "mean_sharpe": float(base_sh.mean()),
+                "mean_alpha": float(base_al.mean()),
+                "full_period_max_drawdown": float(base_full_dd),
+            },
+            "tilted": {
+                "folds": tilt_folds,
+                "mean_sharpe": float(tilt_sh.mean()),
+                "mean_alpha": float(tilt_al.mean()),
+                "full_period_max_drawdown": float(tilt_full_dd),
+            },
+            "uplift": {
+                "sharpe_delta_mean": float(d_sh_mean),
+                "full_period_max_drawdown_delta": float(d_full_dd),
+            },
+        }
+        json_path = APP_DIR / "tilted_ensemble_test_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"[tilted-ens] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[tilted-ens] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("TILTED ENSEMBLE TEST COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--tilted-ensemble-test" in sys.argv:
+    _exit_code = _run_tilted_ensemble_test()
     sys.exit(_exit_code)
 
 
