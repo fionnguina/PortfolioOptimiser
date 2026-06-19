@@ -163,12 +163,19 @@ if _CRASH_HEDGE_TEST_MODE:
 _CRASH_HEDGE_RELEASE_SWEEP_MODE = "--crash-hedge-release-sweep" in sys.argv
 if _CRASH_HEDGE_RELEASE_SWEEP_MODE:
     print("[hedge-rel] --crash-hedge-release-sweep detected; will skip dialog + live pipeline")
+# `--stretch-only-test`: walk-forward CV comparing 5-slot ensemble vs
+# Stretch-only (slot_weights_override forcing 100% on Stretch slot).
+# Tests whether the defensive layer is worth its alpha cost.
+_STRETCH_ONLY_TEST_MODE = "--stretch-only-test" in sys.argv
+if _STRETCH_ONLY_TEST_MODE:
+    print("[stretch] --stretch-only-test detected; will skip dialog + live pipeline")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
                        or _TURNOVER_SWEEP_MODE or _WALK_FORWARD_CV_MODE
                        or _ATTRIBUTION_MODE or _CRASH_HEDGE_TEST_MODE
-                       or _CRASH_HEDGE_RELEASE_SWEEP_MODE)
+                       or _CRASH_HEDGE_RELEASE_SWEEP_MODE
+                       or _STRETCH_ONLY_TEST_MODE)
 
 
 # =====================================================================
@@ -6537,6 +6544,7 @@ def run_oos_ensemble_walk_forward(
     crash_hedge: bool = False,
     crash_hedge_dd_trigger: float | None = None,
     crash_hedge_dd_release: float | None = None,
+    slot_weights_override: dict | None = None,
 ) -> dict:
     """Ensemble walk-forward: solve 5 candidates per rebalance, softmax-blend
     by rolling 12M Sortino, hold the blended portfolio for 1 month.
@@ -6761,6 +6769,15 @@ def run_oos_ensemble_walk_forward(
                 forward_weights=fwd_w,
                 backward_alpha=forward_signal_alpha,
             )
+        # Optional override: replace softmax with a fixed slot-weight map.
+        # Used by --stretch-only-test and similar diagnostic modes to force
+        # a specific allocation across slots without rewriting the engine.
+        if slot_weights_override is not None:
+            override = pd.Series(slot_weights_override).reindex(
+                ENSEMBLE_SLOT_NAMES, fill_value=0.0).astype(float)
+            override_sum = float(override.sum())
+            if override_sum > 0:
+                soft_w = override / override_sum
         softmax_rows[t] = soft_w
 
         # Save per-candidate weights at this rebal.
@@ -9372,6 +9389,246 @@ def _run_crash_hedge_release_sweep() -> int:
 
 if "--crash-hedge-release-sweep" in sys.argv:
     _exit_code = _run_crash_hedge_release_sweep()
+    sys.exit(_exit_code)
+
+
+# === Stretch-only A/B test (--stretch-only-test) ===========================
+# Walk-forward CV comparing the 5-slot ensemble against a Stretch-only
+# allocation (slot_weights_override forcing 100% on Stretch). Tests
+# whether the defensive slots (Modest/Aggressive) are worth their alpha
+# cost — per attribution, Modest has alpha -5.5%/yr and Stretch +4.8%/yr
+# so it's plausible that Stretch alone beats the blend. Settles the
+# question definitively before any further defensive-layer redesign.
+def _run_stretch_only_test() -> int:
+    print("\n" + "=" * 88)
+    print("STRETCH-ONLY A/B TEST — walk-forward CV (5-slot blend vs Stretch-only)")
+    print("=" * 88)
+
+    TRAIN_MONTHS = 24
+    MIN_OOS_YEAR = 2016
+    MIN_FOLD_DAYS = 150
+
+    # Find the Stretch slot name (last entry by convention but be safe)
+    stretch_slot = None
+    for name in ENSEMBLE_SLOT_NAMES:
+        if "Stretch" in name:
+            stretch_slot = name
+            break
+    if not stretch_slot:
+        print("[stretch] no Stretch slot found in ENSEMBLE_SLOTS; aborting.")
+        return 1
+    print(f"  Stretch slot: {stretch_slot}")
+
+    _so_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[stretch] universe: {len(_so_tickers)} tickers, OOS folds: year ≥ {MIN_OOS_YEAR}")
+    print(f"[stretch] downloading full history (max)...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_so_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[stretch] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+
+    def _run(override):
+        # override=None → full 5-slot blend; override=dict → forced slot weights
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(
+            px_aud,
+            train_window_months=TRAIN_MONTHS,
+            rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY",
+            score_lookback_days=252,
+            lambda_temp=3.0,
+            starting_nav_aud=1_000_000.0,
+            slot_weights_override=override,
+        )
+        elapsed = time.perf_counter() - t1
+        strat_rets = out["blended_returns"]
+        cost_ser = out.get("rebalance_costs", pd.Series(dtype=float))
+        tax_ser = out.get("rebalance_taxes", pd.Series(dtype=float))
+        return strat_rets, cost_ser, tax_ser, elapsed
+
+    def _fold_metrics(rets: pd.Series) -> list[dict]:
+        if rets.empty:
+            return []
+        folds = []
+        for yr in sorted(set(rets.index.year)):
+            if yr < MIN_OOS_YEAR:
+                continue
+            mask = (rets.index.year == yr)
+            chunk = rets.loc[mask]
+            if len(chunk) < MIN_FOLD_DAYS:
+                continue
+            chunk_nav = (1.0 + chunk).cumprod()
+            n_days = len(chunk)
+            yic = n_days / ANNUAL_TRADING_DAYS
+            ann_ret = float(chunk_nav.iloc[-1] ** (1.0 / yic) - 1.0)
+            vol = float(chunk.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+            sharpe = ann_ret / vol if vol > 0 else 0.0
+            dd = float((chunk_nav / chunk_nav.cummax() - 1.0).min())
+            spy_chunk = spy_ret_full.reindex(chunk.index).fillna(0.0)
+            spy_nav = (1.0 + spy_chunk).cumprod()
+            spy_ann = float(spy_nav.iloc[-1] ** (1.0 / yic) - 1.0)
+            folds.append({
+                "year": int(yr),
+                "ann_return": ann_ret,
+                "sharpe": sharpe,
+                "max_drawdown": dd,
+                "alpha_vs_spy": ann_ret - spy_ann,
+            })
+        return folds
+
+    print(f"\n[stretch] running BASELINE (5-slot ensemble)...")
+    base_rets, base_costs, base_taxes, base_t = _run(None)
+    print(f"[stretch] baseline done in {base_t:.1f}s ({len(base_rets)} OOS days)")
+
+    print(f"\n[stretch] running TREATMENT (100% Stretch only)...")
+    stretch_override = {stretch_slot: 1.0}
+    stretch_rets, stretch_costs, stretch_taxes, stretch_t = _run(stretch_override)
+    print(f"[stretch] treatment done in {stretch_t:.1f}s ({len(stretch_rets)} OOS days)")
+
+    base_folds = _fold_metrics(base_rets)
+    stretch_folds = _fold_metrics(stretch_rets)
+    if len(base_folds) < 3 or len(stretch_folds) < 3:
+        print("[stretch] insufficient folds; aborting.")
+        return 1
+
+    base_by = {r["year"]: r for r in base_folds}
+    str_by = {r["year"]: r for r in stretch_folds}
+    common_years = sorted(set(base_by.keys()) & set(str_by.keys()))
+
+    # === Per-fold ===
+    print("\n" + "=" * 88)
+    print(f"PER-FOLD COMPARISON ({len(common_years)} years)")
+    print("=" * 88)
+    print(f"  {'Year':>5}   {'5-slot':>22}     {'Stretch-only':>22}     {'Δ':>15}")
+    print(f"  {'':>5}   {'Sharpe / α / MaxDD':>22}     {'Sharpe / α / MaxDD':>22}     "
+          f"{'ΔSharpe Δα':>15}")
+    print(f"  {'-'*5}   {'-'*22}     {'-'*22}     {'-'*15}")
+    for yr in common_years:
+        b = base_by[yr]
+        s = str_by[yr]
+        d_sh = s["sharpe"] - b["sharpe"]
+        d_al = s["alpha_vs_spy"] - b["alpha_vs_spy"]
+        print(f"  {yr:>5}   "
+              f"{b['sharpe']:>+5.2f} / {b['alpha_vs_spy']*100:>+6.1f}% / {b['max_drawdown']*100:>+5.1f}%     "
+              f"{s['sharpe']:>+5.2f} / {s['alpha_vs_spy']*100:>+6.1f}% / {s['max_drawdown']*100:>+5.1f}%     "
+              f"{d_sh:>+5.2f}   {d_al*100:>+6.1f}%")
+
+    # === Aggregate ===
+    base_sh = np.array([base_by[y]["sharpe"] for y in common_years])
+    str_sh = np.array([str_by[y]["sharpe"] for y in common_years])
+    base_al = np.array([base_by[y]["alpha_vs_spy"] for y in common_years])
+    str_al = np.array([str_by[y]["alpha_vs_spy"] for y in common_years])
+    base_dd = np.array([base_by[y]["max_drawdown"] for y in common_years])
+    str_dd = np.array([str_by[y]["max_drawdown"] for y in common_years])
+    base_rt = np.array([base_by[y]["ann_return"] for y in common_years])
+    str_rt = np.array([str_by[y]["ann_return"] for y in common_years])
+
+    years = len(stretch_rets) / ANNUAL_TRADING_DAYS
+    base_cgt = float(base_taxes.sum() / years * 10_000) if not base_taxes.empty else 0.0
+    str_cgt = float(stretch_taxes.sum() / years * 10_000) if not stretch_taxes.empty else 0.0
+    base_brk = float(base_costs.sum() / years * 10_000) if not base_costs.empty else 0.0
+    str_brk = float(stretch_costs.sum() / years * 10_000) if not stretch_costs.empty else 0.0
+
+    print("\n" + "=" * 88)
+    print("AGGREGATE (mean ± std across folds)")
+    print("=" * 88)
+    print(f"  Sharpe:        5-slot {base_sh.mean():+.2f} ± {base_sh.std(ddof=1):.2f}   "
+          f"Stretch {str_sh.mean():+.2f} ± {str_sh.std(ddof=1):.2f}   "
+          f"Δ {str_sh.mean() - base_sh.mean():+.2f}")
+    print(f"  Ann return:    5-slot {base_rt.mean()*100:+.2f}%   "
+          f"Stretch {str_rt.mean()*100:+.2f}%   "
+          f"Δ {(str_rt.mean() - base_rt.mean())*100:+.2f}%")
+    print(f"  α vs SPY:      5-slot {base_al.mean()*100:+.2f}% ± {base_al.std(ddof=1)*100:.2f}%   "
+          f"Stretch {str_al.mean()*100:+.2f}% ± {str_al.std(ddof=1)*100:.2f}%   "
+          f"Δ {(str_al.mean() - base_al.mean())*100:+.2f}%")
+    print(f"  MaxDD:         5-slot {base_dd.mean()*100:+.2f}% (worst {base_dd.min()*100:+.2f}%)   "
+          f"Stretch {str_dd.mean()*100:+.2f}% (worst {str_dd.min()*100:+.2f}%)   "
+          f"Δ {(str_dd.mean() - base_dd.mean())*100:+.2f}%")
+    print(f"  Brokerage:     5-slot {base_brk:.0f} bps/yr   Stretch {str_brk:.0f} bps/yr")
+    print(f"  CGT:           5-slot {base_cgt:.0f} bps/yr   Stretch {str_cgt:.0f} bps/yr   "
+          f"Δ {str_cgt - base_cgt:+.0f}")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    d_sharpe = str_sh.mean() - base_sh.mean()
+    d_alpha = str_al.mean() - base_al.mean()
+    d_dd = str_dd.mean() - base_dd.mean()
+    if d_sharpe > 0.10 and d_alpha > 0:
+        print(f"  Reading: Stretch-only IMPROVES Sharpe ({d_sharpe:+.2f}) AND alpha "
+              f"({d_alpha*100:+.2f}%). The defensive slots are alpha tax with no Sharpe benefit.")
+    elif d_sharpe > 0.05:
+        print(f"  Reading: Stretch-only mildly better. MaxDD impact: {d_dd*100:+.1f}%.")
+    elif d_sharpe > -0.05:
+        print(f"  Reading: Roughly neutral on Sharpe. MaxDD impact: {d_dd*100:+.1f}%. "
+              f"5-slot blending costs nothing meaningful, gives some MaxDD smoothing.")
+    elif d_sharpe > -0.15:
+        print(f"  Reading: Stretch-only hurts Sharpe by {d_sharpe:+.2f} — the defensive "
+              f"layer is delivering risk-adjusted value, even at alpha cost.")
+    else:
+        print(f"  Reading: Stretch-only badly hurts Sharpe ({d_sharpe:+.2f}). Defensive "
+              f"layer is essential — don't drop Modest.")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "5_slot": {
+                "folds": base_folds,
+                "mean_sharpe": round(float(base_sh.mean()), 3),
+                "mean_alpha": round(float(base_al.mean()), 6),
+                "mean_max_drawdown": round(float(base_dd.mean()), 6),
+                "cgt_bps_per_year": round(base_cgt, 1),
+            },
+            "stretch_only": {
+                "folds": stretch_folds,
+                "mean_sharpe": round(float(str_sh.mean()), 3),
+                "mean_alpha": round(float(str_al.mean()), 6),
+                "mean_max_drawdown": round(float(str_dd.mean()), 6),
+                "cgt_bps_per_year": round(str_cgt, 1),
+            },
+            "delta": {
+                "sharpe": round(float(d_sharpe), 3),
+                "alpha": round(float(d_alpha), 6),
+                "max_drawdown": round(float(d_dd), 6),
+            },
+        }
+        json_path = APP_DIR / "stretch_only_test_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n[stretch] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[stretch] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("STRETCH-ONLY TEST COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--stretch-only-test" in sys.argv:
+    _exit_code = _run_stretch_only_test()
     sys.exit(_exit_code)
 
 
