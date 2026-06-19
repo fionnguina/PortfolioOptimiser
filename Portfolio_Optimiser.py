@@ -10632,33 +10632,22 @@ try:
 except Exception as _e_metrics:
     print(f"[metrics] snapshot call failed: {_e_metrics}")
 
-# === Crash-diagnostic checkpoints (added 2026-06-19 to chase a silent dist
-# exe crash that died between [oos] metrics computed and Excel write). Keep
-# until the dist run reliably proceeds past these checkpoints.
-print(f"[debug-crash] CHECKPOINT 1: passed OOS metrics block")
 # Tables used later
 n_opt = len(securities_opt)
-print(f"[debug-crash] CHECKPOINT 2: n_opt={n_opt}")
 cov_plus = Sigma_opt.copy()
 cov_plus.loc[:, 'w'] = 0.0
 cov_plus.loc['w', :] = 0.0
 cov_plus.loc['w', 'w'] = 0.0
-print(f"[debug-crash] CHECKPOINT 3: cov_plus shape={cov_plus.shape}")
 exp_ret_df = mu_vec_opt.rename(exp_ret_label).to_frame()
-print(f"[debug-crash] CHECKPOINT 4: exp_ret_df shape={exp_ret_df.shape}")
 
 # FX map used by Holdings + trade plan
 usd_aud    = get_usd_aud_fx()
-print(f"[debug-crash] CHECKPOINT 5: usd_aud={usd_aud}")
 fx_map_all = fx_to_aud_for_tickers(prices.columns, usd_aud)
-print(f"[debug-crash] CHECKPOINT 6: fx_map_all len={len(fx_map_all)}")
 
 # ---- 10D) Reopen Excel and WRITE everything, then close ----
 if USE_XLWINGS:
-    print(f"[debug-crash] CHECKPOINT 7: about to spawn xw.App() — Excel COM")
     try:
         with xw.App(visible=False, add_book=False) as app:
-            print(f"[debug-crash] CHECKPOINT 8: xw.App spawned OK")
             filename = os.path.abspath(filename)
             wb = app.books.open(filename, update_links=False, read_only=False)      
             
@@ -12786,7 +12775,10 @@ def export_to_ppt(results, trades, charts=None):
     is_with = (pl == "with tilts" or pl == "with_tilts")
     is_ens = (pl == "ensemble")
     is_no = not (is_with or is_ens)
-    box = slide.shapes.add_textbox(Cm(2.15), Cm(2.05), Cm(21.80), Cm(0.45))
+    # Position INSIDE the blue title ribbon (band runs ~y=0.5 to y=2.5cm).
+    # Was at y=2.05 which sat too close to the bottom of the ribbon; bumped
+    # to y=1.55 so it nests cleanly under the title text.
+    box = slide.shapes.add_textbox(Cm(2.15), Cm(1.55), Cm(21.80), Cm(0.45))
     tf = box.text_frame
     tf.clear()
     tf.word_wrap = False
@@ -12824,7 +12816,10 @@ def export_to_ppt(results, trades, charts=None):
                     if n in mix.index:
                         parts.append(f"{_abbr.get(n, n)} {float(mix[n])*100:.0f}%")
                 mix_str = " · ".join(parts)
-                mix_box = slide.shapes.add_textbox(Cm(2.15), Cm(2.55), Cm(21.80), Cm(0.45))
+                # Sits in the blue ribbon directly under the plan label.
+                # Was at y=2.55 which spilled below the ribbon onto white;
+                # bumped to y=2.05 to stay inside the dark band.
+                mix_box = slide.shapes.add_textbox(Cm(2.15), Cm(2.05), Cm(21.80), Cm(0.45))
                 tfm = mix_box.text_frame
                 tfm.clear()
                 tfm.word_wrap = False
@@ -12840,10 +12835,13 @@ def export_to_ppt(results, trades, charts=None):
             print(f"[pptx] Slide 2 regime mix annotation skipped: {_e_mix}")
 
     # --- TLH scorecard line (one-liner with cumulative harvest activity) ---
-    # Positioned between the dark header band and the trade-plan table (which
-    # starts at top=Cm(4.0)). Uses dark text so it's visible on the light body
-    # background — the header-band white-text boxes above sit in the blue band
-    # but anything below ~y=3.1cm needs dark text.
+    # Positioned at the BOTTOM of slide 2 (below the Deferred Tax/Cash
+    # callouts at y=14.73cm). Standard widescreen slide height ~19cm, so
+    # y=16.7cm sits just above the bottom accent strip. Italic gray so it
+    # reads as supporting metadata, not a headline. Earlier it sat between
+    # the title ribbon and the trade plan table which crowded the layout —
+    # moving it to the bottom matches the cleaned-up layout in the target
+    # screenshot from 2026-06-19.
     try:
         _tlh_events_ppt = globals().get("oos_tlh_events", []) or []
         if TLH_ENABLED:
@@ -12863,7 +12861,7 @@ def export_to_ppt(results, trades, charts=None):
                 _tlh_text = (f"Tax-loss harvesting: enabled, 0 events triggered  ·  "
                              f"threshold {TLH_MIN_LOSS_PCT*100:+.0f}%, "
                              f"${TLH_MIN_LOSS_AUD:.0f} min, {TLH_COOLDOWN_DAYS}d cooldown")
-            tlh_box = slide.shapes.add_textbox(Cm(1.10), Cm(3.50), Cm(23.80), Cm(0.50))
+            tlh_box = slide.shapes.add_textbox(Cm(1.10), Cm(16.70), Cm(23.80), Cm(0.50))
             tft = tlh_box.text_frame
             tft.clear()
             tft.word_wrap = False
@@ -12874,8 +12872,8 @@ def export_to_ppt(results, trades, charts=None):
             pt_.font.size = Pt(10)
             pt_.font.italic = True
             pt_.font.color.rgb = RGBColor(60, 60, 60)
-            pt_.alignment = PP_ALIGN.LEFT
-            print(f"[pptx] Slide 2 TLH scorecard added: {len(_tlh_events_ppt)} events")
+            pt_.alignment = PP_ALIGN.CENTER
+            print(f"[pptx] Slide 2 TLH scorecard added (bottom): {len(_tlh_events_ppt)} events")
     except Exception as _e_tlh_ppt:
         print(f"[pptx] Slide 2 TLH scorecard skipped: {_e_tlh_ppt}")
 

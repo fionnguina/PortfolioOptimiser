@@ -5,42 +5,58 @@ import sys
 import os
 import io
 import datetime as _dt
+import faulthandler  # catches hard crashes (segfault, COM crash) with traceback
 
 
 def _setup_logging():
-    """Redirect stdout/stderr to a log file beside the executable.
+    """Redirect stdout/stderr to a timestamped log file beside the executable.
 
     The build is --noconsole, so prints and tracebacks would otherwise vanish.
-    We tee output to a log file (run.log) AND keep writing to the original
-    streams when present, so running from source still shows live output.
+    We tee output to `run_YYYY-MM-DD_HH-MM-SS.log` AND keep writing to the
+    original streams when present, so running from source still shows live
+    output. Also keeps a `run.log` symlink-like copy (overwritten each run)
+    for quick "latest" inspection.
+
+    Old run.log/run.log.N files from the prior rotation scheme are migrated
+    on first encounter. Logs older than KEEP_LATEST timestamped files are
+    auto-pruned so the dist folder stays tidy.
     """
     # Locate the directory the user actually launched from.
     base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
         else os.path.dirname(os.path.abspath(__file__))
-    log_path = os.path.join(base_dir, "run.log")
 
-    # Rotate prior run.log files: run.log -> run.log.1, .1 -> .2, ..., keep last 7.
-    # Lets us go back and diff against a working run if today's break.
-    KEEP = 7
+    # Generate timestamped filename for THIS run.
+    ts = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = f"run_{ts}.log"
+    log_path = os.path.join(base_dir, log_filename)
+
+    # Cleanup: remove old rotating run.log.N files from the legacy scheme.
+    # Also delete the previous run.log copy (we'll overwrite it below).
     try:
-        for i in range(KEEP - 1, 0, -1):
-            src = os.path.join(base_dir, f"run.log.{i}" if i > 0 else "run.log")
-            dst = os.path.join(base_dir, f"run.log.{i+1}")
-            if os.path.exists(src):
-                if os.path.exists(dst):
-                    try: os.remove(dst)
-                    except Exception: pass
-                try: os.rename(src, dst)
-                except Exception: pass
-        if os.path.exists(log_path):
-            dst = os.path.join(base_dir, "run.log.1")
-            if os.path.exists(dst):
-                try: os.remove(dst)
-                except Exception: pass
-            try: os.rename(log_path, dst)
-            except Exception: pass
+        for name in os.listdir(base_dir):
+            if name.startswith("run.log.") or name == "run.log":
+                try:
+                    os.remove(os.path.join(base_dir, name))
+                except Exception:
+                    pass
     except Exception:
-        pass  # rotation is best-effort; never block startup
+        pass
+
+    # Auto-prune timestamped logs: keep the most recent KEEP_LATEST.
+    KEEP_LATEST = 10
+    try:
+        ts_logs = sorted(
+            (n for n in os.listdir(base_dir)
+             if n.startswith("run_") and n.endswith(".log")),
+            reverse=True,
+        )
+        for old in ts_logs[KEEP_LATEST:]:
+            try:
+                os.remove(os.path.join(base_dir, old))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     try:
         log_fh = open(log_path, "w", encoding="utf-8", buffering=1)
@@ -74,6 +90,16 @@ def _setup_logging():
 
     sys.stdout = _Tee(sys.__stdout__, log_fh)
     sys.stderr = _Tee(sys.__stderr__, log_fh)
+    # Also write a "run.log" copy (overwritten each run) for quick "latest"
+    # inspection without having to find the newest timestamped file.
+    try:
+        latest_copy = open(os.path.join(base_dir, "run.log"),
+                            "w", encoding="utf-8", buffering=1)
+        latest_copy.write(header)
+        sys.stdout = _Tee(sys.__stdout__, log_fh, latest_copy)
+        sys.stderr = _Tee(sys.__stderr__, log_fh, latest_copy)
+    except Exception:
+        pass  # latest-copy is a convenience; never block on it
     return log_path
 
 
@@ -81,6 +107,20 @@ def main():
     log_path = _setup_logging()
     if log_path:
         print(f"[log] writing run log to: {log_path}")
+    # Catch hard crashes (SIGSEGV, Windows AV from Excel COM, etc.) — without
+    # this, the exe vanishes silently when xlwings/COM detonates. faulthandler
+    # writes a Python-level traceback when the process dies. In --noconsole
+    # PyInstaller builds, sys.stderr is the tee wrapper which has no fileno,
+    # so we point faulthandler at the underlying log file directly.
+    try:
+        if log_path:
+            _fh_log = open(log_path, "a", encoding="utf-8")
+            faulthandler.enable(file=_fh_log)
+        else:
+            faulthandler.enable()  # falls back to real stderr if any
+    except Exception as _fh_err:
+        # Silent — faulthandler is best-effort safety; never block startup.
+        pass
 
     # Bundle-aware import for Portfolio_Optimiser.py
     script_name = "Portfolio_Optimiser.py"
