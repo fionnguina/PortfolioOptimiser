@@ -146,10 +146,17 @@ if _TURNOVER_SWEEP_MODE:
 _WALK_FORWARD_CV_MODE = "--walk-forward-cv" in sys.argv
 if _WALK_FORWARD_CV_MODE:
     print("[wf-cv] --walk-forward-cv detected; will skip dialog + live pipeline")
+# `--attribution`: decompose OOS returns by slot, asset, and regime to
+# answer "where does the engine earn its money / lose to SPY?" Purely
+# descriptive — no parameters to tune, no validation budget consumed.
+_ATTRIBUTION_MODE = "--attribution" in sys.argv
+if _ATTRIBUTION_MODE:
+    print("[attr] --attribution detected; will skip dialog + live pipeline")
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
-                       or _TURNOVER_SWEEP_MODE or _WALK_FORWARD_CV_MODE)
+                       or _TURNOVER_SWEEP_MODE or _WALK_FORWARD_CV_MODE
+                       or _ATTRIBUTION_MODE)
 
 
 # =====================================================================
@@ -8343,6 +8350,328 @@ def _run_walk_forward_cv() -> int:
 
 if "--walk-forward-cv" in sys.argv:
     _exit_code = _run_walk_forward_cv()
+    sys.exit(_exit_code)
+
+
+# === Performance attribution (--attribution) ================================
+# Decomposes the engine's OOS returns to answer:
+#   1) Per-slot:   which of the 5 candidate slots adds Sharpe / α?
+#   2) Per-asset:  which tickers are the biggest cumulative contributors?
+#   3) Per-regime: bull (SPY 20d>50d) vs bear (SPY 20d<50d) split
+# Purely descriptive — no parameters to tune, no validation budget consumed.
+# Modern-universe filter (post-2016) matches walk-forward-cv default so
+# results are directly comparable.
+def _run_attribution() -> int:
+    print("\n" + "=" * 88)
+    print("PERFORMANCE ATTRIBUTION — where does the engine earn its money?")
+    print("=" * 88)
+
+    TRAIN_MONTHS = 24
+    MIN_OOS_YEAR = 2016
+    _attr_tickers = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[attr] universe: {len(_attr_tickers)} tickers, OOS filter: year ≥ {MIN_OOS_YEAR}")
+    print(f"[attr] downloading full history (max)...")
+
+    t0 = time.perf_counter()
+    raw = yf.download(_attr_tickers, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[attr] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    print(f"\n[attr] running engine (single walk-forward)...")
+    t1 = time.perf_counter()
+    out = run_oos_ensemble_walk_forward(
+        px_aud,
+        train_window_months=TRAIN_MONTHS,
+        rebalance=REBALANCE_FREQ,
+        benchmark_ticker="SPY",
+        score_lookback_days=252,
+        lambda_temp=3.0,
+        starting_nav_aud=1_000_000.0,
+    )
+    strat_rets_full = out["blended_returns"]
+    if strat_rets_full.empty:
+        print("[attr] engine returned empty series; aborting.")
+        return 1
+
+    # Slice OOS to modern era
+    mask = strat_rets_full.index.year >= MIN_OOS_YEAR
+    strat_rets = strat_rets_full.loc[mask]
+    if strat_rets.empty:
+        print(f"[attr] no OOS days in year ≥ {MIN_OOS_YEAR}; aborting.")
+        return 1
+    print(f"[attr] engine done ({len(strat_rets)} OOS days "
+          f"{strat_rets.index.min().date()} → {strat_rets.index.max().date()}) "
+          f"in {time.perf_counter()-t1:.1f}s")
+
+    years = max(len(strat_rets) / ANNUAL_TRADING_DAYS, 1e-6)
+    nav_curve = (1.0 + strat_rets).cumprod()
+    strat_ann = float(nav_curve.iloc[-1] ** (1.0 / years) - 1.0)
+    strat_vol = float(strat_rets.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+    strat_sharpe = strat_ann / strat_vol if strat_vol > 0 else 0.0
+    spy_ret_full = (px_aud["SPY"].pct_change().dropna()
+                    if "SPY" in px_aud.columns else pd.Series(dtype=float))
+    spy_window = spy_ret_full.reindex(strat_rets.index).fillna(0.0)
+    spy_nav = (1.0 + spy_window).cumprod()
+    spy_ann = float(spy_nav.iloc[-1] ** (1.0 / years) - 1.0)
+    spy_vol = float(spy_window.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+    spy_sharpe = spy_ann / spy_vol if spy_vol > 0 else 0.0
+    print(f"\n[attr] BLENDED  ann={strat_ann*100:+.2f}%  "
+          f"Sharpe={strat_sharpe:.2f}  "
+          f"vs SPY ann={spy_ann*100:+.2f}%  Sharpe={spy_sharpe:.2f}  "
+          f"α={strat_ann-spy_ann:+.2%}")
+
+    # === 1) Per-slot attribution ===
+    print("\n" + "=" * 88)
+    print("1) PER-SLOT ATTRIBUTION")
+    print("=" * 88)
+    print("  Standalone = each slot's returns if it were held alone (no blending).")
+    print("  Contribution = avg softmax weight × slot's actual return inside blend.")
+    print()
+    slot_rows: list[dict] = []
+    cand_rets_df = out.get("per_candidate_returns", pd.DataFrame())
+    softmax_df = out.get("softmax_history", pd.DataFrame())
+    cand_rets_mod = cand_rets_df.loc[cand_rets_df.index.year >= MIN_OOS_YEAR] \
+                     if not cand_rets_df.empty else pd.DataFrame()
+    softmax_mod = softmax_df.loc[softmax_df.index.year >= MIN_OOS_YEAR] \
+                   if not softmax_df.empty else pd.DataFrame()
+
+    for slot in ENSEMBLE_SLOT_NAMES:
+        if slot not in cand_rets_mod.columns:
+            continue
+        sr = cand_rets_mod[slot].dropna()
+        if sr.empty:
+            continue
+        sr_nav = (1.0 + sr).cumprod()
+        s_years = max(len(sr) / ANNUAL_TRADING_DAYS, 1e-6)
+        s_ann = float(sr_nav.iloc[-1] ** (1.0 / s_years) - 1.0)
+        s_vol = float(sr.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        s_sharpe = s_ann / s_vol if s_vol > 0 else 0.0
+        spy_aligned = spy_ret_full.reindex(sr.index).fillna(0.0)
+        spy_nav_s = (1.0 + spy_aligned).cumprod()
+        spy_ann_s = float(spy_nav_s.iloc[-1] ** (1.0 / s_years) - 1.0)
+        s_alpha = s_ann - spy_ann_s
+        s_dd = float((sr_nav / sr_nav.cummax() - 1.0).min())
+
+        avg_softmax = float(softmax_mod.get(slot, pd.Series(0.0)).mean()) if not softmax_mod.empty else 0.0
+        slot_rows.append({
+            "slot": slot,
+            "avg_softmax_weight": avg_softmax,
+            "standalone_ann_return": s_ann,
+            "standalone_sharpe": s_sharpe,
+            "standalone_max_drawdown": s_dd,
+            "standalone_alpha_vs_spy": s_alpha,
+            "contribution_to_blended": avg_softmax * s_ann,
+        })
+
+    print(f"  {'Slot':<22} {'AvgWt':>7} {'AnnRet':>9} {'Sharpe':>7} "
+          f"{'MaxDD':>8} {'α(SPY)':>8} {'Contrib':>9}")
+    print(f"  {'-'*22} {'-'*7} {'-'*9} {'-'*7} {'-'*8} {'-'*8} {'-'*9}")
+    for r in slot_rows:
+        print(f"  {r['slot']:<22} "
+              f"{r['avg_softmax_weight']*100:>6.1f}% "
+              f"{r['standalone_ann_return']*100:>+8.2f}% "
+              f"{r['standalone_sharpe']:>7.2f} "
+              f"{r['standalone_max_drawdown']*100:>+7.2f}% "
+              f"{r['standalone_alpha_vs_spy']*100:>+7.2f}% "
+              f"{r['contribution_to_blended']*100:>+8.2f}%")
+    print()
+    print(f"  Blended ann return (sum of contributions, approx): "
+          f"{sum(r['contribution_to_blended'] for r in slot_rows)*100:+.2f}%")
+    print(f"  Blended ann return (actual realised, with regime switching): "
+          f"{strat_ann*100:+.2f}%")
+    print(f"  Difference = value added by softmax timing of slot weights.")
+
+    # === 2) Per-asset attribution ===
+    print("\n" + "=" * 88)
+    print("2) PER-ASSET ATTRIBUTION (cumulative return contribution to blended)")
+    print("=" * 88)
+    blended_weights_df = out.get("blended_weights", pd.DataFrame())
+    asset_contrib: dict[str, float] = {}
+    if not blended_weights_df.empty:
+        bw = blended_weights_df.copy()
+        bw.index = pd.to_datetime(bw.index).tz_localize(None)
+        bw = bw.sort_index()
+        bw_mod = bw.loc[bw.index.year >= MIN_OOS_YEAR]
+        # Daily forward-filled blended weights across the OOS span.
+        daily_idx = strat_rets.index
+        bw_daily = bw_mod.reindex(daily_idx).ffill().fillna(0.0)
+        # Daily asset returns aligned to OOS span.
+        asset_rets_daily = px_aud.pct_change().reindex(daily_idx).fillna(0.0)
+        # Per-asset cumulative contribution = sum over days of (w_a(d) × r_a(d)).
+        # That sum approximately equals the asset's contribution to total blended
+        # return (exact under buy-and-hold; near-exact with daily rebalance lag).
+        common_tkrs = [c for c in bw_daily.columns if c in asset_rets_daily.columns]
+        for tkr in common_tkrs:
+            contrib = float((bw_daily[tkr] * asset_rets_daily[tkr]).sum())
+            asset_contrib[tkr] = contrib
+
+    sorted_assets = sorted(asset_contrib.items(), key=lambda kv: kv[1], reverse=True)
+    n_show = min(10, len(sorted_assets))
+    print(f"  TOP {n_show} CONTRIBUTORS (cumulative return added):")
+    print(f"  {'Ticker':<10} {'Cum Contrib':>13}")
+    print(f"  {'-'*10} {'-'*13}")
+    for tkr, c in sorted_assets[:n_show]:
+        print(f"  {tkr:<10} {c*100:>+12.2f}%")
+    print()
+    print(f"  BOTTOM {n_show} CONTRIBUTORS:")
+    print(f"  {'Ticker':<10} {'Cum Contrib':>13}")
+    print(f"  {'-'*10} {'-'*13}")
+    for tkr, c in sorted_assets[-n_show:]:
+        print(f"  {tkr:<10} {c*100:>+12.2f}%")
+    total_contrib = sum(c for _, c in sorted_assets)
+    print(f"\n  Sum of all asset contributions: {total_contrib*100:+.2f}%")
+    print(f"  Blended cumulative return (actual): {(nav_curve.iloc[-1] - 1.0)*100:+.2f}%")
+
+    # === 3) Per-regime attribution ===
+    print("\n" + "=" * 88)
+    print("3) PER-REGIME ATTRIBUTION (SPY 20d/50d SMA cross)")
+    print("=" * 88)
+    spy_px = px_aud["SPY"] if "SPY" in px_aud.columns else pd.Series(dtype=float)
+    regime_rows = []
+    if not spy_px.empty:
+        sma20 = spy_px.rolling(20).mean()
+        sma50 = spy_px.rolling(50).mean()
+        regime_flag = (sma20 > sma50).reindex(strat_rets.index).ffill()
+        for label, mask in [("BULL (SMA20>SMA50)", regime_flag == True),
+                            ("BEAR (SMA20<SMA50)", regime_flag == False)]:
+            chunk = strat_rets.loc[mask]
+            spy_chunk = spy_window.loc[mask]
+            if chunk.empty:
+                continue
+            chunk_nav = (1.0 + chunk).cumprod()
+            n = len(chunk)
+            y = max(n / ANNUAL_TRADING_DAYS, 1e-6)
+            ann_ret = float(chunk_nav.iloc[-1] ** (1.0 / y) - 1.0)
+            vol = float(chunk.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+            sh = ann_ret / vol if vol > 0 else 0.0
+            spy_nav_r = (1.0 + spy_chunk).cumprod()
+            spy_ann_r = float(spy_nav_r.iloc[-1] ** (1.0 / y) - 1.0)
+            spy_vol_r = float(spy_chunk.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+            spy_sh = spy_ann_r / spy_vol_r if spy_vol_r > 0 else 0.0
+            dd = float((chunk_nav / chunk_nav.cummax() - 1.0).min())
+            # Average softmax slot weights during this regime
+            softmax_in_regime = pd.Series(dtype=float)
+            if not softmax_mod.empty:
+                sm_idx = softmax_mod.index[softmax_mod.index.isin(chunk.index)]
+                if not sm_idx.empty:
+                    softmax_in_regime = softmax_mod.loc[sm_idx].mean()
+            regime_rows.append({
+                "regime": label,
+                "n_days": n,
+                "frac_of_oos": n / len(strat_rets),
+                "ann_return": ann_ret,
+                "sharpe": sh,
+                "max_drawdown": dd,
+                "spy_ann_return": spy_ann_r,
+                "spy_sharpe": spy_sh,
+                "alpha_vs_spy": ann_ret - spy_ann_r,
+                "avg_slot_weights": {k: float(v) for k, v in softmax_in_regime.items()},
+            })
+
+    print(f"  {'Regime':<20} {'Days':>5} {'%OOS':>5} {'AnnRet':>9} "
+          f"{'Sharpe':>7} {'MaxDD':>8} {'SPY Ret':>9} {'SPY Sh':>7} {'α':>8}")
+    print(f"  {'-'*20} {'-'*5} {'-'*5} {'-'*9} {'-'*7} {'-'*8} {'-'*9} {'-'*7} {'-'*8}")
+    for r in regime_rows:
+        print(f"  {r['regime']:<20} "
+              f"{r['n_days']:>5} "
+              f"{r['frac_of_oos']*100:>4.0f}% "
+              f"{r['ann_return']*100:>+8.2f}% "
+              f"{r['sharpe']:>7.2f} "
+              f"{r['max_drawdown']*100:>+7.2f}% "
+              f"{r['spy_ann_return']*100:>+8.2f}% "
+              f"{r['spy_sharpe']:>7.2f} "
+              f"{r['alpha_vs_spy']*100:>+7.2f}%")
+    print()
+    for r in regime_rows:
+        if r["avg_slot_weights"]:
+            mix = " · ".join(f"{k.split(' ')[0]} {v*100:.0f}%"
+                              for k, v in r["avg_slot_weights"].items())
+            print(f"  {r['regime']} avg slot mix: {mix}")
+
+    # === Verdict ===
+    print("\n" + "=" * 88)
+    print("VERDICT")
+    print("=" * 88)
+    if slot_rows:
+        best_slot = max(slot_rows, key=lambda r: r["standalone_alpha_vs_spy"])
+        worst_slot = min(slot_rows, key=lambda r: r["standalone_alpha_vs_spy"])
+        print(f"  Best α-vs-SPY slot:  {best_slot['slot']}  "
+              f"α={best_slot['standalone_alpha_vs_spy']*100:+.2f}%  "
+              f"(avg weight {best_slot['avg_softmax_weight']*100:.0f}%)")
+        print(f"  Worst α-vs-SPY slot: {worst_slot['slot']}  "
+              f"α={worst_slot['standalone_alpha_vs_spy']*100:+.2f}%  "
+              f"(avg weight {worst_slot['avg_softmax_weight']*100:.0f}%)")
+    if regime_rows:
+        bull = next((r for r in regime_rows if "BULL" in r["regime"]), None)
+        bear = next((r for r in regime_rows if "BEAR" in r["regime"]), None)
+        if bull and bear:
+            print(f"  Bull-regime α: {bull['alpha_vs_spy']*100:+.2f}%   "
+                  f"Bear-regime α: {bear['alpha_vs_spy']*100:+.2f}%")
+            if bear["alpha_vs_spy"] > bull["alpha_vs_spy"] + 0.05:
+                print(f"  Reading: engine outperforms SPY in BEAR regimes — "
+                      f"consistent with vol-managed-beta thesis.")
+            elif bull["alpha_vs_spy"] > bear["alpha_vs_spy"] + 0.05:
+                print(f"  Reading: engine outperforms in BULL regimes — "
+                      f"unusual for a vol-managed strategy, possibly noise.")
+            else:
+                print(f"  Reading: regime α difference small — engine is "
+                      f"regime-neutral on raw return.")
+
+    # Save JSON
+    try:
+        summary = {
+            "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "oos_window": {
+                "start": str(strat_rets.index.min().date()),
+                "end": str(strat_rets.index.max().date()),
+                "n_days": len(strat_rets),
+                "years": round(years, 2),
+            },
+            "blended": {
+                "ann_return": round(strat_ann, 6),
+                "sharpe": round(strat_sharpe, 3),
+                "spy_ann_return": round(spy_ann, 6),
+                "spy_sharpe": round(spy_sharpe, 3),
+                "alpha_vs_spy": round(strat_ann - spy_ann, 6),
+            },
+            "per_slot": slot_rows,
+            "per_asset_top": [{"ticker": t, "cum_contribution": round(c, 6)}
+                              for t, c in sorted_assets[:n_show]],
+            "per_asset_bottom": [{"ticker": t, "cum_contribution": round(c, 6)}
+                                 for t, c in sorted_assets[-n_show:]],
+            "per_regime": regime_rows,
+        }
+        json_path = APP_DIR / "attribution_summary.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n[attr] summary JSON → {json_path}")
+    except Exception as e:
+        print(f"[attr] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("ATTRIBUTION COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+if "--attribution" in sys.argv:
+    _exit_code = _run_attribution()
     sys.exit(_exit_code)
 
 
