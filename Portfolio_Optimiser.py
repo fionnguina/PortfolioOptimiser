@@ -88,6 +88,11 @@ except Exception:
     _BUILD_TIME = "n/a"
 print(f"[build] version: GIT_SHA={_BUILD_GIT_SHA}  BUILD_TIME={_BUILD_TIME}")
 
+# Track script start time for the [health] runtime line at the end of every
+# live run (see _print_run_health_summary at bottom of file).
+import time as _time_for_health
+_SCRIPT_START_TIME = _time_for_health.perf_counter()
+
 
 # === Swallowed-exception helper (F1/F3/L18) ==================================
 # Use inside `except: pass` blocks where pass is the desired runtime behaviour
@@ -14857,3 +14862,119 @@ if OPEN_PPT_AFTER_SAVE and ppt_path:
         open_ppt_if_enabled(ppt_path)
     else:
         print(f"[pptx] Saved but not opened automatically (file not stable yet): {ppt_path}")
+
+
+# === RUN HEALTH SUMMARY ============================================
+# One-shot block at the very end of the live pipeline. Designed so a
+# silent failure (Excel skipped a sheet, metrics regressed, PPT slide
+# missing, etc.) can't slip through unnoticed. Scans the run.log for
+# [WARN] / [ERROR] / metrics-warn counts and reports them alongside
+# the in-memory state.
+def _print_run_health_summary():
+    import os
+    print()
+    print("=" * 88)
+    print("[health] === RUN HEALTH SUMMARY ===")
+    print("=" * 88)
+    # Runtime
+    try:
+        elapsed = _time_for_health.perf_counter() - _SCRIPT_START_TIME
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        print(f"  Runtime:              {mins}m {secs:02d}s")
+    except Exception:
+        pass
+    print(f"  Build:                {_BUILD_GIT_SHA} at {_BUILD_TIME}")
+    _prod_label = (next(iter(PRODUCTION_SLOT_OVERRIDE.keys()))
+                    if PRODUCTION_SLOT_OVERRIDE else "5-slot blend")
+    print(f"  Production config:    slot={_prod_label}  "
+          f"crash_hedge={'ON' if PRODUCTION_CRASH_HEDGE else 'off'}")
+
+    # PPT
+    if ppt_path and os.path.exists(ppt_path):
+        try:
+            from pptx import Presentation as _P
+            _p = _P(ppt_path)
+            print(f"  PPT generated:        OK ({len(_p.slides)} slides)")
+        except Exception:
+            print(f"  PPT generated:        OK")
+    else:
+        print(f"  PPT generated:        FAILED / not saved")
+
+    # Excel
+    try:
+        _xlpath = globals().get("filename")
+        if _xlpath and os.path.exists(_xlpath):
+            mtime = os.path.getmtime(_xlpath)
+            age_s = _time_for_health.time() - mtime
+            if age_s < 120:
+                print(f"  Excel workbook:       OK (updated {int(age_s)}s ago)")
+            else:
+                print(f"  Excel workbook:       WARNING (last modified {int(age_s/60)}m ago)")
+    except Exception:
+        pass
+
+    # Metrics history
+    try:
+        _hist_path = APP_DIR / "metrics_history.jsonl"
+        if _hist_path.exists():
+            with _hist_path.open(encoding="utf-8") as f:
+                _n_hist = sum(1 for line in f if line.strip())
+            print(f"  Metrics snapshot:     OK ({_n_hist} total runs logged)")
+    except Exception:
+        pass
+
+    # Live recommendation
+    _w_live = globals().get("W_ENSEMBLE_SER", pd.Series(dtype=float))
+    if isinstance(_w_live, pd.Series) and not _w_live.empty:
+        print(f"  Live recommendation:  {len(_w_live)} positions")
+
+    # TLH events
+    _tlh = globals().get("oos_tlh_events", []) or []
+    if _tlh:
+        _loss = float(sum(e.get("loss_aud", 0.0) for e in _tlh))
+        print(f"  TLH (backtest):       {len(_tlh)} events  (${_loss:,.0f} loss realised)")
+
+    # Drift tracker last state
+    try:
+        _drift_summary = globals().get("DRIFT_LAST_SUMMARY", None)
+        if isinstance(_drift_summary, str):
+            print(f"  Drift tracker:        {_drift_summary}")
+    except Exception:
+        pass
+
+    # Scan run.log for warnings + errors + metrics regressions
+    try:
+        base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+            else os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(base_dir, "run.log")
+        if os.path.exists(log_path):
+            with open(log_path, encoding="utf-8", errors="ignore") as f:
+                log_text = f.read()
+            n_warn = (log_text.count("[WARN") + log_text.count("[warn")
+                      + log_text.count("WARNING") + log_text.count("Warning"))
+            # subtract the count of the word "Warning" inside the health block we're emitting now
+            # (rough — best-effort).
+            n_err = (log_text.count("[ERROR") + log_text.count("Traceback")
+                     + log_text.count("FAILED") + log_text.count("Exception:"))
+            n_regress = log_text.count("[metrics-warn]")
+            _warn_str = f"  Warnings in log:      {n_warn}"
+            if n_warn > 0:
+                _warn_str += "  (grep run.log for [WARN])"
+            print(_warn_str)
+            _err_str = f"  Errors in log:        {n_err}"
+            if n_err > 0:
+                _err_str += "  ← INVESTIGATE (grep run.log for [ERROR] / Traceback)"
+            print(_err_str)
+            if n_regress:
+                print(f"  Metrics regressions:  {n_regress}  ← REVIEW (grep run.log for [metrics-warn])")
+            print(f"  Run log:              {log_path}")
+    except Exception as _e_log:
+        print(f"  (log scan failed: {_e_log})")
+    print("=" * 88)
+
+
+try:
+    _print_run_health_summary()
+except Exception as _e_health:
+    print(f"[health] summary print failed: {_e_health}")
