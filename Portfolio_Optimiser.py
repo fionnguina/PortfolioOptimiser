@@ -901,6 +901,124 @@ def _run_factor_recs() -> int:
 # sweep-mean MaxDD looked fine in isolation but full-period peak-to-trough
 # was much worse. Without a persistent log, that kind of regression is
 # invisible run-to-run.
+def _evaluate_sweep_result(
+    baseline: dict,
+    treatment: dict,
+    *,
+    sharpe_threshold: float = -0.10,
+    maxdd_threshold: float = -0.05,
+    alpha_threshold: float = -0.01,
+    return_threshold: float = -0.01,
+    label_baseline: str = "baseline",
+    label_treatment: str = "treatment",
+) -> dict:
+    """Honest verdict for any A/B sweep: treatment vs baseline.
+
+    Each dict should contain: sharpe, max_drawdown, alpha_vs_spy, ann_return.
+    Missing keys are treated as 'unmeasured' (skipped). The verdict requires
+    treatment NOT to regress materially on ANY of the four dimensions —
+    fixes the 2026-06-19 bug where sweep verdicts said PROCEED based on
+    Sharpe improvement while silently ignoring a -5.5%/yr return collapse.
+
+    Thresholds are *worst tolerable delta* (negative = regression). Defaults:
+      sharpe   ≥ -0.10  (Sharpe must not drop by more than 0.10)
+      maxdd    ≥ -0.05  (MaxDD must not deepen by more than 5pp)
+      alpha    ≥ -0.01  (alpha vs SPY must not drop by more than 1pp)
+      return   ≥ -0.01  (annualised return must not drop by more than 1pp)
+
+    Returns dict with:
+      warnings   list[str]  — one line per regressing dimension
+      improvements list[str] — one line per materially improving dimension
+      verdict    str        — 'SHIP' / 'NEUTRAL' / 'REVERT'
+      summary    str        — one-line headline
+    """
+    def _d(key, neg_is_bad=False):
+        b = baseline.get(key); t = treatment.get(key)
+        if b is None or t is None:
+            return None, None, None
+        delta = t - b
+        return b, t, delta
+
+    warnings = []
+    improvements = []
+
+    b_sh, t_sh, d_sh = _d("sharpe")
+    if d_sh is not None:
+        if d_sh <= sharpe_threshold:
+            warnings.append(f"Sharpe regressed {d_sh:+.3f} ({b_sh:.2f} → {t_sh:.2f})")
+        elif d_sh >= -sharpe_threshold:
+            improvements.append(f"Sharpe improved {d_sh:+.3f} ({b_sh:.2f} → {t_sh:.2f})")
+
+    b_dd, t_dd, d_dd = _d("max_drawdown")
+    if d_dd is not None:
+        # max_drawdown is negative; "regressed" = MORE negative (deeper)
+        if d_dd <= maxdd_threshold:
+            warnings.append(f"MaxDD deepened by {d_dd*100:+.2f}pp "
+                              f"({b_dd*100:+.2f}% → {t_dd*100:+.2f}%)")
+        elif d_dd >= -maxdd_threshold:
+            improvements.append(f"MaxDD improved by {d_dd*100:+.2f}pp "
+                                  f"({b_dd*100:+.2f}% → {t_dd*100:+.2f}%)")
+
+    b_al, t_al, d_al = _d("alpha_vs_spy")
+    if d_al is not None:
+        if d_al <= alpha_threshold:
+            warnings.append(f"Alpha vs SPY worsened {d_al*100:+.2f}pp "
+                              f"({b_al*100:+.2f}% → {t_al*100:+.2f}%)")
+        elif d_al >= -alpha_threshold:
+            improvements.append(f"Alpha improved {d_al*100:+.2f}pp "
+                                  f"({b_al*100:+.2f}% → {t_al*100:+.2f}%)")
+
+    b_rt, t_rt, d_rt = _d("ann_return")
+    if d_rt is not None:
+        if d_rt <= return_threshold:
+            warnings.append(f"Ann return dropped {d_rt*100:+.2f}pp "
+                              f"({b_rt*100:+.2f}% → {t_rt*100:+.2f}%)")
+        elif d_rt >= -return_threshold:
+            improvements.append(f"Ann return rose {d_rt*100:+.2f}pp "
+                                  f"({b_rt*100:+.2f}% → {t_rt*100:+.2f}%)")
+
+    # Overall verdict
+    if warnings:
+        verdict = "REVERT"
+        summary = (f"{label_treatment} regresses on {len(warnings)} dimension(s) "
+                    f"vs {label_baseline} — DO NOT SHIP without addressing the warnings")
+    elif improvements:
+        verdict = "SHIP"
+        summary = (f"{label_treatment} improves on {len(improvements)} dimension(s) "
+                    f"vs {label_baseline} with no material regression — candidate for shipping")
+    else:
+        verdict = "NEUTRAL"
+        summary = (f"{label_treatment} is within noise of {label_baseline} on all "
+                    f"dimensions — no material change, keep current default")
+
+    return {
+        "warnings": warnings,
+        "improvements": improvements,
+        "verdict": verdict,
+        "summary": summary,
+    }
+
+
+def _print_sweep_verdict(eval_result: dict) -> None:
+    """Pretty-print the result of _evaluate_sweep_result() to console + run.log.
+    Always prints warnings FIRST so the eye catches regressions immediately,
+    then improvements, then the overall verdict header."""
+    print("=" * 88)
+    print(f"VERDICT — {eval_result['verdict']}")
+    print("=" * 88)
+    print(f"  {eval_result['summary']}")
+    if eval_result["warnings"]:
+        print(f"\n  REGRESSIONS (worst-tolerable thresholds breached):")
+        for w in eval_result["warnings"]:
+            print(f"    ✗  {w}")
+    if eval_result["improvements"]:
+        print(f"\n  Improvements (beyond noise):")
+        for im in eval_result["improvements"]:
+            print(f"    ✓  {im}")
+    if not eval_result["warnings"] and not eval_result["improvements"]:
+        print(f"  All four dimensions (Sharpe, MaxDD, Alpha, Ann Return) within noise.")
+
+
 def _append_metrics_snapshot(metrics_table, ensemble_mix_live, w_ensemble_live,
                               tlh_events_n: int = 0, tlh_loss_aud: float = 0.0,
                               n_executed: int = 0, n_skipped: int = 0) -> None:
@@ -9773,6 +9891,8 @@ def _run_crash_hedge_test() -> int:
     hedge_al = np.array([r["alpha_vs_spy"] for r in hedge_folds if r["year"] in common_years])
     base_dd = np.array([r["max_drawdown"] for r in base_folds if r["year"] in common_years])
     hedge_dd = np.array([r["max_drawdown"] for r in hedge_folds if r["year"] in common_years])
+    base_rt = np.array([r["ann_return"] for r in base_folds if r["year"] in common_years])
+    hedge_rt = np.array([r["ann_return"] for r in hedge_folds if r["year"] in common_years])
 
     print("\n" + "=" * 88)
     print("AGGREGATE (mean ± std across folds)")
@@ -9780,6 +9900,9 @@ def _run_crash_hedge_test() -> int:
     print(f"  Sharpe:        baseline {base_sh.mean():+.2f} ± {base_sh.std(ddof=1):.2f}   "
           f"hedge {hedge_sh.mean():+.2f} ± {hedge_sh.std(ddof=1):.2f}   "
           f"Δ {hedge_sh.mean() - base_sh.mean():+.2f}")
+    print(f"  Ann return:    baseline {base_rt.mean()*100:+.2f}%   "
+          f"hedge {hedge_rt.mean()*100:+.2f}%   "
+          f"Δ {(hedge_rt.mean() - base_rt.mean())*100:+.2f}%")
     print(f"  α vs SPY:      baseline {base_al.mean()*100:+.2f}% ± {base_al.std(ddof=1)*100:.2f}%   "
           f"hedge {hedge_al.mean()*100:+.2f}% ± {hedge_al.std(ddof=1)*100:.2f}%   "
           f"Δ {(hedge_al.mean() - base_al.mean())*100:+.2f}%")
@@ -9790,23 +9913,26 @@ def _run_crash_hedge_test() -> int:
           f"hedge {hedge_info['cgt_bps_per_year']:.0f}   "
           f"Δ {hedge_info['cgt_bps_per_year'] - base_info['cgt_bps_per_year']:+.0f}")
 
-    # === Verdict ===
-    print("\n" + "=" * 88)
-    print("VERDICT")
-    print("=" * 88)
-    d_sharpe = hedge_sh.mean() - base_sh.mean()
-    d_alpha = hedge_al.mean() - base_al.mean()
-    d_dd = hedge_dd.mean() - base_dd.mean()
-    if d_sharpe > 0.10 and d_dd > 0:
-        print(f"  Reading: hedge IMPROVES Sharpe AND reduces drawdown — keep it on.")
-    elif d_sharpe > 0.05:
-        print(f"  Reading: hedge moderately improves Sharpe. MaxDD impact: {d_dd*100:+.1f}%.")
-    elif d_sharpe > -0.05:
-        print(f"  Reading: hedge ≈ neutral on Sharpe. MaxDD impact: {d_dd*100:+.1f}%.")
-    else:
-        print(f"  Reading: hedge HURTS Sharpe by {d_sharpe:+.2f}. The trigger fires "
-              f"too often or releases too late.")
-    print(f"  N triggers in OOS window: {hedge_info['hedge_n_triggers']}")
+    # === Verdict (honest 4-dimension check via central helper) ===
+    print()
+    _verdict = _evaluate_sweep_result(
+        baseline={
+            "sharpe": float(base_sh.mean()),
+            "max_drawdown": float(base_dd.min()),  # worst-fold MaxDD as proxy
+            "alpha_vs_spy": float(base_al.mean()),
+            "ann_return": float(base_rt.mean()),
+        },
+        treatment={
+            "sharpe": float(hedge_sh.mean()),
+            "max_drawdown": float(hedge_dd.min()),
+            "alpha_vs_spy": float(hedge_al.mean()),
+            "ann_return": float(hedge_rt.mean()),
+        },
+        label_baseline="hedge OFF",
+        label_treatment="hedge ON",
+    )
+    _print_sweep_verdict(_verdict)
+    print(f"\n  N triggers in OOS window: {hedge_info['hedge_n_triggers']}")
     print(f"  Hedge active on {hedge_info['hedge_active_rebals']} rebalances "
           f"(out of {hedge_info['n_executed'] + hedge_info['n_skipped']})")
 
@@ -10269,27 +10395,25 @@ def _run_stretch_only_test() -> int:
     print(f"  CGT:           5-slot {base_cgt:.0f} bps/yr   Stretch {str_cgt:.0f} bps/yr   "
           f"Δ {str_cgt - base_cgt:+.0f}")
 
-    # === Verdict ===
-    print("\n" + "=" * 88)
-    print("VERDICT")
-    print("=" * 88)
-    d_sharpe = str_sh.mean() - base_sh.mean()
-    d_alpha = str_al.mean() - base_al.mean()
-    d_dd = str_dd.mean() - base_dd.mean()
-    if d_sharpe > 0.10 and d_alpha > 0:
-        print(f"  Reading: Stretch-only IMPROVES Sharpe ({d_sharpe:+.2f}) AND alpha "
-              f"({d_alpha*100:+.2f}%). The defensive slots are alpha tax with no Sharpe benefit.")
-    elif d_sharpe > 0.05:
-        print(f"  Reading: Stretch-only mildly better. MaxDD impact: {d_dd*100:+.1f}%.")
-    elif d_sharpe > -0.05:
-        print(f"  Reading: Roughly neutral on Sharpe. MaxDD impact: {d_dd*100:+.1f}%. "
-              f"5-slot blending costs nothing meaningful, gives some MaxDD smoothing.")
-    elif d_sharpe > -0.15:
-        print(f"  Reading: Stretch-only hurts Sharpe by {d_sharpe:+.2f} — the defensive "
-              f"layer is delivering risk-adjusted value, even at alpha cost.")
-    else:
-        print(f"  Reading: Stretch-only badly hurts Sharpe ({d_sharpe:+.2f}). Defensive "
-              f"layer is essential — don't drop Modest.")
+    # === Verdict (honest 4-dimension check via central helper) ===
+    print()
+    _verdict = _evaluate_sweep_result(
+        baseline={
+            "sharpe": float(base_sh.mean()),
+            "max_drawdown": float(base_dd.min()),
+            "alpha_vs_spy": float(base_al.mean()),
+            "ann_return": float(base_rt.mean()),
+        },
+        treatment={
+            "sharpe": float(str_sh.mean()),
+            "max_drawdown": float(str_dd.min()),
+            "alpha_vs_spy": float(str_al.mean()),
+            "ann_return": float(str_rt.mean()),
+        },
+        label_baseline="5-slot blend",
+        label_treatment="Stretch-only",
+    )
+    _print_sweep_verdict(_verdict)
 
     # Save JSON
     try:
@@ -10804,25 +10928,30 @@ def _run_tilted_ensemble_test() -> int:
           f"tilts {tilt_full_dd*100:+.2f}%   "
           f"Δ {(tilt_full_dd - base_full_dd)*100:+.2f}%   ← key metric")
 
-    # === Verdict ===
-    print("\n" + "=" * 88)
-    print("VERDICT")
-    print("=" * 88)
-    d_sh_mean = tilt_sh.mean() - base_sh.mean()
-    d_full_dd = tilt_full_dd - base_full_dd
-    if d_sh_mean > 0.05 and d_full_dd > -0.03:
-        print(f"  Reading: tilts IMPROVE Sharpe (+{d_sh_mean:.2f}) without "
-              f"worsening full-period MaxDD ({d_full_dd*100:+.2f}%). PROCEED.")
-        print(f"  Recommend: set PRODUCTION_AUTO_FACTOR_TILTS = True after one more")
-        print(f"  sanity check (live-pipeline run, then check metrics_history regression).")
-    elif d_sh_mean > -0.05 and d_full_dd > -0.05:
-        print(f"  Reading: tilts ≈ neutral (ΔSharpe {d_sh_mean:+.2f}, "
-              f"ΔMaxDD {d_full_dd*100:+.2f}%). Marginal benefit, may not be worth")
-        print(f"  the added complexity.")
-    else:
-        print(f"  Reading: tilts HURT (ΔSharpe {d_sh_mean:+.2f}, "
-              f"ΔMaxDD {d_full_dd*100:+.2f}%). KEEP OFF — auto-tilts don't")
-        print(f"  generalise. Engine ceiling holds.")
+    # === Verdict (honest 4-dimension check via central helper) ===
+    print()
+    _verdict = _evaluate_sweep_result(
+        baseline={
+            "sharpe": float(base_sh.mean()),
+            "max_drawdown": float(base_full_dd),
+            "alpha_vs_spy": float(base_al.mean()),
+            "ann_return": float(base_rt.mean()),
+        },
+        treatment={
+            "sharpe": float(tilt_sh.mean()),
+            "max_drawdown": float(tilt_full_dd),
+            "alpha_vs_spy": float(tilt_al.mean()),
+            "ann_return": float(tilt_rt.mean()),
+        },
+        label_baseline="no tilts",
+        label_treatment="auto tilts ON",
+    )
+    _print_sweep_verdict(_verdict)
+    if _verdict["verdict"] == "SHIP":
+        print(f"\n  Next: live-pipeline sanity run, then set "
+              f"PRODUCTION_AUTO_FACTOR_TILTS = True if metrics_history confirms.")
+    elif _verdict["verdict"] == "REVERT":
+        print(f"\n  Next: KEEP PRODUCTION_AUTO_FACTOR_TILTS = False. Engine ceiling holds.")
     print()
 
     # Save JSON
