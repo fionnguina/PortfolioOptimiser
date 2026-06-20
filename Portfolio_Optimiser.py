@@ -6793,7 +6793,17 @@ def run_oos_walk_forward(
     weights_history: dict[pd.Timestamp, pd.Series] = {}
     segments: list[pd.Series] = []
 
+    _n_rebals_total = len(rebal_dates)
+    _progress_every = max(10, _n_rebals_total // 10)  # ~10 progress prints across run
+    _t_oos_start = time.perf_counter()
     for i, t in enumerate(rebal_dates):
+        # Progress beacon — every ~10% of rebalances.
+        if i > 0 and i % _progress_every == 0:
+            _elapsed = time.perf_counter() - _t_oos_start
+            _pct = i / _n_rebals_total * 100
+            _eta = (_elapsed / i) * (_n_rebals_total - i)
+            print(f"  [oos-progress] rebal {i}/{_n_rebals_total} ({_pct:.0f}%) "
+                  f"@ {t.date()}  elapsed={_elapsed:.1f}s  ETA={_eta:.0f}s")
         train_px = px.loc[t - lead : t]
         if len(train_px) < 60:
             continue
