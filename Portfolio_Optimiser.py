@@ -190,6 +190,13 @@ if _SHOW_METRICS_HISTORY_MODE:
 _FACTOR_RECS_MODE = "--factor-recs" in sys.argv
 if _FACTOR_RECS_MODE:
     print("[factor-recs] --factor-recs detected; will print recommendation table then exit")
+# `--preflight`: fast system-check mode. Validates yfinance reachability,
+# Excel COM, workbook lock state, IBKR TWS (if enabled), config files,
+# disk space — and exits in seconds with a PASS/FAIL list. Catches setup
+# issues BEFORE the user spends 5 minutes on a heavy pipeline that crashes.
+_PREFLIGHT_MODE = "--preflight" in sys.argv
+if _PREFLIGHT_MODE:
+    print("[preflight] --preflight detected; will run system checks then exit")
 # `--tilted-ensemble-test`: walk-forward CV with auto-factor-tilts ON vs OFF.
 # Threads dynamic tilt targets (recomputed per rebal from trailing-3M factor
 # Sharpes) through solve_candidate_portfolios so each ensemble slot expresses
@@ -207,7 +214,8 @@ _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _STRETCH_HEDGE_SWEEP_MODE
                        or _SHOW_METRICS_HISTORY_MODE
                        or _FACTOR_RECS_MODE
-                       or _TILTED_ENSEMBLE_TEST_MODE)
+                       or _TILTED_ENSEMBLE_TEST_MODE
+                       or _PREFLIGHT_MODE)
 
 
 # =====================================================================
@@ -786,6 +794,171 @@ def _show_metrics_history(max_rows: int = 12) -> int:
 if _SHOW_METRICS_HISTORY_MODE:
     _exit_code = _show_metrics_history()
     sys.exit(_exit_code)
+
+
+def _run_preflight() -> int:
+    """Fast system-check before the heavy live pipeline.
+
+    Returns 0 if all checks pass, 1 if any FAIL (blocking) issue found.
+    WARN-level issues don't fail the check but are surfaced.
+    """
+    import os as _os
+    import socket as _socket
+    import shutil as _shutil
+
+    print("\n" + "=" * 88)
+    print("PREFLIGHT — system checks before heavy pipeline")
+    print("=" * 88)
+
+    pass_count = 0
+    warn_count = 0
+    fail_count = 0
+
+    def _check(label: str, status: str, detail: str = ""):
+        nonlocal pass_count, warn_count, fail_count
+        if status == "PASS":
+            pass_count += 1
+            print(f"  ✓ PASS  {label:<32}  {detail}")
+        elif status == "WARN":
+            warn_count += 1
+            print(f"  ⚠ WARN  {label:<32}  {detail}")
+        else:
+            fail_count += 1
+            print(f"  ✗ FAIL  {label:<32}  {detail}")
+
+    # 1) Build stamp
+    if _BUILD_GIT_SHA not in ("dev", "unknown"):
+        _check("Build stamp", "PASS", f"{_BUILD_GIT_SHA} at {_BUILD_TIME}")
+    else:
+        _check("Build stamp", "WARN",
+                f"running from source (git={_BUILD_GIT_SHA}) — fine for dev")
+
+    # 2) Required runtime config files
+    for fname in ("regions.json", "tlh_pairs.json"):
+        fpath = APP_DIR / fname
+        if fpath.exists():
+            _check(f"Config: {fname}", "PASS", f"size {fpath.stat().st_size} bytes")
+        else:
+            _check(f"Config: {fname}", "WARN", "file not found — engine uses defaults")
+
+    # 3) Excel workbook present and not locked
+    try:
+        xl_path = CFG.get("excel_path") or _default_excel_path()
+        if not _os.path.exists(xl_path):
+            _check("Excel workbook", "FAIL", f"NOT FOUND at {xl_path}")
+        else:
+            # Try opening for read+write to detect lock
+            try:
+                with open(xl_path, "r+b") as _fh:
+                    pass
+                _check("Excel workbook", "PASS", f"writable at {xl_path}")
+            except PermissionError:
+                _check("Excel workbook", "FAIL",
+                        "LOCKED — close Excel and any open instance of the file")
+            except Exception as _e:
+                _check("Excel workbook", "WARN", f"open check failed: {_e}")
+    except Exception as _e:
+        _check("Excel workbook", "FAIL", str(_e))
+
+    # 4) Disk space (need at least 500 MB for reports + logs)
+    try:
+        usage = _shutil.disk_usage(str(APP_DIR))
+        free_mb = usage.free / 1024 / 1024
+        if free_mb < 200:
+            _check("Disk space", "FAIL", f"only {free_mb:.0f} MB free in {APP_DIR}")
+        elif free_mb < 500:
+            _check("Disk space", "WARN", f"{free_mb:.0f} MB free — tight")
+        else:
+            _check("Disk space", "PASS", f"{free_mb:.0f} MB free")
+    except Exception as _e:
+        _check("Disk space", "WARN", f"check failed: {_e}")
+
+    # 5) yfinance reachability (small probe download)
+    try:
+        _probe = yf.download("SPY", period="5d", interval="1d",
+                              auto_adjust=True, threads=False, progress=False)
+        if _probe is None or (hasattr(_probe, "empty") and _probe.empty):
+            _check("yfinance reachable", "FAIL", "SPY probe returned empty")
+        else:
+            _n = len(_probe) if hasattr(_probe, "__len__") else 0
+            _check("yfinance reachable", "PASS", f"SPY 5-day probe = {_n} rows")
+    except Exception as _e:
+        _check("yfinance reachable", "FAIL", f"{type(_e).__name__}: {_e}")
+
+    # 6) IBKR TWS port reachable (if enabled)
+    if USE_IBKR_LIVE_PRICES:
+        try:
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            sock.settimeout(1.5)
+            result = sock.connect_ex((IBKR_HOST, IBKR_PORT))
+            sock.close()
+            if result == 0:
+                _check("IBKR TWS port", "PASS",
+                        f"port {IBKR_HOST}:{IBKR_PORT} open")
+            else:
+                _check("IBKR TWS port", "WARN",
+                        f"port {IBKR_HOST}:{IBKR_PORT} closed — will fall back to yfinance")
+        except Exception as _e:
+            _check("IBKR TWS port", "WARN", f"check failed: {_e}")
+    else:
+        _check("IBKR TWS", "PASS", "disabled in config")
+
+    # 7) Excel COM probe (xlwings) — only attempt on Windows
+    if USE_XLWINGS:
+        try:
+            import xlwings as _xw
+            # Don't actually open a workbook here; just test that the COM object is reachable.
+            _app = _xw.App(visible=False, add_book=False)
+            _app.quit()
+            _check("Excel COM (xlwings)", "PASS", "COM accessible")
+        except Exception as _e:
+            _check("Excel COM (xlwings)", "FAIL", f"{type(_e).__name__}: {_e}")
+    else:
+        _check("Excel COM (xlwings)", "PASS", "xlwings disabled in config")
+
+    # 8) Production config snapshot — visible at preflight too
+    _prod_slot = (next(iter(PRODUCTION_SLOT_OVERRIDE.keys()))
+                   if PRODUCTION_SLOT_OVERRIDE else "5-slot blend")
+    _check("Production config", "PASS",
+            f"slot={_prod_slot}, hedge={'ON' if PRODUCTION_CRASH_HEDGE else 'off'}")
+
+    # 9) Past metrics history (regression tripwire)
+    try:
+        _hist = APP_DIR / "metrics_history.jsonl"
+        if _hist.exists():
+            with _hist.open(encoding="utf-8") as f:
+                _n_hist = sum(1 for line in f if line.strip())
+            _check("Metrics history", "PASS",
+                    f"{_n_hist} run snapshots in metrics_history.jsonl")
+        else:
+            _check("Metrics history", "WARN",
+                    "no history yet — first live run will create it")
+    except Exception as _e:
+        _check("Metrics history", "WARN", str(_e))
+
+    # Summary
+    print()
+    print("=" * 88)
+    if fail_count == 0:
+        if warn_count == 0:
+            print(f"PREFLIGHT RESULT: ALL CLEAR  ({pass_count} passed)")
+            print(f"  Safe to run the live pipeline.")
+        else:
+            print(f"PREFLIGHT RESULT: PASS WITH WARNINGS  "
+                  f"({pass_count} passed, {warn_count} warnings, 0 failed)")
+            print(f"  Live pipeline will likely succeed but check warnings above.")
+        rc = 0
+    else:
+        print(f"PREFLIGHT RESULT: BLOCKED  "
+              f"({pass_count} passed, {warn_count} warnings, {fail_count} FAILED)")
+        print(f"  Fix the FAILED items before running the live pipeline.")
+        rc = 1
+    print("=" * 88)
+    return rc
+
+
+# Preflight dispatch DEFERRED — see after USE_XLWINGS / IBKR config
+# constants are defined (search for: --preflight dispatch).
 
 
 def _run_factor_recs() -> int:
@@ -2285,6 +2458,12 @@ def auto_recommend_factor_tilts(ff_data: pd.DataFrame,
 # Runs before heavy price download / FF5 universe build that follows.
 if _FACTOR_RECS_MODE:
     _exit_code = _run_factor_recs()
+    sys.exit(_exit_code)
+
+# --preflight dispatch — placed here so USE_XLWINGS, IBKR config, etc are
+# all defined, but BEFORE the heavy yfinance bulk download at line ~2290.
+if _PREFLIGHT_MODE:
+    _exit_code = _run_preflight()
     sys.exit(_exit_code)
 
 
