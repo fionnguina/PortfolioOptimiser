@@ -9066,24 +9066,30 @@ def _run_rebal_skip_sweep() -> int:
         print(f"[skip-sweep] VAL uplift (winner vs δ=3%): "
               f"ΔSharpe {val_d_sharpe:+.3f}, Δann_ret {val_d_ann*100:+.2f}%")
 
-    # === Verdict ===
-    print("\n" + "=" * 88)
-    print("VERDICT")
-    print("=" * 88)
+    # === Verdict (honest 4-dim check on validation: winner vs baseline) ===
+    print()
     if val_baseline:
-        dev_uplift = winner['sharpe'] - (baseline['sharpe'] if baseline else winner['sharpe'])
-        val_uplift = val_winner['sharpe'] - val_baseline['sharpe']
-        print(f"  DEV uplift (chosen δ vs 3%):     ΔSharpe {dev_uplift:+.3f}")
-        print(f"  VAL uplift (chosen δ vs 3%):     ΔSharpe {val_uplift:+.3f}")
-        if val_uplift > 0.05:
-            print(f"  Reading: Generalises — winning δ improves validation Sharpe.")
-            print(f"  Recommend: set SKIP_REBAL_DELTA = {winner['skip_delta']}")
-        elif val_uplift > -0.05:
-            print(f"  Reading: Roughly neutral on validation. Marginal change.")
-            print(f"  Recommend: stay at 3% unless dev uplift > 0.10 Sharpe.")
+        _verdict = _evaluate_sweep_result(
+            baseline={
+                "sharpe": val_baseline['sharpe'],
+                "max_drawdown": val_baseline['max_drawdown'],
+                "alpha_vs_spy": val_baseline['alpha_vs_spy'],
+                "ann_return": val_baseline['ann_return'],
+            },
+            treatment={
+                "sharpe": val_winner['sharpe'],
+                "max_drawdown": val_winner['max_drawdown'],
+                "alpha_vs_spy": val_winner['alpha_vs_spy'],
+                "ann_return": val_winner['ann_return'],
+            },
+            label_baseline="δ=3% on VAL",
+            label_treatment=f"δ={winner['skip_delta']*100:.0f}% on VAL (winner)",
+        )
+        _print_sweep_verdict(_verdict)
+        if _verdict["verdict"] == "SHIP":
+            print(f"\n  Next: set SKIP_REBAL_DELTA = {winner['skip_delta']}")
         else:
-            print(f"  Reading: DOES NOT generalise. Dev gain was overfit to that window.")
-            print(f"  Recommend: stay at SKIP_REBAL_DELTA = 0.03.")
+            print(f"\n  Next: stay at SKIP_REBAL_DELTA = 0.03 — winning δ does NOT generalise.")
     else:
         print(f"  (validation baseline failed — can't quote generalisation)")
 
@@ -9304,24 +9310,30 @@ def _run_turnover_penalty_sweep() -> int:
               f"ΔSharpe {val_d_sharpe:+.3f}, Δann_ret {val_d_ann*100:+.2f}%, "
               f"ΔCGT {val_d_cgt:+.0f} bps/yr")
 
-    # === Verdict ===
-    print("\n" + "=" * 88)
-    print("VERDICT")
-    print("=" * 88)
+    # === Verdict (honest 4-dim check on validation: winner vs γ=0) ===
+    print()
     if val_baseline:
-        dev_uplift = winner['sharpe'] - (baseline['sharpe'] if baseline else winner['sharpe'])
-        val_uplift = val_winner['sharpe'] - val_baseline['sharpe']
-        print(f"  DEV uplift (chosen γ vs 0):    ΔSharpe {dev_uplift:+.3f}")
-        print(f"  VAL uplift (chosen γ vs 0):    ΔSharpe {val_uplift:+.3f}")
-        if val_uplift > 0.05:
-            print(f"  Reading: Generalises — cost-aware solver improves validation Sharpe.")
-            print(f"  Recommend: set engine default turnover_penalty = {winner['turnover_penalty']:g}")
-        elif val_uplift > -0.05:
-            print(f"  Reading: Roughly neutral on validation. Marginal change.")
-            print(f"  Recommend: keep turnover_penalty = 0 unless dev uplift > 0.10 Sharpe.")
+        _verdict = _evaluate_sweep_result(
+            baseline={
+                "sharpe": val_baseline['sharpe'],
+                "max_drawdown": val_baseline['max_drawdown'],
+                "alpha_vs_spy": val_baseline['alpha_vs_spy'],
+                "ann_return": val_baseline['ann_return'],
+            },
+            treatment={
+                "sharpe": val_winner['sharpe'],
+                "max_drawdown": val_winner['max_drawdown'],
+                "alpha_vs_spy": val_winner['alpha_vs_spy'],
+                "ann_return": val_winner['ann_return'],
+            },
+            label_baseline="γ=0 on VAL",
+            label_treatment=f"γ={winner['turnover_penalty']:g} on VAL (winner)",
+        )
+        _print_sweep_verdict(_verdict)
+        if _verdict["verdict"] == "SHIP":
+            print(f"\n  Next: set engine default turnover_penalty = {winner['turnover_penalty']:g}")
         else:
-            print(f"  Reading: DOES NOT generalise. Dev gain was overfit to that window.")
-            print(f"  Recommend: keep turnover_penalty = 0.")
+            print(f"\n  Next: keep turnover_penalty = 0 — winning γ does NOT generalise.")
     else:
         print(f"  (validation baseline failed — can't quote generalisation)")
 
@@ -10367,17 +10379,36 @@ def _run_crash_hedge_release_sweep() -> int:
           f"Sharpe {winner['mean_sharpe']:+.2f}  α {winner['mean_alpha']*100:+.2f}%  "
           f"vs baseline Sharpe {base_mean_sh:+.2f}  Δ {winner['mean_sharpe']-base_mean_sh:+.2f}")
 
-    print("\n" + "=" * 88)
-    print("VERDICT")
-    print("=" * 88)
-    if winner["mean_sharpe"] > base_mean_sh + 0.05:
-        print(f"  Reading: hedge IMPROVES Sharpe at optimal release. Update default to "
-              f"CRASH_HEDGE_DD_RELEASE = {winner['release']}.")
-    elif winner["mean_sharpe"] > base_mean_sh - 0.05:
-        print(f"  Reading: best release ≈ neutral vs baseline. Marginal change.")
-    else:
-        print(f"  Reading: even the best release HURTS Sharpe. Crash hedge as designed "
-              f"is structurally negative on this window. Consider reverting.")
+    # === Verdict (honest 4-dim check on the winning release) ===
+    print()
+    # Pull winner's per-fold series into the standard 4-tuple
+    _win_folds = winner["folds"]
+    _win_sh = np.array([f["sharpe"] for f in _win_folds])
+    _win_al = np.array([f["alpha_vs_spy"] for f in _win_folds])
+    _win_rt = np.array([f["ann_return"] for f in _win_folds])
+    _win_dd = np.array([f["max_drawdown"] for f in _win_folds])
+    _base_yr_dd = np.array([f["max_drawdown"] for f in base_folds])
+    _base_rt = np.array([f["ann_return"] for f in base_folds])
+    _verdict = _evaluate_sweep_result(
+        baseline={
+            "sharpe": float(base_mean_sh),
+            "max_drawdown": float(_base_yr_dd.min()),
+            "alpha_vs_spy": float(base_mean_al),
+            "ann_return": float(_base_rt.mean()),
+        },
+        treatment={
+            "sharpe": float(winner["mean_sharpe"]),
+            "max_drawdown": float(_win_dd.min()),
+            "alpha_vs_spy": float(winner["mean_alpha"]),
+            "ann_return": float(_win_rt.mean()),
+        },
+        label_baseline="no hedge",
+        label_treatment=f"hedge release={winner['release']*100:+.0f}%",
+    )
+    _print_sweep_verdict(_verdict)
+    if _verdict["verdict"] == "SHIP":
+        print(f"\n  Next: update CRASH_HEDGE_DD_RELEASE = {winner['release']} "
+              f"and rerun live-pipeline; check metrics_history.")
 
     # Save JSON
     try:
@@ -10865,23 +10896,27 @@ def _run_stretch_hedge_sweep() -> int:
         print(f"  vs 5-slot blend:    ΔSharpe {d_vs_5slot:+.2f}")
         print(f"  vs Stretch-only:    ΔSharpe {d_vs_stretch:+.2f}")
 
-    # === Verdict ===
-    print("\n" + "=" * 88)
-    print("VERDICT")
-    print("=" * 88)
+    # === Verdict (honest 4-dim check: best hedge config vs Stretch-only) ===
+    print()
     if treatments and winner:
-        d_alpha_vs_stretch = winner["agg"]["mean_alpha"] - bls_agg.get("mean_alpha", 0.0)
-        d_dd_vs_stretch = winner["agg"]["mean_max_drawdown"] - bls_agg.get("mean_max_drawdown", 0.0)
-        if d_vs_stretch > 0.05:
-            print(f"  Reading: hedge ADDS value on top of Stretch ({d_vs_stretch:+.2f} Sharpe). "
-                  f"Recommend: ship Stretch + hedge (release={winner['release']*100:+.0f}%).")
-        elif d_vs_stretch > -0.05:
-            print(f"  Reading: hedge ≈ neutral vs Stretch ({d_vs_stretch:+.2f} Sharpe). "
-                  f"MaxDD impact: {d_dd_vs_stretch*100:+.1f}%. Marginal.")
-        else:
-            print(f"  Reading: even best hedge HURTS Stretch ({d_vs_stretch:+.2f} Sharpe). "
-                  f"Stretch alone is the right answer for modern era.")
-        print(f"  Note: ALL configs in this window have no GFC-class crash to test "
+        _verdict = _evaluate_sweep_result(
+            baseline={
+                "sharpe": float(bls_agg.get("mean_sharpe", 0.0)),
+                "max_drawdown": float(bls_agg.get("mean_max_drawdown", 0.0)),
+                "alpha_vs_spy": float(bls_agg.get("mean_alpha", 0.0)),
+                "ann_return": float(bls_agg.get("mean_ann_return", 0.0)),
+            },
+            treatment={
+                "sharpe": float(winner["agg"]["mean_sharpe"]),
+                "max_drawdown": float(winner["agg"]["mean_max_drawdown"]),
+                "alpha_vs_spy": float(winner["agg"]["mean_alpha"]),
+                "ann_return": float(winner["agg"]["mean_ann_return"]),
+            },
+            label_baseline="Stretch-only (no hedge)",
+            label_treatment=f"Stretch + hedge release={winner['release']*100:+.0f}%",
+        )
+        _print_sweep_verdict(_verdict)
+        print(f"\n  Note: ALL configs in this window have no GFC-class crash to test "
               f"tail protection. Stress test (--stress-test) remains the only "
               f"true-tail evidence we have.")
 
@@ -14915,6 +14950,149 @@ def export_to_ppt(results, trades, charts=None):
             print(f"[pptx] Engine Metrics Dashboard slide added (last position)")
         except Exception as _e_dump:
             print(f"[pptx] Dashboard slide skipped: {_e_dump}")
+
+        # --- FINAL FINAL SLIDE: PDS-style disclosure (placeholder) ---
+        # Standard Product Disclosure Statement structure: fund identity,
+        # strategy, target, benchmark, fees modelled, key risks, legal
+        # disclosures. Conservative placeholder text — user can edit the
+        # strings here when actual fund details are finalised.
+        try:
+            pds_layout = prs.slide_layouts[20]
+            pds_slide = prs.slides.add_slide(pds_layout)
+            if pds_slide.shapes.title:
+                pds_slide.shapes.title.text = "Disclosure & Product Statement"
+
+            # Fund identity sub-line in the title ribbon
+            _pds_subtitle = (f"Portfolio Optimiser  ·  Active Asset Allocation (multi-region equity ensemble)  ·  "
+                              f"Benchmark: SPY (AUD)")
+            _pds_sub_box = pds_slide.shapes.add_textbox(Cm(2.15), Cm(1.85), Cm(21.80), Cm(0.45))
+            _psf = _pds_sub_box.text_frame
+            _psf.clear()
+            _psf.word_wrap = False
+            _psf.margin_left = 0
+            _psp = _psf.paragraphs[0]
+            _psp.text = _pds_subtitle
+            _psp.font.size = Pt(10)
+            _psp.font.italic = True
+            _psp.font.color.rgb = RGBColor(255, 255, 255)
+
+            # Body sections — two-column layout
+            def _section_box(left_cm, top_cm, width_cm, height_cm, header, body_lines,
+                              header_size=12, body_size=10):
+                box = pds_slide.shapes.add_textbox(
+                    Cm(left_cm), Cm(top_cm), Cm(width_cm), Cm(height_cm))
+                tf = box.text_frame
+                tf.clear()
+                tf.word_wrap = True
+                tf.margin_left = Cm(0.2)
+                tf.margin_top = Cm(0.1)
+                # header
+                ph = tf.paragraphs[0]
+                ph.text = header
+                ph.font.size = Pt(header_size)
+                ph.font.bold = True
+                ph.font.color.rgb = RGBColor(31, 78, 161)
+                for line in body_lines:
+                    p = tf.add_paragraph()
+                    p.text = line
+                    p.font.size = Pt(body_size)
+                    p.font.color.rgb = RGBColor(40, 40, 40)
+
+            # --- Left column: Fund summary ---
+            _section_box(
+                left_cm=1.0, top_cm=3.7, width_cm=11.5, height_cm=6.5,
+                header="FUND SUMMARY",
+                body_lines=[
+                    "Strategy:  5-slot regime-aware ensemble (Modest, Aggressive,",
+                    "  Bold, Maximum, Stretch). Softmax-blended via rolling 12-month",
+                    "  Sortino + forward SPY-regime signal. Rebalanced ~9×/year.",
+                    "",
+                    "Asset Class:  Multi-region equity ETFs (US + Australia +",
+                    "  Europe + Japan + Emerging Markets), plus defensive sleeve",
+                    "  (gold, cash equivalents, long bonds, inverse equity).",
+                    "",
+                    "Universe:  ~46 ETFs; ~45 pass FF5 universe validation each run.",
+                    "",
+                    "Target Return:  SPY (AUD)-comparable, on a risk-adjusted",
+                    "  (Sharpe) basis. Backtest 10Y Sharpe ≈ 0.97 vs SPY 0.83.",
+                    "",
+                    "Investment Horizon:  5+ years recommended.",
+                ],
+            )
+
+            # --- Right column: Fees + Risks ---
+            _section_box(
+                left_cm=13.0, top_cm=3.7, width_cm=11.5, height_cm=6.5,
+                header="FEES & COSTS MODELLED",
+                body_lines=[
+                    "Brokerage:  Interactive Brokers Pro AU schedule",
+                    "  · AU min $5.00 + 0.080% · US min $1.50 + 0.020%",
+                    "  · Modelled cost ~28 bps/yr at $1M AUM.",
+                    "",
+                    "CGT:  Australian personal MTR 30% + Medicare 2%",
+                    "  · 50% LT discount on holdings ≥365 days",
+                    "  · FY netting + carry-forward losses honoured.",
+                    "  · Modelled drag ~296 bps/yr at $1M AUM.",
+                    "",
+                    "FX:  AUD-denominated. USD assets unhedged.",
+                    "",
+                    "Total modelled drag:  ~324 bps/yr at $1M AUM.",
+                    "  Net of all costs — NOT a pre-tax/pre-fee figure.",
+                ],
+            )
+
+            # --- Bottom-left: Key risks ---
+            _section_box(
+                left_cm=1.0, top_cm=10.5, width_cm=11.5, height_cm=5.0,
+                header="KEY RISKS",
+                body_lines=[
+                    "• Equity-like volatility (backtest annualised ~14%).",
+                    "• MaxDD: backtest -20% modern, -25% GFC stress test.",
+                    "• Tail risk: 2008-class crash modelled to -25% drawdown;",
+                    "  uncovered tail regimes (e.g. stagflation) untested.",
+                    "• Concentration: individual ticker weight up to 5% (capped).",
+                    "• Regime risk: design assumes regime patterns persist.",
+                    "• FX risk: USD holdings unhedged.",
+                    "• Liquidity: ETF universe; assumes daily fills at close.",
+                ],
+                body_size=9,
+            )
+
+            # --- Bottom-right: Legal disclosures ---
+            _section_box(
+                left_cm=13.0, top_cm=10.5, width_cm=11.5, height_cm=5.0,
+                header="DISCLOSURES",
+                body_lines=[
+                    "• This is NOT licensed financial advice.",
+                    "• AFSL: not held (for personal use only).",
+                    "• Past performance ≠ future returns.",
+                    "• Backtest is OOS walk-forward but design choices were",
+                    "  made on the same 2016-2026 data window — silent",
+                    "  pseudo-overfit risk remains; see ARCHITECTURE.md §10.",
+                    "• Backtest excludes: tracking error, slippage gates,",
+                    "  liquidity constraints, dividend reinvestment timing.",
+                    "• Tax: modelled at AU 30% MTR; consult tax advisor.",
+                    "• Operational risk: see RUNBOOK.md.",
+                ],
+                body_size=9,
+            )
+
+            # Footer
+            _pds_foot_text = (f"Disclosure as at {pd.Timestamp.now().strftime('%d %B %Y')}    ·    "
+                               f"Build {_BUILD_GIT_SHA}    ·    Placeholder text — edit in source before public distribution")
+            _pds_foot_box = pds_slide.shapes.add_textbox(Cm(1.5), Cm(17.3), Cm(22.5), Cm(0.6))
+            _pft = _pds_foot_box.text_frame
+            _pft.clear()
+            _pfp = _pft.paragraphs[0]
+            _pfp.text = _pds_foot_text
+            _pfp.font.size = Pt(9)
+            _pfp.font.italic = True
+            _pfp.font.color.rgb = RGBColor(120, 120, 120)
+            _pfp.alignment = PP_ALIGN.CENTER
+
+            print(f"[pptx] PDS disclosure slide added (final position)")
+        except Exception as _e_pds:
+            print(f"[pptx] PDS slide skipped: {_e_pds}")
 
         tmp_path = ppt_path.replace(".pptx", ".__tmp__.pptx")
         prs.save(tmp_path)
