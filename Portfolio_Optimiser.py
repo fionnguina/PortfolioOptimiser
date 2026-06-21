@@ -13656,10 +13656,10 @@ def export_to_ppt(results, trades, charts=None):
     is_with = (pl == "with tilts" or pl == "with_tilts")
     is_ens = (pl == "ensemble")
     is_no = not (is_with or is_ens)
-    # Position INSIDE the blue title ribbon (band runs ~y=0.5 to y=2.5cm).
-    # Was at y=2.05 which sat too close to the bottom of the ribbon; bumped
-    # to y=1.55 so it nests cleanly under the title text.
-    box = slide.shapes.add_textbox(Cm(2.15), Cm(1.55), Cm(21.80), Cm(0.45))
+    # Position INSIDE the blue title ribbon. Adjusted 2026-06-20:
+    # y=1.55 overlapped the title text; y=2.05 dropped below the ribbon.
+    # y=1.85 nests cleanly under the title without overlap.
+    box = slide.shapes.add_textbox(Cm(2.15), Cm(1.85), Cm(21.80), Cm(0.45))
     tf = box.text_frame
     tf.clear()
     tf.word_wrap = False
@@ -13698,9 +13698,9 @@ def export_to_ppt(results, trades, charts=None):
                         parts.append(f"{_abbr.get(n, n)} {float(mix[n])*100:.0f}%")
                 mix_str = " · ".join(parts)
                 # Sits in the blue ribbon directly under the plan label.
-                # Was at y=2.55 which spilled below the ribbon onto white;
-                # bumped to y=2.05 to stay inside the dark band.
-                mix_box = slide.shapes.add_textbox(Cm(2.15), Cm(2.05), Cm(21.80), Cm(0.45))
+                # Adjusted 2026-06-20: y=2.05 was still too tight on plan_label;
+                # y=2.35 gives proper line spacing while staying in the ribbon.
+                mix_box = slide.shapes.add_textbox(Cm(2.15), Cm(2.35), Cm(21.80), Cm(0.45))
                 tfm = mix_box.text_frame
                 tfm.clear()
                 tfm.word_wrap = False
@@ -14307,10 +14307,15 @@ def export_to_ppt(results, trades, charts=None):
             ffd_tbl = ffd.loc[window_start_tbl:common_end]
             port_r_tbl = port_r.loc[window_start_tbl:common_end]
             
-            # Chart window (last ~3 months of FF-available overlap)
+            # Chart window (last ~3 months). Portfolio extends past common_end
+            # to TODAY so viewers see live performance; FF series stop at
+            # common_end (Ken French publishes ~6 weeks late). A vertical line
+            # at common_end marks where FF data ends so the visible gap reads
+            # as "FF data not yet available" not "portfolio diverged".
             window_start_chart = common_end - relativedelta(months=3, days=10)
             ffd_chart = ffd.loc[window_start_chart:common_end]
-            port_r_chart = port_r.loc[window_start_chart:common_end]
+            live_end = port_r.index.max() if not port_r.empty else common_end
+            port_r_chart = port_r.loc[window_start_chart:live_end]
 
             # Date callout under the slide title — Slide 4 anchors to the FF data end
             # (~1mo behind live), so everything on this slide should reference common_end.
@@ -14357,16 +14362,49 @@ def export_to_ppt(results, trades, charts=None):
             except Exception as _e_strat_ff:
                 print(f"[pptx] Slide 4 strategy series skipped: {_e_strat_ff}")
 
+            # Use OUTER join so Portfolio rows past common_end survive (FF
+            # cells will be NaN there). Cumret is computed per-column below
+            # so NaN propagates correctly — FF lines stop, Portfolio continues.
             chart_df = pd.DataFrame({"Portfolio": port_r_chart})
             if not strat_r_chart.empty:
-                chart_df[strategy_label_ff] = strat_r_chart
-            chart_df = chart_df.join(ffd_chart[series_to_show], how="inner")
+                # Extend strategy too so its line matches Portfolio length
+                strat_full = globals().get("returns_wide_df", None)
+                if isinstance(strat_full, pd.DataFrame):
+                    try:
+                        _w_full = pd.Series(w_selected_ff).astype(float)
+                        _c_full = strat_full.columns.intersection(_w_full.index)
+                        _w_full = _w_full.reindex(_c_full).fillna(0.0)
+                        if float(_w_full.sum()) != 0.0:
+                            _w_full = _w_full / float(_w_full.sum())
+                        _sret_full = (strat_full[_c_full].fillna(0.0) @ _w_full).astype(float)
+                        chart_df[strategy_label_ff] = _sret_full.loc[
+                            window_start_chart:live_end]
+                    except Exception:
+                        chart_df[strategy_label_ff] = strat_r_chart
+                else:
+                    chart_df[strategy_label_ff] = strat_r_chart
+            chart_df = chart_df.join(ffd_chart[series_to_show], how="outer")
+            chart_df = chart_df.loc[window_start_chart:live_end]
             tbl_df = pd.DataFrame({"Portfolio": port_r_tbl})
             if not strat_r_tbl.empty:
                 tbl_df[strategy_label_ff] = strat_r_tbl
             tbl_df = tbl_df.join(ffd_tbl[series_to_show], how="inner")
             
-            ret = ((1.0 + chart_df.fillna(0.0)).cumprod() - 1.0) * 100.0
+            # Compute cumret per-column so NaN (past FF cutoff) propagates.
+            # matplotlib skips NaN, so FF lines naturally end at common_end
+            # while Portfolio extends to live_end.
+            ret = pd.DataFrame(index=chart_df.index)
+            for col in chart_df.columns:
+                _s = chart_df[col]
+                # Cumprod requires no leading NaN; reindex forward-fill 0 from
+                # the first valid index but keep trailing NaN as-is.
+                _first = _s.first_valid_index()
+                _last = _s.last_valid_index()
+                if _first is None or _last is None:
+                    continue
+                _seg = _s.loc[_first:_last].fillna(0.0)
+                _cum = ((1.0 + _seg).cumprod() - 1.0) * 100.0
+                ret[col] = _cum.reindex(ret.index)
             fig, ax = plt.subplots(figsize=(7.5, 4.8))
             ret.plot(ax=ax, linewidth=1.4)
 
@@ -14381,11 +14419,30 @@ def export_to_ppt(results, trades, charts=None):
             if not ret.empty:
                 ax.set_xlim(ret.index.min(), ret.index.max())
 
-            # Explicit end-date annotation in the chart bottom-right so the FF lag
-            # (~1 month behind live) is impossible to miss.
+            # Vertical line at FF cutoff (Ken French publishes ~6 wk late).
+            # Lets viewers see at-a-glance that FF lines stop here while
+            # Portfolio continues past — gap is "data not published yet",
+            # not "Portfolio diverged from factors".
+            try:
+                _ff_end_ts = pd.Timestamp(common_end)
+                ax.axvline(_ff_end_ts, color="#b00000", linestyle="--",
+                            linewidth=1.2, alpha=0.65, zorder=1)
+                # Label placed near the top of the chart, just right of the line
+                _ylim_top = ax.get_ylim()[1]
+                ax.annotate(
+                    f"FF data ends\n{_ff_end_ts.strftime('%d %b %Y')}",
+                    xy=(_ff_end_ts, _ylim_top),
+                    xytext=(4, -4), textcoords="offset points",
+                    ha="left", va="top",
+                    fontsize=8, color="#b00000", style="italic",
+                )
+            except Exception:
+                pass
+
+            # Live-end annotation bottom-right.
             try:
                 ax.annotate(
-                    f"End: {pd.Timestamp(common_end).strftime('%d %b %Y')}",
+                    f"Live end: {pd.Timestamp(live_end).strftime('%d %b %Y')}",
                     xy=(0.99, 0.02), xycoords="axes fraction",
                     ha="right", va="bottom",
                     fontsize=9, color="#404040", style="italic",
@@ -14709,10 +14766,12 @@ def export_to_ppt(results, trades, charts=None):
                 plt.close(fig)
                 _rs_buf.seek(0)
 
-                # Bigger picture area, matched to the (11.5, 5.5) figure aspect
-                # so the regime legend renders at readable size.
-                road.shapes.add_picture(_rs_buf, Cm(0.7), Cm(2.4),
-                                        width=Cm(23.8), height=Cm(10.5))
+                # Chart + table dimensions tuned 2026-06-20 to match user's
+                # target layout: chart 8.61 H × 22.6 W cm, table 6.77 H × 22.6 W cm.
+                # Both centred at left=1.4 (slide width ~25.4cm → margin 1.4cm
+                # each side). Chart top stays at 2.4cm under title ribbon.
+                road.shapes.add_picture(_rs_buf, Cm(1.4), Cm(2.4),
+                                        width=Cm(22.6), height=Cm(8.61))
 
                 # ---- Metrics table (3Y / 5Y / 10Y) ----
                 # Restructure for display: rows = (horizon, series), cols = metric.
@@ -14738,9 +14797,11 @@ def export_to_ppt(results, trades, charts=None):
                 if rows:
                     n_rows = len(rows) + 1  # +1 header
                     n_cols = len(display_metrics) + 1  # +1 row label
+                    # Table: 6.77 H × 22.6 W cm at left=1.4, top=11.21 (chart
+                    # bottom is 2.4+8.61=11.01, +0.2 cm gap → table top 11.21).
                     tbl_shape = road.shapes.add_table(
                         n_rows, n_cols,
-                        Cm(1.3), Cm(13.0), Cm(22.6), Cm(4.7)
+                        Cm(1.4), Cm(11.21), Cm(22.6), Cm(6.77)
                     )
                     tbl = tbl_shape.table
                     # Header row
