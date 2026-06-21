@@ -10,6 +10,9 @@
     "VEU.AX": "VGS.AX",
     "VGS.AX": "VEU.AX",
     "VAP.AX": "REIT.AX",
-    "REIT.AX": "VAP.AX"
+    "REIT.AX": "VAP.AX",
+    "SMH": "SOXX",
+    "SOXX": "SMH",
+    "SEMI.AX": "SMH"
   }
 }

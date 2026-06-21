@@ -14420,7 +14420,12 @@ def export_to_ppt(results, trades, charts=None):
             ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=9)
             ax.set_title("Portfolio vs Fama French Factors (3-Month Performance)")
             ax.set_ylabel("Return (%)")
+            # Pin ticks to the 1st of each month so the x-axis reads cleanly
+            # (Feb 01, Mar 01, …) instead of matplotlib's auto-locator picking
+            # uneven dates like 14-Jan / 23-Jan / 12-Feb / 06-Mar.
+            ax.xaxis.set_major_locator(mdates.MonthLocator(bymonthday=1))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
+            ax.xaxis.set_minor_locator(mdates.MonthLocator(bymonthday=15))
             ax.grid(True, linestyle="--", alpha=0.4)
             ax.margins(x=0)
             if not ret.empty:
@@ -14809,13 +14814,13 @@ def export_to_ppt(results, trades, charts=None):
                 if rows:
                     n_rows = len(rows) + 1  # +1 header
                     n_cols = len(display_metrics) + 1  # +1 row label
-                    # Table position kept under the chart: top=11.59 = chart
-                    # bottom (2.78 + 8.61 = 11.39) + 0.2cm gap. Width 22.6,
-                    # height 6.77 (user's earlier spec; bottom ends at 18.36cm
-                    # which fits within the ~19cm slide height).
+                    # Table position pinned flush against chart bottom: top=11.39
+                    # = chart bottom (2.78 + 8.61 = 11.39), no gap (user spec
+                    # 2026-06-21). Width 22.6, height 6.77 — bottom ends at
+                    # 18.16cm which fits within the 19.05cm slide height.
                     tbl_shape = road.shapes.add_table(
                         n_rows, n_cols,
-                        Cm(1.4), Cm(11.59), Cm(22.6), Cm(6.77)
+                        Cm(1.4), Cm(11.39), Cm(22.6), Cm(6.77)
                     )
                     tbl = tbl_shape.table
                     # Header row
