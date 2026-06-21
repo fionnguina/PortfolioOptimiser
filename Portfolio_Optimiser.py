@@ -11381,6 +11381,9 @@ try:
     _Sigma_live = Sigma_daily.copy()
     _spy_mu_live = float(_mu_live["SPY"]) if "SPY" in _mu_live.index else None
     _cand_live = solve_candidate_portfolios(_mu_live, _Sigma_live, _spy_mu_live)
+    # Publish the live slot weights so downstream consumers (EF chart, TLH,
+    # attribution) can read per-slot composition without re-solving.
+    globals()["LIVE_SLOT_WEIGHTS"] = {n: w.copy() for n, w in _cand_live.items()}
     _oos_cand_rets = globals().get("oos_per_candidate_returns", pd.DataFrame())
     # For IR scoring, pass SPY daily returns aligned to OOS candidate returns.
     _spy_bench_for_score = None
@@ -11782,139 +11785,42 @@ if USE_XLWINGS:
                 return None
                             
            
-            # -------- Example usage (fits your existing variables) --------
-            # Compute current portfolio point if you want it plotted; otherwise pass current_point=None.
-            current_point = None
-            target_point = None
-            previous_point = None
-            factor_point = None
+            # -------- Per-slot frontier points (replaces Current/Previous/
+            # Optimised/With Tilts markers as of 2026-06-22 user request). The
+            # 5 ENSEMBLE_SLOTS are themselves frontier-optimal by construction
+            # (each solves solve_frontier_point_cvxpy at a specific target),
+            # so projecting them onto Sigma_opt / mu_vec_opt shows where each
+            # regime preference lands on the curve. Ensemble (separate marker
+            # below) is a softmax blend of these slots — by concavity it sits
+            # strictly inside the frontier unless one slot has 100% weight.
+            slot_points: dict[str, tuple[float, float]] = {}
             ensemble_point = None
 
             try:
                 mu_use = mu_vec_opt.reindex(Sigma_opt.index).fillna(0.0).values
                 S_use = Sigma_opt.values
-            
-                # --- Current (from current holdings / current weights) ---
-                curr_w = current_holdings_weights(
-                    units=current_holdings_units if 'current_holdings_units' in globals() else units_ser,
-                    last_prices=last_px_hold,
-                    investable=list(Sigma_opt.index),
-                    fx_to_aud=fx_map_all
-                ).reindex(Sigma_opt.index).fillna(0.0)
-            
-                wv0 = curr_w.values
-                curr_ret = float(mu_use @ wv0)
-                curr_vol = float(np.sqrt(wv0 @ S_use @ wv0) * np.sqrt(252.0))
-                current_point = (curr_vol, curr_ret)
-            
-                # --- Previous (seed / last-saved holdings) ---
-                try:
-                    if seed_units is not None and isinstance(seed_units, pd.Series) and not seed_units.empty:
-                        prev_w = current_holdings_weights(
-                            units=seed_units,
-                            last_prices=last_px_hold,
-                            investable=list(Sigma_opt.index),
-                            fx_to_aud=fx_map_all
-                        ).reindex(Sigma_opt.index).fillna(0.0)
-            
-                        wp = prev_w.values
-                        prev_ret = float(mu_use @ wp)
-                        prev_vol = float(np.sqrt(wp @ S_use @ wp) * np.sqrt(252.0))
-                        previous_point = (prev_vol, prev_ret)
-                except Exception:
-                    previous_point = None
-            
-                # --- Factor-effected point (achievable tilt weights) ---
-                try:
-                    if "B" in globals() and "f_mean_ann" in globals() and "Fcov_daily" in globals():
-                        B_sub = B.reindex(Sigma_opt.index).dropna(how="any")
-                        if not B_sub.empty:
-                            w_fac = max_sharpe_long_only(mu_vec_opt, Sigma_opt, rf=float(globals().get("rf_annual", 0.0))).reindex(Sigma_opt.index).fillna(0.0)
-            
-                            if float(w_fac.sum()) != 0:
-                                w_fac = w_fac / float(w_fac.sum())
-            
-                            wf = w_fac.values
-                            fac_ret = float(mu_use @ wf)
-                            fac_vol = float(np.sqrt(wf @ S_use @ wf) * np.sqrt(252.0))
-                            factor_point = (fac_vol, fac_ret)
-                            factor_vol, factor_ret = float(factor_point[0]), float(factor_point[1])
-                except Exception:
-                    factor_point = None
-            
-                # --- Target (post-trade) using optimiser weights ---
-                w1 = pd.to_numeric(w_star, errors="coerce").reindex(Sigma_opt.index).fillna(0.0)
-                if float(w1.sum()) != 0:
-                    w1 = w1 / float(w1.sum())
-            
-                wv1 = w1.values
-                tgt_ret = float(mu_use @ wv1)
-                tgt_vol = float(np.sqrt(wv1 @ S_use @ wv1) * np.sqrt(252.0))
-                target_point = (tgt_vol, tgt_ret)
-                
-                # --- Target (With Tilts) point (soft tilts; closest feasible) ---
-                tilt_point = None
-                try:
-                    B_sub = B.reindex(Sigma_opt.index) if ("B" in globals() and isinstance(B, pd.DataFrame)) else None
-                    tilt_targets = pd.to_numeric(tilt_df["Target"], errors="coerce").fillna(0.0)
-                    tilt_bands   = pd.to_numeric(tilt_df["Band"],   errors="coerce").fillna(0.0)
-                    use_mask     = tilt_df["Use?"].astype(bool).to_dict()
-                
-                    w_tilt, ok_tilt, note_tilt = solve_frontier_point_cvxpy(
-                        mu_vec_opt,
-                        Sigma_opt,
-                        float(tgt_ret),
-                        B=B_sub,
-                        tilt_targets=tilt_targets,
-                        tilt_bands=tilt_bands,
-                        use_mask=use_mask,
-                        tilt_mode="soft",
-                        tilt_penalty=1e4
-                    )
 
-
-                    # Defensive alignment: if solver returns a shorter vector, pad with zeros to match Sigma_opt
+                _slot_w_map = globals().get("LIVE_SLOT_WEIGHTS", {}) or {}
+                for _slot_name, _slot_w in _slot_w_map.items():
                     try:
-                        w_tilt = np.asarray(w_tilt, dtype=float).reshape(-1)
-                        n_expected = len(Sigma_opt.index)
-                        if len(w_tilt) != n_expected:
-                            w_tmp = np.zeros(n_expected, dtype=float)
-                            # Best-effort: fill from the front (assumes solver used the same ordering)
-                            w_tmp[:min(len(w_tilt), n_expected)] = w_tilt[:min(len(w_tilt), n_expected)]
-                            w_tilt = w_tmp
-                    except Exception:
-                        pass
-                    if ok_tilt and np.all(np.isfinite(w_tilt)):
-                        w_tilt = w_tilt / float(np.sum(w_tilt))
-                        tr = float(mu_use @ w_tilt)
-                        tv = float(np.sqrt(w_tilt @ S_use @ w_tilt) * np.sqrt(252.0))
-                        tilt_point = (tv, tr)
-                except Exception as e:
-                    print(f"[chart] Tilt (soft) point error: {e}")
-                print(f"[debug] tilt_point={tilt_point}, factor_point={factor_point}")
-
-                # --- Target (No Tilts) ---
-                no_tilt_point = None
-                try:
-                    w_nt = pd.Series(w_star_no_tilts, index=Sigma_opt.index)
-                    if float(w_nt.sum()) != 0:
-                        w_nt = w_nt / float(w_nt.sum())
-
-                    wv_nt = w_nt.values
-                    nt_ret = float(mu_use @ wv_nt)
-                    nt_vol = float(np.sqrt(wv_nt @ S_use @ wv_nt) * np.sqrt(252.0))
-                    no_tilt_point = (nt_vol, nt_ret)
-                except Exception as e:
-                    print(f"[chart] No-tilt point error: {e}")
+                        if not isinstance(_slot_w, pd.Series) or _slot_w.empty:
+                            continue
+                        _ws = pd.Series(_slot_w, dtype=float).reindex(
+                            Sigma_opt.index).fillna(0.0)
+                        if float(_ws.sum()) <= 0:
+                            continue
+                        _ws = _ws / float(_ws.sum())
+                        _wv = _ws.values
+                        _sret = float(mu_use @ _wv)
+                        _svol = float(np.sqrt(_wv @ S_use @ _wv) * np.sqrt(252.0))
+                        slot_points[_slot_name] = (_svol, _sret)
+                    except Exception as _e_slot:
+                        print(f"[chart] Slot point error for {_slot_name}: {_e_slot}")
 
                 # --- Ensemble (live regime-blend portfolio) ---
-                # The auto-selected plan in ~95% of runs. Project onto the
-                # same Sigma_opt / mu_vec_opt basis so the marker is directly
-                # comparable to With Tilts / Optimised on the frontier chart.
-                # Tickers outside Sigma_opt.index (rare after the FF5 refresh
-                # fix) get dropped here — their contribution to ensemble
-                # vol/return is not visualised on this chart.
-                ensemble_point = None
+                # Convex combination of the 5 slots — by concavity of the
+                # frontier this sits strictly inside the curve unless one
+                # slot has 100% softmax weight.
                 try:
                     _w_ens = globals().get("W_ENSEMBLE_SER", None)
                     if isinstance(_w_ens, pd.Series) and not _w_ens.empty:
@@ -11930,10 +11836,7 @@ if USE_XLWINGS:
 
             except Exception as e:
                 print(f"[chart] Point compute error: {e}")
-                current_point = None
-                target_point = None
-                previous_point = None
-                factor_point = None
+                slot_points = {}
                 ensemble_point = None
 
 
@@ -11952,75 +11855,64 @@ if USE_XLWINGS:
                 ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
                 ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
                 
-                # Points
-                with_tilts_point = tilt_point if tilt_point else factor_point
-                if current_point:
-                    ax.scatter([float(current_point[0])], [float(current_point[1])], s=60, marker="s", label="Current")
-                if previous_point:
-                    ax.scatter([float(previous_point[0])], [float(previous_point[1])], s=60, marker="D", label="Previous")
-                if with_tilts_point:
-                    wt_vol = float(with_tilts_point[0])
-                    wt_ret = float(with_tilts_point[1])
-                    eps_v, eps_r = 0.0005, 0.0005
-                
+                # Per-slot markers (Modest / Aggressive / Bold / Maximum /
+                # Stretch). Each slot is a frontier point by construction, so
+                # if Σ_opt ≈ the live Σ used at slot-solve time these markers
+                # should land on (or very near) the curve. Visible drift = the
+                # basis difference between mu_ann_geo/Sigma_daily (slot solve)
+                # and mu_vec_opt/Sigma_opt (chart axis).
+                _slot_style = {
+                    "Modest (SPY+0%)":      ("o", "#1f77b4", 70),
+                    "Aggressive (SPY+5%)":  ("s", "#2ca02c", 70),
+                    "Bold (SPY+10%)":       ("D", "#ff7f0e", 70),
+                    "Maximum (SPY+15%)":    ("^", "#9467bd", 90),
+                    "Stretch (SPY+25%)":    ("v", "#d62728", 90),
+                }
+                for _sn, _spt in slot_points.items():
+                    _mk, _co, _sz = _slot_style.get(_sn, ("o", "#555555", 70))
+                    _short = _sn.split(" (")[0]
                     ax.scatter(
-                        [wt_vol + eps_v],
-                        [wt_ret + eps_r],
-                        marker="D",
-                        s=70,
-                        label="With Tilts",
-                        zorder=6
+                        [float(_spt[0])], [float(_spt[1])],
+                        s=_sz, marker=_mk, color=_co,
+                        edgecolors="black", linewidths=0.5,
+                        label=_short, zorder=5,
                     )
-                
                     ax.annotate(
-                        "With Tilts",
-                        (wt_vol + eps_v, wt_ret + eps_r),
-                        xytext=(6, 6),
-                        textcoords="offset points",
-                        fontsize=9
+                        _short,
+                        (float(_spt[0]), float(_spt[1])),
+                        xytext=(6, 6), textcoords="offset points",
+                        fontsize=8, color=_co,
                     )
-                if no_tilt_point:
-                    ax.scatter(
-                        [float(no_tilt_point[0])], [float(no_tilt_point[1])],
-                        s=80, marker="o", facecolors="none", edgecolors="purple",
-                        linewidths=1.8, label="Optimised", zorder=5,
-                    )
+
                 if ensemble_point:
-                    # Ensemble = the auto-selected plan in ~95% of runs. Plot
-                    # as a star so it stands out against With Tilts (diamond)
-                    # and Optimised (circle). Projected onto Sigma_opt basis,
-                    # so it's directly comparable to the other markers.
+                    # Star out the regime-blend portfolio so it stands out
+                    # against the 5 slot points. By concavity of the frontier
+                    # this convex combination sits strictly inside the curve
+                    # unless one slot has 100% softmax weight.
                     ax.scatter(
                         [float(ensemble_point[0])], [float(ensemble_point[1])],
-                        s=140, marker="*", color="#c00000",
+                        s=170, marker="*", color="#c00000",
                         edgecolors="black", linewidths=0.8,
-                        label="Ensemble (selected)", zorder=7,
+                        label="Ensemble (blend)", zorder=7,
                     )
                     ax.annotate(
                         "Ensemble",
                         (float(ensemble_point[0]), float(ensemble_point[1])),
-                        xytext=(8, -10),
+                        xytext=(8, -12),
                         textcoords="offset points",
                         fontsize=9, fontweight="bold", color="#c00000",
                     )
-                # NOTE: "Target" point removed — Ensemble (above) is the marker
-                # readers should focus on. The frontier curve + Optimised/With
-                # Tilts/Current already convey the reference points.
 
-                ax.legend()
+                ax.legend(loc="best", fontsize=8)
                 _eff_buf = io.BytesIO()
                 fig.savefig(_eff_buf, format="png", bbox_inches="tight")
                 plt.close(fig)
                 _eff_buf.seek(0)
 
                 charts["efficient_frontier_image"] = _eff_buf
-                charts["frontier_points"] = {
-                    "Current": current_point,
-                    "Previous": previous_point,
-                    "Optimised": no_tilt_point if no_tilt_point else factor_point,
-                    "With Tilts": with_tilts_point,
-                    "Ensemble": ensemble_point,
-                }
+                _fp = {sn: pt for sn, pt in slot_points.items()}
+                _fp["Ensemble"] = ensemble_point
+                charts["frontier_points"] = _fp
                 globals()["charts"] = charts
             except Exception as _e_eff_png:
                 print(f"[pptx] Efficient frontier PNG build skipped: {_e_eff_png}")
@@ -12076,6 +11968,12 @@ if USE_XLWINGS:
             
             # Finally, update the existing chart on 'OPT'
             # --- Efficient Frontier Chart Update (safe version) ---
+            # PPT chart was migrated to slot-point markers 2026-06-22. The
+            # Excel chart still accepts the legacy current/previous/etc
+            # markers but those values are no longer computed, so pass None.
+            # The Excel chart will show only the frontier curve + tangency.
+            # Migrate the Excel updater to slot points in a follow-up if you
+            # want them on the OPT sheet too.
             try:
                 update_efficient_frontier_chart(
                     opt_sheet=opt,
@@ -12084,13 +11982,13 @@ if USE_XLWINGS:
                     rf_annual=float(rf_annual),
                     tan_ret=float(tan_ret),
                     tan_vol=float(tan_vol),
-                    current_point=current_point,
+                    current_point=None,
                     title_text=chart_title,
-                    target_point=target_point,
-                    previous_point=previous_point,
-                    factor_point=factor_point,
-                    no_tilt_point=no_tilt_point,
-                    tilt_point=tilt_point
+                    target_point=None,
+                    previous_point=None,
+                    factor_point=None,
+                    no_tilt_point=None,
+                    tilt_point=None,
                 )
 
             except Exception as e:
@@ -14413,7 +14311,12 @@ def export_to_ppt(results, trades, charts=None):
                 _cum = ((1.0 + _seg).cumprod() - 1.0) * 100.0
                 ret[col] = _cum.reindex(ret.index)
             fig, ax = plt.subplots(figsize=(7.5, 4.8))
-            ret.plot(ax=ax, linewidth=1.4)
+            # x_compat=True forces pandas to use matplotlib's date converter
+            # instead of its own. Without this, axvline(common_end) and
+            # MonthLocator place ticks/lines in different coordinate systems —
+            # symptom: vertical line annotated "30 Apr" lands visually
+            # between the 01-Mar and 01-Apr ticks instead of just before 01-May.
+            ret.plot(ax=ax, linewidth=1.4, x_compat=True)
 
             # Make room inside the figure on the right for the legend
             fig.subplots_adjust(right=0.78)
@@ -14544,14 +14447,22 @@ def export_to_ppt(results, trades, charts=None):
                 pts = charts.get("frontier_points", {}) or {}
 
             rows = []
-            for k in ["Current", "Previous", "Optimised", "With Tilts", "Ensemble"]:
+            # New marker set as of 2026-06-22: 5 ensemble slots + the blended
+            # Ensemble portfolio (replaced Current/Previous/Optimised/With
+            # Tilts). Falls back to legacy keys if an older charts dict is
+            # passed in so the slide doesn't blank out on stale state.
+            _slot_keys = list(ENSEMBLE_SLOT_NAMES) + ["Ensemble"]
+            _legacy_keys = ["Current", "Previous", "Optimised", "With Tilts", "Ensemble"]
+            _ordered_keys = _slot_keys if any(k in pts for k in _slot_keys) else _legacy_keys
+            for k in _ordered_keys:
                 v = pts.get(k, None)
                 if v is None:
                     continue
                 try:
                     vol, ret = float(v[0]), float(v[1])
                     if np.isfinite(vol) and np.isfinite(ret):
-                        rows.append({"Point": k, "Vol (ann.)": vol, "Return (ann.)": ret})
+                        _label = k.split(" (")[0] if "(" in k else k
+                        rows.append({"Point": _label, "Vol (ann.)": vol, "Return (ann.)": ret})
                 except Exception:
                     pass
 
