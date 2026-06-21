@@ -14301,6 +14301,13 @@ def export_to_ppt(results, trades, charts=None):
             
             # Use the latest common date (FF often lags)
             common_end = min(ffd.index.max(), port_r.index.max())
+            # Diagnostic: surface the actual dates being used so we can
+            # diagnose any misalignment between the annotation and the
+            # chart's visible x-axis tick labels.
+            print(f"[ff-chart] ff5_raw.index.max()={ff.index.max()}, "
+                  f"ffd (dropna).index.max()={ffd.index.max()}, "
+                  f"port_r.index.max()={port_r.index.max()}, "
+                  f"common_end={common_end}")
             
             # Table window (up to 3Y of overlap)
             window_start_tbl = common_end - relativedelta(years=3, days=10)
@@ -14418,6 +14425,8 @@ def export_to_ppt(results, trades, charts=None):
             ax.margins(x=0)
             if not ret.empty:
                 ax.set_xlim(ret.index.min(), ret.index.max())
+                print(f"[ff-chart] xlim set to ({ret.index.min()}, {ret.index.max()}), "
+                      f"vertical line at common_end={common_end}")
 
             # Vertical line at FF cutoff (Ken French publishes ~6 wk late).
             # Lets viewers see at-a-glance that FF lines stop here while
@@ -14489,9 +14498,12 @@ def export_to_ppt(results, trades, charts=None):
                     ]
 
             ff_tbl = pd.DataFrame.from_dict(rows, orient="index", columns=["3M", "6M", "12M", "3Y"])
+            # Position + size tuned 2026-06-21 to user's measured target:
+            # left=2.03cm, top=11.55cm, width=20.32cm, height=6.48cm.
+            # Previous height 2.794cm was too tight (text overflowed).
             tbl_left, tbl_top, tbl_w, tbl_h = _ppt_anchor(
                 slide4, slide_layout, "table_ff",
-                fb_left_cm=2.032, fb_top_cm=11.90, fb_w_cm=20.32, fb_h_cm=2.794,
+                fb_left_cm=2.03, fb_top_cm=11.55, fb_w_cm=20.32, fb_h_cm=6.48,
             )
             _add_perf_table(
                 slide4, ff_tbl,
@@ -14766,11 +14778,11 @@ def export_to_ppt(results, trades, charts=None):
                 plt.close(fig)
                 _rs_buf.seek(0)
 
-                # Chart + table dimensions tuned 2026-06-20 to match user's
-                # target layout: chart 8.61 H × 22.6 W cm, table 6.77 H × 22.6 W cm.
-                # Both centred at left=1.4 (slide width ~25.4cm → margin 1.4cm
-                # each side). Chart top stays at 2.4cm under title ribbon.
-                road.shapes.add_picture(_rs_buf, Cm(1.4), Cm(2.4),
+                # Chart + table dimensions tuned 2026-06-20/21 to match user's
+                # measured target layout (Format Picture dialog values):
+                # chart 8.61 H × 22.6 W cm at (1.4, 2.78), table 6.48 H ×
+                # 20.32 W at (2.03, 11.55). Both centred horizontally.
+                road.shapes.add_picture(_rs_buf, Cm(1.4), Cm(2.78),
                                         width=Cm(22.6), height=Cm(8.61))
 
                 # ---- Metrics table (3Y / 5Y / 10Y) ----
@@ -14797,11 +14809,13 @@ def export_to_ppt(results, trades, charts=None):
                 if rows:
                     n_rows = len(rows) + 1  # +1 header
                     n_cols = len(display_metrics) + 1  # +1 row label
-                    # Table: 6.77 H × 22.6 W cm at left=1.4, top=11.21 (chart
-                    # bottom is 2.4+8.61=11.01, +0.2 cm gap → table top 11.21).
+                    # Table position kept under the chart: top=11.59 = chart
+                    # bottom (2.78 + 8.61 = 11.39) + 0.2cm gap. Width 22.6,
+                    # height 6.77 (user's earlier spec; bottom ends at 18.36cm
+                    # which fits within the ~19cm slide height).
                     tbl_shape = road.shapes.add_table(
                         n_rows, n_cols,
-                        Cm(1.4), Cm(11.21), Cm(22.6), Cm(6.77)
+                        Cm(1.4), Cm(11.59), Cm(22.6), Cm(6.77)
                     )
                     tbl = tbl_shape.table
                     # Header row
