@@ -125,10 +125,19 @@ try {
 }
 
 # --- Run engine with --auto-pipeline ---
+# Use Start-Process -Wait, NOT "& $ExePath | Out-Null". The engine is
+# PyInstaller --noconsole, which spawns child processes (Tk, matplotlib,
+# COM workers) that inherit any stdout pipe handle. With `| Out-Null` the
+# wrapper would block forever waiting for those children to release the
+# pipe even after the main engine process terminated (observed 2026-06-22
+# under scheduled-task execution). Start-Process -Wait waits on the
+# specific engine PID instead, so child-process pipes don't matter.
 $EngineStart = Get-Date
 try {
-    & $ExePath --auto-pipeline 2>&1 | Out-Null
-    $engineExit = $LASTEXITCODE
+    $proc = Start-Process -FilePath $ExePath `
+        -ArgumentList "--auto-pipeline" `
+        -Wait -PassThru -WindowStyle Hidden
+    $engineExit = $proc.ExitCode
 } catch {
     Write-Log "Engine launch threw: $($_.Exception.Message)"
     Show-Toast `
