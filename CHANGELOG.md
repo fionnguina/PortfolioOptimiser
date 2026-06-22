@@ -14,6 +14,18 @@ in [README.md](README.md) records which commit is bundled into the live `.exe`.
 ## [Unreleased]
 
 ### Added
+- **Excel `Actual_Fills` sheet** populated on every engine run from
+  `ibkr_fills_log.jsonl`. Header shows the latest batch summary
+  (Submitted / Filled / Cancelled / Pending), full per-row ledger
+  below sorted by exec timestamp descending. Cross-references the
+  `--check-fills` mode for broker truth when the script's snapshot
+  is stale.
+- **[CONFIG.md](CONFIG.md)** — every operationally-meaningful knob
+  documented in one place: build/paths, broker, CGT, drift, IBKR,
+  rebalance triggers, weight caps, TLH, crash hedge, production
+  toggles, fund economics, FF5 + universe filter. Mirrors the
+  `_log_config_snapshot()` output so any `run.log` is reproducible
+  without grepping the engine.
 - **IBKR Phase 3 — paper-account execution** ([ibkr_paper_exec.py](ibkr_paper_exec.py)).
   Five-layer safety: hardcoded paper port 7497, account-prefix `DU` check,
   `--execute` flag (default OFF = Phase 2 preview), interactive typed-YES

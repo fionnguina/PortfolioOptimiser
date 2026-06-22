@@ -13031,6 +13031,99 @@ if USE_XLWINGS:
             except Exception as _e_tlh:
                 print(f"[excel] TLH_Log write skipped: {_e_tlh}")
 
+            # ---- IBKR Actual Fills sheet (from ibkr_fills_log.jsonl) ----
+            # Surfaces the Phase 3 paper-execution log inside the workbook so
+            # the user can reconcile what was actually filled (broker truth)
+            # against what the engine recommended. Refreshes every engine run;
+            # safe to be missing (shows "no log entries yet").
+            try:
+                _fills_path = APP_DIR / "ibkr_fills_log.jsonl"
+                _fills_sht = get_or_clear_sheet(wb, 'Actual_Fills')
+                _fills_rows = []
+                if _fills_path.exists():
+                    with open(_fills_path, "r", encoding="utf-8") as _fh:
+                        for _line in _fh:
+                            _line = _line.strip()
+                            if not _line:
+                                continue
+                            try:
+                                _fills_rows.append(json.loads(_line))
+                            except json.JSONDecodeError:
+                                continue
+                if _fills_rows:
+                    _fills_rows.sort(key=lambda r: r.get("exec_timestamp", ""),
+                                       reverse=True)
+                    _latest_ts = _fills_rows[0].get("exec_timestamp", "?")
+                    _latest_batch = [r for r in _fills_rows
+                                       if r.get("exec_timestamp") == _latest_ts]
+                    _n_filled = sum(1 for r in _latest_batch
+                                       if r.get("status_final") == "Filled"
+                                       or r.get("status") == "Filled")
+                    _n_cancelled = sum(1 for r in _latest_batch
+                                         if r.get("status_final") == "Cancelled"
+                                         or r.get("status") == "Cancelled")
+                    _n_pending = sum(1 for r in _latest_batch
+                                       if not r.get("is_done", False))
+                    _fills_sht.range("A1").value = (
+                        "IBKR Actual Fills — Phase 3 paper-trade execution log"
+                    )
+                    _fills_sht.range("A2").value = (
+                        f"Source: ibkr_fills_log.jsonl  ·  Total rows: {len(_fills_rows)}"
+                    )
+                    _fills_sht.range("A3").value = (
+                        f"Most recent batch: {_latest_ts}"
+                    )
+                    _fills_sht.range("A4").value = (
+                        f"  Submitted: {len(_latest_batch)}  ·  "
+                        f"Filled: {_n_filled}  ·  "
+                        f"Cancelled: {_n_cancelled}  ·  "
+                        f"Pending: {_n_pending}"
+                    )
+                    _fills_sht.range("A5").value = (
+                        "Note: fills_log captures script-side state at write time. "
+                        "For broker truth use: ibkr_paper_exec.py --check-fills"
+                    )
+                    _fills_df = pd.DataFrame([{
+                        "Exec TS":       r.get("exec_timestamp", ""),
+                        "Rec Run TS":    r.get("rec_log_run_at", ""),
+                        "Ticker":        r.get("ticker", ""),
+                        "Side":          r.get("side", ""),
+                        "Qty Req":       r.get("qty_requested", 0),
+                        "Qty Filled":    r.get("qty_filled", 0),
+                        "Qty Remaining": r.get("qty_remaining", 0),
+                        "Avg Fill Px":   r.get("avg_fill_price_local", None),
+                        "Rec Px (AUD)":  r.get("rec_px_aud", None),
+                        "Status":        (r.get("status_final")
+                                            or r.get("status") or "?"),
+                        "Done":          r.get("is_done", False),
+                        "OrderId":       r.get("order_id", 0),
+                        "PermId":        r.get("ibkr_perm_id", 0),
+                        "N Fills":       r.get("n_fills", 0),
+                    } for r in _fills_rows])
+                    _fills_sht.range("A7").options(pd.DataFrame, index=False,
+                                                     header=True).value = _fills_df
+                    _fills_sht.autofit()
+                    print(f"[excel] Actual_Fills: {len(_fills_rows)} rows "
+                          f"(latest batch {_latest_ts}: "
+                          f"{_n_filled}F/{_n_cancelled}C/{_n_pending}P)")
+                elif _fills_path.exists():
+                    _fills_sht.range("A1").value = "IBKR Actual Fills — log empty"
+                    _fills_sht.range("A2").value = (
+                        "ibkr_fills_log.jsonl exists but has no rows. Run "
+                        "ibkr_paper_exec.py --execute to populate."
+                    )
+                    print("[excel] Actual_Fills: log file exists but empty")
+                else:
+                    _fills_sht.range("A1").value = "IBKR Actual Fills — log not found"
+                    _fills_sht.range("A2").value = (
+                        "ibkr_fills_log.jsonl does not exist yet. Run "
+                        "ibkr_paper_exec.py --execute to start populating; "
+                        "this sheet refreshes on every engine run."
+                    )
+                    print("[excel] Actual_Fills: log file does not exist yet")
+            except Exception as _e_fills:
+                print(f"[excel] Actual_Fills write skipped: {_e_fills}")
+
             # ---- Update Lots and overwrite Holdings with target units (for next run) ----
             UPDATED_LOTS = _update_lots_after_trades(lots_df, trade_rec, pd.Timestamp(prices.index[-1]), fx_map_all)
             sht_lots = get_or_clear_sheet(wb, 'Lots')
