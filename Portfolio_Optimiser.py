@@ -12449,57 +12449,67 @@ if USE_XLWINGS:
                                     index=w_tradeplan_idx)
 
             # === Rebalance trigger verdict ============================================
-            # Compute summed |Δw| between current portfolio composition and the
-            # target (w_tradeplan). When run by the scheduled wrapper, this
-            # verdict line is what the wrapper parses to decide whether to send
-            # a "rebalance ready" notification or "no action needed today."
-            # The threshold is the same SKIP_REBAL_DELTA used in the backtest
-            # engine so live behaviour mirrors backtest behaviour.
+            # Computes Σ|Δw| from the trade_rec DataFrame directly:
+            #     Σ|Δw| = Σ|Δ_units · last_px| / portfolio_value
+            # This is the actual trade volume normalised by NAV — exactly the
+            # L1 distance between current and target weight vectors, computed
+            # WITHOUT the weight-vector arithmetic that has produced impossible
+            # values twice now (39.87 → 78.53 → 155.91 across 3 runs, despite
+            # raw sums of both inputs being 1.0). The trade_rec path uses the
+            # engine's already-validated make_trade_plan() output and inherits
+            # its rounding for partial-share trades.
             #
-            # Defensive normalisation 2026-06-22: first-run testing produced
-            # summed_|Δw| = 39.87 / 78.53 — way above the theoretical max of 2.0
-            # for two probability vectors. Root cause was input series not
-            # actually summing to 1. Now we explicitly normalise both sides
-            # AND log raw sums so any future divergence is diagnosable.
+            # Rationale recap: a previous diff-of-weight-vectors approach
+            # silently degraded when one side had signed/cancelling values.
+            # The trade-volume approach can't degrade that way — it's a
+            # straight cash-flow sum.
             try:
-                _curr_units_ser = pd.Series(units, dtype=float)
-                _px_for_w = pd.Series(last_px_hold, dtype=float)
-                _val_ser = (_curr_units_ser
-                              .reindex(_px_for_w.index, fill_value=0.0)
-                              * _px_for_w).dropna()
-                _curr_val_total = float(_val_ser.sum())
-                if _curr_val_total > 0:
-                    _curr_w = (_val_ser / _curr_val_total).reindex(
-                        w_tradeplan.index, fill_value=0.0)
+                # Use the existing helper so we match whatever encoding the
+                # delta column has (Δ Units, Delta Units, or the mojibake
+                # variant from legacy Excel round-trips).
+                _delta_col_v = _trade_delta_col(trade_rec)
+                _px_col_v = ("Last Px (AUD)"
+                               if "Last Px (AUD)" in trade_rec.columns
+                               else None)
+                # Portfolio value: the same value the rec log will record so
+                # the verdict and the log agree.
+                if (portfolio_value_override is not None
+                        and np.isfinite(portfolio_value_override)
+                        and portfolio_value_override > 0):
+                    _portfolio_val_for_verdict = float(portfolio_value_override)
                 else:
-                    _curr_w = pd.Series(0.0, index=w_tradeplan.index)
-                _target_w = w_tradeplan.reindex(_curr_w.index, fill_value=0.0)
+                    _cu_v = pd.to_numeric(trade_rec.get("Curr Units", 0),
+                                            errors="coerce").fillna(0)
+                    _lp_v = pd.to_numeric(trade_rec.get("Last Px (AUD)", 0),
+                                            errors="coerce").fillna(0)
+                    _portfolio_val_for_verdict = float((_cu_v * _lp_v).sum())
 
-                # Capture raw sums BEFORE normalisation so we can spot input
-                # bugs without needing a re-run.
-                _curr_sum_raw = float(_curr_w.sum())
-                _target_sum_raw = float(_target_w.sum())
+                if _delta_col_v is None or _px_col_v is None:
+                    raise ValueError(
+                        f"trade_rec missing delta or price column "
+                        f"(delta={_delta_col_v}, px={_px_col_v})"
+                    )
+                _deltas = pd.to_numeric(trade_rec[_delta_col_v],
+                                          errors="coerce").fillna(0)
+                _pxs = pd.to_numeric(trade_rec[_px_col_v],
+                                       errors="coerce").fillna(0)
+                _trade_volume_aud = float(np.abs(_deltas * _pxs).sum())
+                _n_trades = int((_deltas != 0).sum())
+                if _portfolio_val_for_verdict > 0:
+                    _summed_abs_dw = _trade_volume_aud / _portfolio_val_for_verdict
+                else:
+                    _summed_abs_dw = float("nan")
 
-                # Defensive renormalisation — if either side isn't already a
-                # probability distribution, force it to be one. Otherwise the
-                # |Δw| sum is unbounded and the threshold check is meaningless.
-                if _curr_sum_raw > 0:
-                    _curr_w = _curr_w / _curr_sum_raw
-                if _target_sum_raw > 0:
-                    _target_w = _target_w / _target_sum_raw
-
-                _summed_abs_dw = float(np.abs(
-                    _target_w.values - _curr_w.values).sum())
-                _verdict = ("SKIP" if _summed_abs_dw < float(SKIP_REBAL_DELTA)
+                _verdict = ("SKIP" if (np.isfinite(_summed_abs_dw)
+                                         and _summed_abs_dw < float(SKIP_REBAL_DELTA))
                               else "RUN")
                 print(f"[rebal-trigger] summed_|Δw|={_summed_abs_dw:.4f}  "
                       f"threshold={float(SKIP_REBAL_DELTA):.4f}  "
                       f"verdict={_verdict}  "
                       f"mode={_tp_mode}  "
-                      f"portfolio_aud={_curr_val_total:,.0f}  "
-                      f"(raw sums: curr={_curr_sum_raw:.4f}, "
-                      f"target={_target_sum_raw:.4f}, "
-                      f"n_tickers={len(_target_w)})")
+                      f"portfolio_aud={_portfolio_val_for_verdict:,.0f}  "
+                      f"trade_volume_aud={_trade_volume_aud:,.0f}  "
+                      f"n_trades={_n_trades}")
                 globals()["REBAL_TRIGGER_VERDICT"] = _verdict
                 globals()["REBAL_TRIGGER_SUMMED_DW"] = _summed_abs_dw
             except Exception as _e_rebal_trig:
