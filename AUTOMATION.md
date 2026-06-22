@@ -93,13 +93,27 @@ The wrapper parses this line and decides what kind of toast to show.
 
 The `--auto-pipeline` flag was added in the build dated 2026-06-22.
 
+The exe is built `--noconsole` so a bare `& "...exe"` does NOT block —
+PowerShell returns immediately while the engine continues in the
+background. Use `Start-Process -Wait` so the next command sees the
+finished log file:
+
 ```powershell
-& "$PSScriptRoot\dist\Portfolio Optimiser.exe" --auto-pipeline 2>$null
-Get-Content "$PSScriptRoot\dist\run.log" | Select-String "rebal-trigger"
+Start-Process -FilePath "dist\Portfolio Optimiser.exe" `
+    -ArgumentList "--auto-pipeline" -Wait
+Get-Content dist\run.log | Select-String "rebal-trigger"
 ```
 
 You should see a single `[rebal-trigger] ...` line. If you get a usage error or
 no line, rebuild via `& ".\.venv\Scripts\python.exe" build_helper.py`.
+
+> **First-run gotcha:** if PowerShell's execution policy blocks
+> `daily_auto.ps1` with `running scripts is disabled on this system`,
+> either run with `powershell -ExecutionPolicy Bypass -File .\daily_auto.ps1`
+> for one-off testing, or fix it for your user with
+> `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`.
+> The Task Scheduler invocation below already passes `-ExecutionPolicy Bypass`
+> so the scheduled runs work regardless of your default policy.
 
 ### 2. Test the wrapper manually
 
@@ -118,13 +132,15 @@ for unattended runs; the message box is purely visual.
 
 ### 3. Schedule daily via Task Scheduler
 
-Open PowerShell **as admin** (required to register the task), then:
+Open PowerShell **as admin** (required to register the task), then build
+the `/TR` value as a single-quoted PowerShell string so the embedded
+double-quotes around the script path don't get mis-escaped (Windows
+paths with spaces — like `Fionn Guina` — otherwise break the parse):
 
 ```powershell
+$tr = 'powershell -ExecutionPolicy Bypass -File "C:\Users\Fionn Guina\Portfolio_Optimiser\daily_auto.ps1"'
 schtasks /Create /SC WEEKLY /D MON,TUE,WED,THU,FRI `
-  /TN "Portfolio Optimiser Daily" `
-  /TR "powershell -ExecutionPolicy Bypass -File `"C:\Users\Fionn Guina\Portfolio_Optimiser\daily_auto.ps1`"" `
-  /ST 09:30
+  /TN "Portfolio Optimiser Daily" /TR $tr /ST 09:30
 ```
 
 Verify:
