@@ -14,6 +14,24 @@ in [README.md](README.md) records which commit is bundled into the live `.exe`.
 ## [Unreleased]
 
 ### Added
+- **Live TLH injection into the trade plan.** Engine now runs `_run_tlh_pass()`
+  against the current lot book BEFORE building the rebalance plan, so the
+  recommended trades already include any harvest swaps. Cooldown state
+  persists across runs in `tlh_cooldown_state.json` (wash-swap protection
+  under TR 2008/1). The rec log's new `tlh_swaps` array records each event
+  with source/sub ticker, units, prices, loss, hold days. PPT slide 3 gets
+  a red LIVE TLH callout above the cumulative-backtest scorecard when
+  events fire. Phase 2 dry-run + Phase 3 paper exec preview both surface
+  the swap list above the trade table.
+- **`LIVE_TRADING_START_DATE = "2026-06-22"`** — drift tracker is now
+  active (paper trading commenced today). Update to real-money start once
+  AFSL issues + first live fill.
+- **[LOCKBOX.md](LOCKBOX.md)** — validation-discipline + live-evidence-
+  accumulation doc. Captures peek budget state (5/7 used), refresh
+  triggers (peeks exhausted / major arch change / 18mo wall-clock), the
+  refresh procedure (snapshot val results → expand dev → carve new val
+  → reset budget), and the cadence for daily/weekly/monthly/quarterly
+  ops once live evidence starts accumulating.
 - **Excel `Actual_Fills` sheet** populated on every engine run from
   `ibkr_fills_log.jsonl`. Header shows the latest batch summary
   (Submitted / Filled / Cancelled / Pending), full per-row ledger

@@ -471,7 +471,7 @@ CGT_CONFIG = CGT_PROFILES[ACTIVE_CGT_PROFILE].copy()
 # once IBKR is connected. Until then drift NAV tracking stays dormant but the
 # infrastructure (recommendation log, fill sheet, NAV history) keeps running.
 # ============================================================================
-LIVE_TRADING_START_DATE: str | None = None  # ISO date string, e.g. "2026-08-01"
+LIVE_TRADING_START_DATE: str | None = "2026-06-22"  # paper trading commenced this date; drift tracker active from here. Update to real-money start once AFSL issues + first live fill.
 DRIFT_MONTHLY_THRESH       = 0.02   # warn if |monthly drift|       > 2%
 DRIFT_CUMULATIVE_THRESH    = 0.05   # warn if |cumulative drift|    > 5%
 DRIFT_DD_ALERT_THRESH      = -0.10  # warn if live MaxDD            < -10%
@@ -1791,6 +1791,63 @@ def _run_tlh_pass(
         })
         result["n_events"] += 1
     return result
+
+
+# === Live TLH helpers (Phase 4: trade-plan injection) ========================
+# The backtest TLH pass runs inside the walk-forward engine. These helpers
+# wrap the same pass for the live pipeline so the recommended trade plan
+# already includes harvest swaps and the user executes one atomic batch
+# (rebalance + TLH baked in) through Phase 3.
+def _build_lot_book_from_df(lots_df: "pd.DataFrame") -> "LotBook":
+    """Convert the Lots sheet DataFrame into an in-memory LotBook for TLH/CGT
+    queries. Rows with missing/invalid ticker, units, or cost basis are
+    skipped silently. Cost basis convention: per-unit AUD (engine standard,
+    see _allocate_sale_to_lots)."""
+    lb = LotBook()
+    if lots_df is None or (hasattr(lots_df, "empty") and lots_df.empty):
+        return lb
+    for _, r in lots_df.iterrows():
+        try:
+            tk = str(r.get("Security", "")).strip()
+            if not tk or tk.lower() in ("nan", "none"):
+                continue
+            units = float(r.get("Units", 0) or 0)
+            if units <= 0 or not np.isfinite(units):
+                continue
+            date = pd.Timestamp(r.get("AcqDate"))
+            cost_basis = float(r.get("CostBaseAUD", 0) or 0)
+            if not np.isfinite(cost_basis) or cost_basis <= 0:
+                continue
+            lb.buy(tk, units, date, cost_basis)
+        except Exception:
+            continue
+    return lb
+
+
+def _load_tlh_cooldown_state(path) -> dict:
+    """Load persisted TLH cooldown state. Empty dict if file missing/corrupt.
+    Stored as {ticker: ISO timestamp string}, returned as {ticker: Timestamp}."""
+    try:
+        path = Path(path)
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {str(k): pd.Timestamp(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _save_tlh_cooldown_state(path, state: dict) -> None:
+    """Persist TLH cooldown state to JSON. Failures are logged, not raised —
+    the cooldown is an optimisation; a corrupt/missing file just means the
+    next run is more cautious (treats no cooldown as active)."""
+    try:
+        with open(Path(path), "w", encoding="utf-8") as f:
+            json.dump({str(k): pd.Timestamp(v).isoformat()
+                        for k, v in state.items()}, f, indent=2)
+    except Exception as e:
+        print(f"[tlh-live] cooldown state save failed: {e}")
 
 
 def _check_crash_trigger(spy_history, as_of, state: dict,
@@ -5220,12 +5277,20 @@ def append_trade_recommendation_log(
     broker_name: str,
     cgt_mtr: float,
     universe_size: int,
+    tlh_events: list[dict] | None = None,
 ) -> None:
     """Append one JSONL entry recording the engine's current recommendation.
 
     Foundation for the live vs backtest drift tracker (Tier-1 #3). Each run
     appends one line. Once trading starts, a separate sheet of actual fills
     will be joined against this log to compute slippage + adherence.
+
+    tlh_events (optional): list of TLH swap dicts from _run_tlh_pass on the
+    live lot book. When non-empty, the rebalance delta in recommended_trades
+    has already been computed against POST-TLH units (so executing all
+    recommended_trades realises the harvest swap implicitly). tlh_events
+    are also recorded as their own array so downstream consumers can render
+    a TLH-specific view (PPT slide 3 footer, IBKR exec annotation).
     """
     entry = {
         "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
@@ -5248,6 +5313,21 @@ def append_trade_recommendation_log(
         "expected_brokerage_aud": round(float(expected_brokerage_aud), 2),
         "expected_cgt_aud": round(float(expected_cgt_aud), 2),
         "recommended_trades": [],
+        "tlh_swaps": [
+            {
+                "ticker_sold":          str(ev.get("ticker_sold", "")),
+                "ticker_bought":        str(ev.get("ticker_bought", "")),
+                "units_sold":           int(round(float(ev.get("units_sold", 0)))),
+                "units_bought":         int(round(float(ev.get("units_bought", 0)))),
+                "sale_price":           round(float(ev.get("sale_price", 0)), 4),
+                "buy_price":            round(float(ev.get("buy_price", 0)), 4),
+                "loss_aud":             round(float(ev.get("loss_aud", 0)), 2),
+                "swap_value_aud":       round(float(ev.get("swap_value_aud", 0)), 2),
+                "hold_days":            int(ev.get("hold_days", 0)),
+                "lot_date":             str(ev.get("lot_date", "")),
+            }
+            for ev in (tlh_events or [])
+        ],
     }
     delta_col = "Delta Units" if "Delta Units" in trade_df.columns else None
     if delta_col is not None:
@@ -12211,6 +12291,87 @@ if USE_XLWINGS:
                 except Exception as _e_px:
                     print(f"[ibkr-price] override skipped: {_e_px}")
 
+            # === Live TLH injection (Phase 4) ====================================
+            # Run TLH against the CURRENT lot book BEFORE building trade plans so
+            # the resulting rebalance delta already includes the harvest swaps.
+            # Result: the user executes one atomic batch via Phase 3 — rebalance
+            # + TLH baked into the same recommended_trades list. The swap events
+            # are also recorded as `tlh_swaps` in the rec log so Phase 3 can
+            # annotate them, the PPT slide can show a TLH-specific summary, etc.
+            #
+            # Cooldown state is persisted across runs in tlh_cooldown_state.json
+            # so the engine doesn't recommend re-buying a substitute we recently
+            # harvested into (wash-swap protection under TR 2008/1).
+            live_tlh_events: list[dict] = []
+            if TLH_ENABLED:
+                try:
+                    _tlh_cooldown_path = APP_DIR / "tlh_cooldown_state.json"
+                    _live_cooldown_state = _load_tlh_cooldown_state(_tlh_cooldown_path)
+                    _live_lot_book = _build_lot_book_from_df(lots_df)
+                    # Build price snapshot dict (ticker -> AUD price) from
+                    # last_px_hold; substitute tickers may be outside the
+                    # current holdings universe so widen with all known prices.
+                    _px_snap = {}
+                    try:
+                        for _tk, _v in last_px_hold.items():
+                            if pd.notna(_v) and float(_v) > 0:
+                                _px_snap[str(_tk)] = float(_v)
+                    except Exception:
+                        pass
+                    # Also accept any tickers in the wider prices DataFrame so
+                    # substitutes outside last_px_hold can still be priced.
+                    try:
+                        _last_row = prices.iloc[-1]
+                        for _tk, _v in _last_row.items():
+                            if pd.notna(_v) and float(_v) > 0 and str(_tk) not in _px_snap:
+                                _px_snap[str(_tk)] = float(_v)
+                    except Exception:
+                        pass
+                    _tlh_today = pd.Timestamp(prices.index[-1])
+                    _live_nav = (float(portfolio_value_override)
+                                  if (portfolio_value_override is not None
+                                      and np.isfinite(portfolio_value_override)
+                                      and portfolio_value_override > 0)
+                                  else None)
+                    _tlh_out = _run_tlh_pass(
+                        lot_book=_live_lot_book,
+                        price_snapshot=_px_snap,
+                        as_of=_tlh_today,
+                        cooldown_state=_live_cooldown_state,
+                        nav_aud=_live_nav,
+                    )
+                    live_tlh_events = _tlh_out.get("events", []) or []
+                    if live_tlh_events:
+                        # Apply swap deltas to `units` so the rebalance delta
+                        # below already incorporates them. Net effect: the
+                        # user executes one batch via Phase 3 and the harvest
+                        # swap + rebalance both clear together.
+                        units = pd.Series(units, dtype=float).copy()
+                        for _ev in live_tlh_events:
+                            _stk = str(_ev["ticker_sold"])
+                            _btk = str(_ev["ticker_bought"])
+                            _su = float(_ev["units_sold"])
+                            _bu = float(_ev["units_bought"])
+                            units[_stk] = float(units.get(_stk, 0.0)) - _su
+                            units[_btk] = float(units.get(_btk, 0.0)) + _bu
+                        _save_tlh_cooldown_state(_tlh_cooldown_path,
+                                                   _live_cooldown_state)
+                        _loss_total = sum(float(ev.get("loss_aud", 0))
+                                            for ev in live_tlh_events)
+                        print(f"[tlh-live] {len(live_tlh_events)} swap(s) "
+                              f"recommended, ${_loss_total:,.0f} loss to "
+                              f"realise. units adjusted; cooldown saved.")
+                    else:
+                        print(f"[tlh-live] no qualifying loss lots "
+                              f"(threshold {TLH_MIN_LOSS_PCT*100:+.0f}%, "
+                              f"min ${TLH_MIN_LOSS_AUD:.0f}, "
+                              f"cooldown {TLH_COOLDOWN_DAYS}d, "
+                              f"{len(lots_df) if lots_df is not None else 0} "
+                              f"lots scanned)")
+                except Exception as _e_live_tlh:
+                    print(f"[tlh-live] skipped: {_e_live_tlh}")
+            globals()["LIVE_TLH_EVENTS"] = live_tlh_events
+
             # Build ALL three trade plans up-front; downstream code can compare
             # what each one implies, and the "active" one is picked below.
             trade_no, resid_no = make_trade_plan(
@@ -12339,6 +12500,7 @@ if USE_XLWINGS:
                     broker_name=str(BROKER_CONFIG.get("name", "unknown")),
                     cgt_mtr=float(CGT_CONFIG.get("marginal_tax_rate", 0.30)),
                     universe_size=int(len(w_tradeplan)),
+                    tlh_events=globals().get("LIVE_TLH_EVENTS", []) or [],
                 )
             except Exception as _e_drift:
                 print(f"[drift] recommendation log skipped: {_e_drift}")
@@ -13849,6 +14011,43 @@ def export_to_ppt(results, trades, charts=None):
                 pm.alignment = PP_ALIGN.LEFT
         except Exception as _e_mix:
             print(f"[pptx] Slide 2 regime mix annotation skipped: {_e_mix}")
+
+    # --- LIVE TLH callout (this-run harvest swaps, baked into rebalance) ---
+    # Phase 4: live TLH is injected before the trade plan is built so the
+    # rebalance delta in `trades` already includes the harvest swaps. Surface
+    # them here so the user can see exactly which lots are being swapped
+    # and the loss being crystallised — separately from the backtest
+    # cumulative scorecard below.
+    try:
+        _live_tlh_ppt = globals().get("LIVE_TLH_EVENTS", []) or []
+        if _live_tlh_ppt:
+            _live_loss = float(sum(e.get("loss_aud", 0.0) for e in _live_tlh_ppt))
+            _live_pairs = ", ".join(
+                f"{ev.get('ticker_sold', '?')}→{ev.get('ticker_bought', '?')}"
+                for ev in _live_tlh_ppt[:5]
+            )
+            if len(_live_tlh_ppt) > 5:
+                _live_pairs += f" (+{len(_live_tlh_ppt)-5} more)"
+            _live_text = (
+                f"LIVE TLH this run: {len(_live_tlh_ppt)} swap(s)  ·  "
+                f"${_live_loss:,.0f} loss to realise  ·  baked into rebalance  ·  "
+                f"{_live_pairs}"
+            )
+            _live_box = slide.shapes.add_textbox(Cm(1.10), Cm(16.20), Cm(23.80), Cm(0.50))
+            _ltf = _live_box.text_frame
+            _ltf.clear()
+            _ltf.word_wrap = False
+            _ltf.margin_left = 0
+            _ltf.margin_top = 0
+            _lp = _ltf.paragraphs[0]
+            _lp.text = _live_text
+            _lp.font.size = Pt(10)
+            _lp.font.bold = True
+            _lp.font.color.rgb = RGBColor(176, 0, 0)  # accent red — same as FF cutoff line
+            _lp.alignment = PP_ALIGN.CENTER
+            print(f"[pptx] Slide 3 live-TLH callout added: {len(_live_tlh_ppt)} swap(s)")
+    except Exception as _e_live_tlh_ppt:
+        print(f"[pptx] Slide 3 live-TLH callout skipped: {_e_live_tlh_ppt}")
 
     # --- TLH scorecard line (one-liner with cumulative harvest activity) ---
     # Positioned at the BOTTOM of slide 2 (below the Deferred Tax/Cash

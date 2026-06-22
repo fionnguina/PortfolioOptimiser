@@ -102,6 +102,16 @@ def _print_preview(rec_entry: dict, plan: list[tuple], totals: dict) -> None:
         mix_str = " · ".join(f"{k.split('(')[0].strip()}={float(v)*100:.0f}%"
                               for k, v in mix.items())
         print(f"  Regime:     {mix_str}")
+    tlh_swaps = rec_entry.get("tlh_swaps", []) or []
+    if tlh_swaps:
+        total_loss = sum(float(s.get("loss_aud", 0)) for s in tlh_swaps)
+        print(f"  TLH:        {len(tlh_swaps)} swap(s) baked into the rebalance, "
+              f"${total_loss:,.0f} loss to realise")
+        for s in tlh_swaps:
+            print(f"              {s.get('ticker_sold','?'):<10} {int(s.get('units_sold',0)):>6} → "
+                  f"{s.get('ticker_bought','?'):<10} {int(s.get('units_bought',0)):>6}  "
+                  f"loss ${float(s.get('loss_aud',0)):,.0f}  "
+                  f"hold {int(s.get('hold_days',0))}d")
     print()
     print(f"  {'#':>3}  {'Ticker':<10} {'IBKR sym':<10} {'Exch':<6} {'Ccy':<4} "
           f"{'Side':<4} {'Qty':>10} {'Px AUD':>10} {'Value AUD':>14} "
