@@ -12455,6 +12455,12 @@ if USE_XLWINGS:
             # a "rebalance ready" notification or "no action needed today."
             # The threshold is the same SKIP_REBAL_DELTA used in the backtest
             # engine so live behaviour mirrors backtest behaviour.
+            #
+            # Defensive normalisation 2026-06-22: first-run testing produced
+            # summed_|Δw| = 39.87 / 78.53 — way above the theoretical max of 2.0
+            # for two probability vectors. Root cause was input series not
+            # actually summing to 1. Now we explicitly normalise both sides
+            # AND log raw sums so any future divergence is diagnosable.
             try:
                 _curr_units_ser = pd.Series(units, dtype=float)
                 _px_for_w = pd.Series(last_px_hold, dtype=float)
@@ -12468,6 +12474,20 @@ if USE_XLWINGS:
                 else:
                     _curr_w = pd.Series(0.0, index=w_tradeplan.index)
                 _target_w = w_tradeplan.reindex(_curr_w.index, fill_value=0.0)
+
+                # Capture raw sums BEFORE normalisation so we can spot input
+                # bugs without needing a re-run.
+                _curr_sum_raw = float(_curr_w.sum())
+                _target_sum_raw = float(_target_w.sum())
+
+                # Defensive renormalisation — if either side isn't already a
+                # probability distribution, force it to be one. Otherwise the
+                # |Δw| sum is unbounded and the threshold check is meaningless.
+                if _curr_sum_raw > 0:
+                    _curr_w = _curr_w / _curr_sum_raw
+                if _target_sum_raw > 0:
+                    _target_w = _target_w / _target_sum_raw
+
                 _summed_abs_dw = float(np.abs(
                     _target_w.values - _curr_w.values).sum())
                 _verdict = ("SKIP" if _summed_abs_dw < float(SKIP_REBAL_DELTA)
@@ -12476,7 +12496,10 @@ if USE_XLWINGS:
                       f"threshold={float(SKIP_REBAL_DELTA):.4f}  "
                       f"verdict={_verdict}  "
                       f"mode={_tp_mode}  "
-                      f"portfolio_aud={_curr_val_total:,.0f}")
+                      f"portfolio_aud={_curr_val_total:,.0f}  "
+                      f"(raw sums: curr={_curr_sum_raw:.4f}, "
+                      f"target={_target_sum_raw:.4f}, "
+                      f"n_tickers={len(_target_w)})")
                 globals()["REBAL_TRIGGER_VERDICT"] = _verdict
                 globals()["REBAL_TRIGGER_SUMMED_DW"] = _summed_abs_dw
             except Exception as _e_rebal_trig:

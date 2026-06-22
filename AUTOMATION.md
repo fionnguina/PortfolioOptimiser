@@ -132,31 +132,58 @@ for unattended runs; the message box is purely visual.
 
 ### 3. Schedule daily via Task Scheduler
 
-Open PowerShell **as admin** (required to register the task), then build
-the `/TR` value as a single-quoted PowerShell string so the embedded
-double-quotes around the script path don't get mis-escaped (Windows
-paths with spaces — like `Fionn Guina` — otherwise break the parse):
+Open PowerShell **as admin** (required to register the task). Use
+`Register-ScheduledTask` — the modern PowerShell cmdlet — instead of the
+legacy `schtasks` CLI. `schtasks /TR` does not handle paths with spaces
+cleanly even when the value is built in a variable; the modern cmdlet
+takes the script path as a typed argument and quotes it correctly:
 
 ```powershell
-$tr = 'powershell -ExecutionPolicy Bypass -File "C:\Users\Fionn Guina\Portfolio_Optimiser\daily_auto.ps1"'
-schtasks /Create /SC WEEKLY /D MON,TUE,WED,THU,FRI `
-  /TN "Portfolio Optimiser Daily" /TR $tr /ST 09:30
+$action = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument '-ExecutionPolicy Bypass -File "C:\Users\Fionn Guina\Portfolio_Optimiser\daily_auto.ps1"'
+
+$trigger = New-ScheduledTaskTrigger `
+    -Weekly `
+    -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday `
+    -At '9:30 AM'
+
+Register-ScheduledTask `
+    -TaskName 'Portfolio Optimiser Daily' `
+    -Action $action `
+    -Trigger $trigger `
+    -RunLevel Highest `
+    -Description 'Runs the engine in --auto-pipeline mode and pings a toast notification when a rebalance is due.'
 ```
 
 Verify:
 
 ```powershell
-schtasks /Query /TN "Portfolio Optimiser Daily"
+Get-ScheduledTask -TaskName 'Portfolio Optimiser Daily' |
+    Get-ScheduledTaskInfo | Format-List
+```
+
+Trigger a manual test run (no need to wait for 09:30):
+
+```powershell
+Start-ScheduledTask -TaskName 'Portfolio Optimiser Daily'
 ```
 
 Remove (if you ever want to):
 
 ```powershell
-schtasks /Delete /TN "Portfolio Optimiser Daily" /F
+Unregister-ScheduledTask -TaskName 'Portfolio Optimiser Daily' -Confirm:$false
 ```
 
-The 09:30 time is local Windows time. ASX opens at 10:00 AEST so 09:30 gives
-the engine 30 minutes of pre-market price flow + IBKR live-price snapshot.
+The 09:30 time is local Windows time. ASX opens at 10:00 AEST so 09:30
+gives the engine 30 minutes of pre-market price flow + IBKR live-price
+snapshot.
+
+> **Why not `schtasks`?** The legacy `schtasks /Create /TR` CLI tokenises
+> its arguments by space even when the value is in a PowerShell variable,
+> so `C:\Users\Fionn Guina\...` gets split. `Register-ScheduledTask` takes
+> the path as a typed string and quotes it correctly under the hood. See
+> [memory powershell gotchas](memory/reference_powershell_gotchas.md).
 
 ---
 
