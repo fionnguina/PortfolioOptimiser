@@ -14477,9 +14477,13 @@ def export_to_ppt(results, trades, charts=None):
             # Ensemble portfolio (replaced Current/Previous/Optimised/With
             # Tilts). Falls back to legacy keys if an older charts dict is
             # passed in so the slide doesn't blank out on stale state.
+            # Today's Weight column (added 2026-06-22): pulls each slot's
+            # softmax weight from ensemble_mix_live so the regime mix is
+            # visible right next to each slot's vol/return.
             _slot_keys = list(ENSEMBLE_SLOT_NAMES) + ["Ensemble"]
             _legacy_keys = ["Current", "Previous", "Optimised", "With Tilts", "Ensemble"]
             _ordered_keys = _slot_keys if any(k in pts for k in _slot_keys) else _legacy_keys
+            _ens_mix = globals().get("ensemble_mix_live", pd.Series(dtype=float))
             for k in _ordered_keys:
                 v = pts.get(k, None)
                 if v is None:
@@ -14488,7 +14492,14 @@ def export_to_ppt(results, trades, charts=None):
                     vol, ret = float(v[0]), float(v[1])
                     if np.isfinite(vol) and np.isfinite(ret):
                         _label = k.split(" (")[0] if "(" in k else k
-                        rows.append({"Point": _label, "Vol (ann.)": vol, "Return (ann.)": ret})
+                        if k == "Ensemble":
+                            _wt = float("nan")
+                        elif isinstance(_ens_mix, pd.Series) and k in _ens_mix.index:
+                            _wt = float(_ens_mix[k])
+                        else:
+                            _wt = float("nan")
+                        rows.append({"Point": _label, "Vol (ann.)": vol,
+                                     "Return (ann.)": ret, "Today's Weight": _wt})
                 except Exception:
                     pass
 
@@ -14511,9 +14522,12 @@ def export_to_ppt(results, trades, charts=None):
                 df_pts = pd.DataFrame(rows).set_index("Point").rename(
                     columns={"Vol (ann.)": "Volatility", "Return (ann.)": "Return"}
                 )
+                # Widened from 7.72cm to 8.70cm so the new Today's Weight
+                # column fits without crowding the existing 3. Left edge
+                # unchanged (16.50cm) so chart layout is untouched.
                 tbl_left, tbl_top, tbl_w, tbl_h = _ppt_anchor(
                     slide5, slide_layout, "table_frontier_points",
-                    fb_left_cm=16.50, fb_top_cm=4.06, fb_w_cm=7.72, fb_h_cm=4.32,
+                    fb_left_cm=16.50, fb_top_cm=4.06, fb_w_cm=8.70, fb_h_cm=4.32,
                 )
                 _add_perf_table(
                     slide5, df_pts,
