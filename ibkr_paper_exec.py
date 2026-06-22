@@ -94,7 +94,14 @@ def _confirm_typed_yes(n_orders: int) -> bool:
 
 def _submit_orders(ib, plan: list, *, wait: bool) -> list:
     """Place every order in the plan and (optionally) wait for them to settle.
-    Returns the list of Trade objects (one per submitted order)."""
+    Returns the list of (rec, Trade) tuples.
+
+    Flushes the event loop between submissions and after the batch so that
+    IBKR's PreSubmitted -> Submitted -> Filled/Cancelled transitions land on
+    each Trade's orderStatus before we read it. The 2026-06-22 first-run bug
+    (all 12 trades logged as 'Cancelled' with permId=0 despite 6 actually
+    filling per TWS) was caused by reading orderStatus before the async
+    status events were processed."""
     trades = []
     for i, (rec, contract, order) in enumerate(plan, 1):
         try:
@@ -103,6 +110,9 @@ def _submit_orders(ib, plan: list, *, wait: bool) -> list:
             print(f"[exec] [{i:>3}/{len(plan)}] submitted "
                   f"{order.action} {int(order.totalQuantity):>6} {rec['ticker']:<10} "
                   f"orderId={trade.order.orderId}")
+            # Yield to the event loop briefly so the placeOrder ack and any
+            # immediate status updates flow before we submit the next order.
+            ib.sleep(0.1)
         except Exception as e:
             print(f"[exec][ERR] {rec['ticker']} placeOrder failed "
                   f"({type(e).__name__}): {e}")
@@ -115,29 +125,77 @@ def _submit_orders(ib, plan: list, *, wait: bool) -> list:
     if not trades:
         return trades
 
-    print(f"[exec] waiting up to {FILL_WAIT_SECONDS}s for orders to settle...")
-    deadline = time.time() + FILL_WAIT_SECONDS
-    settled_states = {"Filled", "Cancelled", "Inactive", "ApiCancelled"}
-    while time.time() < deadline:
-        n_settled = sum(1 for _, t in trades
-                        if t.orderStatus.status in settled_states)
-        n_total = len(trades)
-        if n_settled == n_total:
-            print(f"[exec] all {n_total} orders settled.")
-            break
-        ib.sleep(1)
-    else:
-        remaining = [t for _, t in trades
-                     if t.orderStatus.status not in settled_states]
-        print(f"[exec][WARN] {len(remaining)}/{len(trades)} orders did not settle "
-              f"within {FILL_WAIT_SECONDS}s. Summary will mark them as pending.")
+    # Initial 2s flush so PreSubmitted/Submitted statuses + permIds land
+    # before our first read.
+    ib.sleep(2)
+    print()
+    print("[exec] post-submit status snapshot:")
+    for rec, t in trades:
+        try:
+            permid = int(getattr(t.order, "permId", 0) or 0)
+            print(f"  {rec['ticker']:<10} orderId={t.order.orderId:>6} "
+                  f"status={t.orderStatus.status:<15} "
+                  f"permId={permid:>10} "
+                  f"filled={int(t.filled() or 0):>6} "
+                  f"remaining={int(t.remaining() or 0):>6}")
+        except Exception as e:
+            print(f"  {rec['ticker']:<10} (status read failed: {e})")
+    print()
 
+    print(f"[exec] waiting up to {FILL_WAIT_SECONDS}s for orders to reach a "
+          f"terminal state (isDone)...")
+    deadline = time.time() + FILL_WAIT_SECONDS
+    last_print = time.time()
+    while time.time() < deadline:
+        # Trade.isDone() is the canonical terminal-state check — catches
+        # Filled, Cancelled, ApiCancelled, Inactive, and other terminal
+        # variants without us hardcoding the list.
+        try:
+            all_done = all(t.isDone() for _, t in trades)
+        except Exception:
+            all_done = False
+        if all_done:
+            print(f"[exec] all {len(trades)} orders reached terminal state.")
+            break
+        # Periodic status print every ~10s so a long wait isn't silent.
+        if time.time() - last_print >= 10:
+            pending = [(r["ticker"], t.orderStatus.status)
+                       for r, t in trades if not t.isDone()]
+            elapsed = int(FILL_WAIT_SECONDS - (deadline - time.time()))
+            print(f"[exec] [{elapsed:>3}s] still pending: "
+                  + ", ".join(f"{tk}={st}" for tk, st in pending[:10])
+                  + (f" (+{len(pending)-10} more)" if len(pending) > 10 else ""))
+            last_print = time.time()
+        # waitOnUpdate returns as soon as ANY event arrives, more responsive
+        # than a fixed-interval sleep.
+        try:
+            ib.waitOnUpdate(timeout=1)
+        except Exception:
+            ib.sleep(1)
+    else:
+        not_done = [(r["ticker"], t.orderStatus.status)
+                    for r, t in trades if not t.isDone()]
+        print(f"[exec][WARN] {len(not_done)}/{len(trades)} orders did not reach "
+              f"terminal state within {FILL_WAIT_SECONDS}s. Logged as pending: "
+              + ", ".join(f"{tk}={st}" for tk, st in not_done))
+
+    # Final 2s flush to catch any straggler fill events before the log write.
+    ib.sleep(2)
     return trades
 
 
 def _write_fills_log(rec_entry: dict, trades: list, log_path: Path) -> int:
     """Append one JSONL row per submitted order to ibkr_fills_log.jsonl.
-    Returns the number of rows written."""
+    Returns the number of rows written.
+
+    Rich diagnostic capture (post 2026-06-22 bug):
+    - is_done from Trade.isDone() instead of inferring from status string
+    - qty_remaining alongside qty_filled so partial fills are unambiguous
+    - status_log: the full transition history from Trade.log so we can
+      see the PreSubmitted -> Cancelled or PreSubmitted -> Filled walk
+      even if the final-status read is stale
+    - avg_fill_price_local emitted as null (not NaN) for JSON safety
+    """
     rec_ts = rec_entry.get("run_at", "?")
     now_iso = datetime.now().isoformat(timespec="seconds")
     n_written = 0
@@ -145,12 +203,37 @@ def _write_fills_log(rec_entry: dict, trades: list, log_path: Path) -> int:
         for rec, trade in trades:
             try:
                 fills = list(getattr(trade, "fills", []) or [])
-                filled_qty = float(getattr(trade, "filled", lambda: 0)() or 0)
+                try:
+                    filled_qty = float(trade.filled() if callable(getattr(trade, "filled", None)) else 0)
+                except Exception:
+                    filled_qty = 0.0
+                try:
+                    remaining_qty = float(trade.remaining() if callable(getattr(trade, "remaining", None)) else 0)
+                except Exception:
+                    remaining_qty = 0.0
                 if filled_qty > 0 and fills:
                     avg_px = sum(float(fl.execution.price) * float(fl.execution.shares)
                                   for fl in fills) / filled_qty
                 else:
-                    avg_px = float("nan")
+                    avg_px = None  # null in JSON — NaN is invalid JSON
+                try:
+                    is_done = bool(trade.isDone())
+                except Exception:
+                    is_done = False
+                # Full status transition history from Trade.log. Each LogEntry
+                # has time, status, message — capture all three, truncate msg
+                # so a verbose IBKR error doesn't blow up the JSONL row.
+                status_log = []
+                for entry in getattr(trade, "log", []):
+                    try:
+                        status_log.append({
+                            "ts": str(getattr(entry, "time", "")),
+                            "status": str(getattr(entry, "status", "")),
+                            "msg": str(getattr(entry, "message", ""))[:240],
+                            "error_code": int(getattr(entry, "errorCode", 0) or 0),
+                        })
+                    except Exception:
+                        continue
                 row = {
                     "exec_timestamp": now_iso,
                     "rec_log_run_at": rec_ts,
@@ -158,15 +241,18 @@ def _write_fills_log(rec_entry: dict, trades: list, log_path: Path) -> int:
                     "side": trade.order.action,
                     "qty_requested": int(trade.order.totalQuantity),
                     "qty_filled": int(filled_qty),
+                    "qty_remaining": int(remaining_qty),
                     "avg_fill_price_local": avg_px,
-                    "rec_px_aud": float(rec.get("px_aud", float("nan"))),
-                    "rec_delta_value_aud": float(rec.get("delta_value_aud", float("nan"))),
-                    "status": trade.orderStatus.status,
+                    "rec_px_aud": float(rec.get("px_aud", 0.0) or 0.0),
+                    "rec_delta_value_aud": float(rec.get("delta_value_aud", 0.0) or 0.0),
+                    "status_final": str(trade.orderStatus.status),
+                    "is_done": is_done,
                     "order_id": int(trade.order.orderId),
                     "ibkr_perm_id": int(getattr(trade.order, "permId", 0) or 0),
                     "n_fills": len(fills),
+                    "status_log": status_log,
                 }
-                f.write(json.dumps(row) + "\n")
+                f.write(json.dumps(row, default=str) + "\n")
                 n_written += 1
             except Exception as e:
                 print(f"[exec][WARN] fill-log row failed for {rec.get('ticker', '?')}: "
@@ -226,6 +312,137 @@ def _print_reconciliation(trades: list) -> None:
     print()
 
 
+def _run_check_fills_mode() -> int:
+    """Re-query IBKR for the current status of orders from the most recent
+    batch in ibkr_fills_log.jsonl. Useful for:
+      - Overnight US orders that were 'pending' when the original run exited
+      - Diagnosing Cancelled-with-permId=0 rows (did the order actually fill
+        despite our log saying otherwise?)
+
+    Read-only — does not place orders, does not append to the fills log."""
+    fills_path = Path(FILLS_LOG_FILENAME)
+    if not fills_path.exists():
+        print(f"[check-fills] {fills_path} not found. Nothing to check.")
+        return 0
+
+    rows = []
+    with open(fills_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not rows:
+        print(f"[check-fills] {fills_path} is empty.")
+        return 0
+
+    # Most recent batch = highest exec_timestamp value
+    latest_ts = max(r["exec_timestamp"] for r in rows)
+    batch = [r for r in rows if r["exec_timestamp"] == latest_ts]
+    print(f"[check-fills] checking {len(batch)} order(s) from batch "
+          f"exec_timestamp={latest_ts}")
+
+    try:
+        from ib_insync import IB
+    except ImportError:
+        print("[check-fills] ib_insync not installed. Run: pip install ib_insync")
+        return 1
+
+    print(f"[check-fills] connecting to PAPER IBKR at {HOST}:{PORT} "
+          f"(clientId={CLIENT_ID})...")
+    ib = IB()
+    try:
+        ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[check-fills][ERR] connect failed ({type(e).__name__}): {e}")
+        print(f"[check-fills] make sure TWS / IB Gateway is on port {PORT} (paper).")
+        return 2
+
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed:
+            print("[check-fills][SAFETY] managedAccounts() returned nothing.")
+            return 3
+        _refuse_if_live(managed[0])
+        print(f"[check-fills] paper account: {managed[0]}")
+
+        # Ask IBKR for both currently-open and recently-completed orders.
+        # ib_insync auto-subscribes to openOrders on connect; we also need
+        # completed orders explicitly, then a short sleep so events arrive.
+        try:
+            ib.reqAllOpenOrders()
+        except Exception as e:
+            print(f"[check-fills][WARN] reqAllOpenOrders failed: {e}")
+        try:
+            ib.reqCompletedOrders(apiOnly=False)
+        except Exception as e:
+            print(f"[check-fills][WARN] reqCompletedOrders failed: {e}")
+        ib.sleep(3)
+
+        all_trades = list(ib.trades())
+        trades_by_id = {t.order.orderId: t for t in all_trades}
+        print(f"[check-fills] IBKR returned {len(all_trades)} known trades for "
+              f"clientId={CLIENT_ID}.")
+
+        print()
+        print("=" * 96)
+        print(f"STATUS RE-CHECK — batch from {latest_ts}")
+        print("=" * 96)
+        print(f"  {'Ticker':<12} {'OrderId':>7} {'PermId':>11} "
+              f"{'Status (logged)':<18} {'Status (now)':<18} "
+              f"{'Filled':>8} {'Avg Px':>10}")
+        print(f"  {'-'*12} {'-'*7} {'-'*11} {'-'*18} {'-'*18} "
+              f"{'-'*8} {'-'*10}")
+        n_changed = 0
+        n_filled_now = 0
+        for row in batch:
+            oid = int(row["order_id"])
+            trade = trades_by_id.get(oid)
+            logged_status = row.get("status_final") or row.get("status") or "?"
+            if not trade:
+                print(f"  {row['ticker']:<12} {oid:>7} {'?':>11} "
+                      f"{logged_status:<18} {'(not in IBKR)':<18} "
+                      f"{'?':>8} {'?':>10}")
+                continue
+            try:
+                now_status = str(trade.orderStatus.status)
+                filled = int(trade.filled() or 0)
+                permid = int(getattr(trade.order, "permId", 0) or 0)
+                fills = list(getattr(trade, "fills", []) or [])
+                if filled > 0 and fills:
+                    avg_px = sum(float(fl.execution.price) * float(fl.execution.shares)
+                                  for fl in fills) / filled
+                    avg_px_str = f"{avg_px:>10.4f}"
+                else:
+                    avg_px_str = f"{'—':>10}"
+                if now_status != logged_status:
+                    n_changed += 1
+                if now_status == "Filled":
+                    n_filled_now += 1
+                print(f"  {row['ticker']:<12} {oid:>7} {permid:>11} "
+                      f"{logged_status:<18} {now_status:<18} "
+                      f"{filled:>8} {avg_px_str}")
+            except Exception as e:
+                print(f"  {row['ticker']:<12} {oid:>7} (read failed: {e})")
+        print(f"  {'-'*12} {'-'*7} {'-'*11} {'-'*18} {'-'*18} "
+              f"{'-'*8} {'-'*10}")
+        print()
+        print(f"  Status changed since log:  {n_changed:>3}")
+        print(f"  Filled now (truth):        {n_filled_now:>3}")
+        print()
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+    print("=" * 96)
+    print("CHECK-FILLS COMPLETE — read-only, no orders placed.")
+    print("=" * 96)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="IBKR Phase 3 — paper-account execution with safety gates."
@@ -241,6 +458,14 @@ def main() -> int:
     parser.add_argument("--no-qualify", action="store_true",
                         help="Skip IBKR connection and contract qualification "
                              "(preview only; --execute is ignored if set).")
+    parser.add_argument("--check-fills", action="store_true",
+                        help="Read the most recent batch from ibkr_fills_log.jsonl, "
+                             "query IBKR for the current status of each orderId, "
+                             "and print an updated reconciliation. Use to check on "
+                             "orders that were pending when the original exec run "
+                             "exited (e.g. US orders waiting for overnight US open) "
+                             "or to diagnose Cancelled-with-permId=0 rows. Read-only "
+                             "— never calls placeOrder.")
     parser.add_argument("--only-tickers", type=str, default="",
                         help="Comma-separated list of tickers to keep from the "
                              "latest rec log. Use to retry specific orders after "
@@ -250,6 +475,11 @@ def main() -> int:
                              "(BEAR matches BEAR.AX, both match each other). "
                              "Example: --only-tickers HBRD,BEAR,BBUS")
     args = parser.parse_args()
+
+    # === --check-fills mode: read-only status query for previous orders ===
+    # No rec log needed, no orders placed. Returns 0 on success.
+    if args.check_fills:
+        return _run_check_fills_mode()
 
     rec_entry = _load_latest_run(Path(args.rec_log))
     trades_recs = rec_entry.get("recommended_trades", [])
