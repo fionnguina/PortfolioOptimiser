@@ -673,6 +673,118 @@ PRODUCTION_SLOT_OVERRIDE = None
 PRODUCTION_CRASH_HEDGE   = False
 
 
+# === Fund economics (currently DISABLED — wired for future activation) =======
+# Set FUND_FEES_ACTIVE = True to start accruing in the live engine + backtest.
+# Until then these constants are surfaced on the PDS slide but do NOT touch
+# any return / NAV calculation anywhere in the pipeline. Designed so that
+# flipping fees on later is a config change, not a code change.
+#
+# Management fee: % of NAV per annum, accrued daily on (NAV / 252).
+# Performance fee: % of return above the high-water mark, crystallised at
+# `PERFORMANCE_FEE_CRYSTALLISE_FREQ`. HWM uses peak-NAV-since-inception logic
+# (no rolling reset). Optional hurdle rate undercuts the performance fee
+# only on excess above hurdle_ann * mgmt_period — set to 0 for unhurdled.
+FUND_FEES_ACTIVE                  = False
+MANAGEMENT_FEE_PCT_ANN            = 0.02   # 2% per annum
+PERFORMANCE_FEE_PCT               = 0.20   # 20% of NAV above HWM
+PERFORMANCE_FEE_HWM               = True   # enforce high-water mark
+PERFORMANCE_FEE_HURDLE_ANN        = 0.00   # 0 = unhurdled
+PERFORMANCE_FEE_CRYSTALLISE_FREQ  = "Q"    # quarterly crystallisation
+
+
+def compute_fund_fees(
+    nav_series: "pd.Series",
+    *,
+    mgmt_pct_ann: float = MANAGEMENT_FEE_PCT_ANN,
+    perf_pct: float = PERFORMANCE_FEE_PCT,
+    use_hwm: bool = PERFORMANCE_FEE_HWM,
+    hurdle_ann: float = PERFORMANCE_FEE_HURDLE_ANN,
+    crystallise_freq: str = PERFORMANCE_FEE_CRYSTALLISE_FREQ,
+) -> "pd.DataFrame":
+    """Compute daily management + performance fee accrual on a NAV series.
+
+    INACTIVE in the live pipeline (gated by FUND_FEES_ACTIVE). Wired so the
+    fund can flip fees on without retrofitting the accounting layer.
+
+    Returns a DataFrame indexed by date with columns:
+      - mgmt_fee_daily: daily accrued management fee (AUD)
+      - mgmt_fee_ytd:   cumulative management fee since last crystallisation
+      - perf_fee_daily: zero except on crystallisation dates
+      - hwm:            high-water mark as-of each row
+      - nav_net_of_fees: NAV after subtracting accrued (but not crystallised)
+                        management fee + crystallised performance fee
+
+    HWM convention: peak NAV (net of management fee, before performance fee)
+    since inception, never reset. Performance fee crystallises on the last
+    business day of each crystallisation period (Q = quarterly: Mar/Jun/Sep/Dec).
+    Hurdle: only the portion above (hwm * (1 + hurdle_ann * period_days/252))
+    is fee-eligible.
+
+    Per-investor accounting (HWM that resets on redemption-and-rebuy etc) is
+    NOT modelled here — this is fund-level. Real per-investor subledger is
+    a future build when the fund actually opens to outside capital.
+    """
+    import pandas as _pd
+    import numpy as _np
+
+    if nav_series is None or len(nav_series) == 0:
+        return _pd.DataFrame()
+
+    nav = _pd.Series(nav_series, dtype=float).sort_index()
+    idx = nav.index
+
+    mgmt_daily_rate = float(mgmt_pct_ann) / 252.0
+
+    mgmt_fee_daily = nav * mgmt_daily_rate
+    mgmt_fee_cum_period = _pd.Series(0.0, index=idx)
+    perf_fee_daily = _pd.Series(0.0, index=idx)
+    hwm_series = _pd.Series(0.0, index=idx)
+    nav_net = _pd.Series(0.0, index=idx)
+
+    # Crystallisation: last trading day in each period
+    period_label = _pd.PeriodIndex(idx, freq=crystallise_freq)
+    is_period_end = period_label != period_label.shift(-1, fill_value=period_label[-1])
+
+    hwm = float(nav.iloc[0])
+    running_mgmt_cum = 0.0
+    running_period_start_nav = float(nav.iloc[0])
+    for i, (dt, nav_t) in enumerate(nav.items()):
+        nav_t = float(nav_t)
+        running_mgmt_cum += float(mgmt_fee_daily.iloc[i])
+        mgmt_fee_cum_period.iloc[i] = running_mgmt_cum
+
+        nav_pre_perf = nav_t - running_mgmt_cum
+        # Hurdle compounding over the current crystallisation period.
+        if use_hwm:
+            period_days = max(1, i - 0 + 1)  # simplified; real fund uses actual days
+            hurdle_mult = (1.0 + float(hurdle_ann) * period_days / 252.0)
+            fee_eligible_nav = max(0.0, nav_pre_perf - hwm * hurdle_mult)
+        else:
+            fee_eligible_nav = max(0.0, nav_pre_perf - running_period_start_nav)
+
+        hwm_series.iloc[i] = hwm
+
+        if is_period_end[i]:
+            perf_fee = float(perf_pct) * fee_eligible_nav
+            perf_fee_daily.iloc[i] = perf_fee
+            nav_net.iloc[i] = nav_pre_perf - perf_fee
+            # Update HWM only if the new NAV (net of perf fee) exceeds prior HWM
+            if nav_net.iloc[i] > hwm:
+                hwm = float(nav_net.iloc[i])
+            running_mgmt_cum = 0.0
+            running_period_start_nav = float(nav_net.iloc[i])
+        else:
+            nav_net.iloc[i] = nav_pre_perf
+
+    return _pd.DataFrame({
+        "mgmt_fee_daily":  mgmt_fee_daily,
+        "mgmt_fee_ytd":    mgmt_fee_cum_period,
+        "perf_fee_daily":  perf_fee_daily,
+        "hwm":             hwm_series,
+        "nav_net_of_fees": nav_net,
+    }, index=idx)
+
+
 # === Config snapshot (L16) ===================================================
 # Dump every operationally-meaningful knob at startup so any run.log is
 # self-describing — no need to grep the code to know what version of the
@@ -704,6 +816,12 @@ def _log_config_snapshot() -> None:
           f"release={CRASH_HEDGE_DD_RELEASE*100:+.0f}%DD  "
           f"lookback={CRASH_HEDGE_LOOKBACK_DAYS}d  "
           f"basket={CRASH_HEDGE_BASKET}")
+    print(f"[config] FUND FEES             active={FUND_FEES_ACTIVE}  "
+          f"mgmt={MANAGEMENT_FEE_PCT_ANN*100:.1f}%/yr  "
+          f"perf={PERFORMANCE_FEE_PCT*100:.0f}%>HWM  "
+          f"hwm={PERFORMANCE_FEE_HWM}  "
+          f"hurdle={PERFORMANCE_FEE_HURDLE_ANN*100:.1f}%/yr  "
+          f"crystallise={PERFORMANCE_FEE_CRYSTALLISE_FREQ}")
     _prod_slot_str = (next(iter(PRODUCTION_SLOT_OVERRIDE.keys()))
                        if PRODUCTION_SLOT_OVERRIDE else "5-slot blend")
     print(f"[config] PRODUCTION ENGINE     slot={_prod_slot_str}  "
@@ -14933,8 +15051,8 @@ def export_to_ppt(results, trades, charts=None):
                 pds_slide.shapes.title.text = "Disclosure & Product Statement"
 
             # Fund identity sub-line in the title ribbon
-            _pds_subtitle = (f"Portfolio Optimiser  ·  Active Asset Allocation (multi-region equity ensemble)  ·  "
-                              f"Benchmark: SPY (AUD)")
+            _pds_subtitle = ("Guina Family Managed Investments  ·  Active Asset Allocation "
+                              "(multi-region equity ensemble)  ·  Benchmark: SPY (AUD)")
             _pds_sub_box = pds_slide.shapes.add_textbox(Cm(2.15), Cm(1.85), Cm(21.80), Cm(0.45))
             _psf = _pds_sub_box.text_frame
             _psf.clear()
@@ -14973,6 +15091,11 @@ def export_to_ppt(results, trades, charts=None):
                 left_cm=1.0, top_cm=3.7, width_cm=11.5, height_cm=6.5,
                 header="FUND SUMMARY",
                 body_lines=[
+                    "Fund:  Guina Family Managed Investments (managed fund).",
+                    "Trustee / Responsible Entity:  Fionn Guina (AFSL pending).",
+                    "Target Investor:  Wholesale only — HNW + Sophisticated",
+                    "  Investors (Corporations Act s708 / s761G).",
+                    "",
                     "Strategy:  5-slot regime-aware ensemble (Modest, Aggressive,",
                     "  Bold, Maximum, Stretch). Softmax-blended via rolling 12-month",
                     "  Sortino + forward SPY-regime signal. Rebalanced ~9×/year.",
@@ -14983,32 +15106,45 @@ def export_to_ppt(results, trades, charts=None):
                     "",
                     "Universe:  ~46 ETFs; ~45 pass FF5 universe validation each run.",
                     "",
-                    "Target Return:  SPY (AUD)-comparable, on a risk-adjusted",
-                    "  (Sharpe) basis. Backtest 10Y Sharpe ≈ 0.97 vs SPY 0.83.",
+                    "Target Return:  SPY (AUD)-comparable, risk-adjusted (Sharpe).",
+                    "  Backtest 10Y Sharpe ≈ 0.97 vs SPY 0.83.",
                     "",
                     "Investment Horizon:  5+ years recommended.",
                 ],
             )
 
-            # --- Right column: Fees + Risks ---
+            # --- Right column: Fees + Costs ---
+            # Build fee block dynamically from the FUND_FEES_ACTIVE flag so
+            # that flipping fees on later updates this slide automatically.
+            _fee_status = "ACTIVE" if FUND_FEES_ACTIVE else "currently waived"
+            _fee_lines = [
+                f"Management Fee:  {MANAGEMENT_FEE_PCT_ANN*100:.1f}% per annum",
+                f"  ({_fee_status}). Accrued daily on NAV.",
+                f"Performance Fee:  {PERFORMANCE_FEE_PCT*100:.0f}% over high-water mark",
+                f"  ({_fee_status}). Crystallised {PERFORMANCE_FEE_CRYSTALLISE_FREQ}-ly.",
+                ("  Hurdle: none."
+                 if PERFORMANCE_FEE_HURDLE_ANN <= 0 else
+                 f"  Hurdle: {PERFORMANCE_FEE_HURDLE_ANN*100:.1f}% p.a."),
+                "",
+                "Brokerage:  Interactive Brokers Pro AU schedule",
+                "  · AU min $5.00 + 0.080% · US min $1.50 + 0.020%",
+                "  · Modelled cost ~28 bps/yr at $1M AUM.",
+                "",
+                "CGT:  Australian personal MTR 30% + Medicare 2%",
+                "  · 50% LT discount on holdings ≥365 days",
+                "  · FY netting + carry-forward losses honoured.",
+                "  · Modelled drag ~296 bps/yr at $1M AUM.",
+                "",
+                "FX:  AUD-denominated. USD assets unhedged.",
+                "Liquidity:  Redemptions at quarterly rebalance only.",
+                "Custody:  Interactive Brokers Australia (IBKR Pty Ltd).",
+                "Distribution:  Direct payment only — no platforms.",
+                "Auditor:  TBC.",
+            ]
             _section_box(
                 left_cm=13.0, top_cm=3.7, width_cm=11.5, height_cm=6.5,
-                header="FEES & COSTS MODELLED",
-                body_lines=[
-                    "Brokerage:  Interactive Brokers Pro AU schedule",
-                    "  · AU min $5.00 + 0.080% · US min $1.50 + 0.020%",
-                    "  · Modelled cost ~28 bps/yr at $1M AUM.",
-                    "",
-                    "CGT:  Australian personal MTR 30% + Medicare 2%",
-                    "  · 50% LT discount on holdings ≥365 days",
-                    "  · FY netting + carry-forward losses honoured.",
-                    "  · Modelled drag ~296 bps/yr at $1M AUM.",
-                    "",
-                    "FX:  AUD-denominated. USD assets unhedged.",
-                    "",
-                    "Total modelled drag:  ~324 bps/yr at $1M AUM.",
-                    "  Net of all costs — NOT a pre-tax/pre-fee figure.",
-                ],
+                header="FEES & TERMS",
+                body_lines=_fee_lines,
             )
 
             # --- Bottom-left: Key risks ---
@@ -15033,23 +15169,29 @@ def export_to_ppt(results, trades, charts=None):
                 left_cm=13.0, top_cm=10.5, width_cm=11.5, height_cm=5.0,
                 header="DISCLOSURES",
                 body_lines=[
-                    "• This is NOT licensed financial advice.",
-                    "• AFSL: not held (for personal use only).",
-                    "• Past performance ≠ future returns.",
+                    "• Wholesale-only offer under Corporations Act s708/s761G.",
+                    "  Not available to retail investors.",
+                    "• AFSL: pending application. Trustee operates under",
+                    "  s911A exemptions until issued. Not licensed advice.",
+                    "• Past performance ≠ future returns. Forecasts are model",
+                    "  outputs, not promises.",
                     "• Backtest is OOS walk-forward but design choices were",
-                    "  made on the same 2016-2026 data window — silent",
-                    "  pseudo-overfit risk remains; see ARCHITECTURE.md §10.",
+                    "  made on 2016-2026 window — pseudo-overfit risk remains.",
                     "• Backtest excludes: tracking error, slippage gates,",
                     "  liquidity constraints, dividend reinvestment timing.",
-                    "• Tax: modelled at AU 30% MTR; consult tax advisor.",
-                    "• Operational risk: see RUNBOOK.md.",
+                    "• Tax: modelled at AU 30% MTR; investor's own MTR applies.",
+                    "• Operational risk: see RUNBOOK.md. Single-operator key",
+                    "  person risk acknowledged.",
                 ],
                 body_size=9,
             )
 
             # Footer
-            _pds_foot_text = (f"Disclosure as at {pd.Timestamp.now().strftime('%d %B %Y')}    ·    "
-                               f"Build {_BUILD_GIT_SHA}    ·    Placeholder text — edit in source before public distribution")
+            _pds_foot_text = (
+                f"Disclosure as at {pd.Timestamp.now().strftime('%d %B %Y')}    ·    "
+                f"Build {_BUILD_GIT_SHA}    ·    Wholesale-only — Corporations Act s708/s761G    ·    "
+                f"DRAFT — pending AFSL + legal review"
+            )
             _pds_foot_box = pds_slide.shapes.add_textbox(Cm(1.5), Cm(17.3), Cm(22.5), Cm(0.6))
             _pft = _pds_foot_box.text_frame
             _pft.clear()
