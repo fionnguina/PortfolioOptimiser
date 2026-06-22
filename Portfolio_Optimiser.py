@@ -15087,9 +15087,12 @@ def export_to_ppt(results, trades, charts=None):
                     p.font.color.rgb = RGBColor(40, 40, 40)
 
             # --- Left column: Fund summary ---
+            # Top blocks: body 9pt + height 8.0cm so the longer post-2026-06-22
+            # content (trustee + investor lines) doesn't overflow into the
+            # bottom blocks. Bottom blocks pushed to top=12.0 for clearance.
             _section_box(
-                left_cm=1.0, top_cm=3.7, width_cm=11.5, height_cm=6.5,
-                header="FUND SUMMARY",
+                left_cm=1.0, top_cm=3.7, width_cm=11.5, height_cm=8.0,
+                header="FUND SUMMARY", body_size=9,
                 body_lines=[
                     "Fund:  Guina Family Managed Investments (managed fund).",
                     "Trustee / Responsible Entity:  Fionn Guina (AFSL pending).",
@@ -15142,14 +15145,14 @@ def export_to_ppt(results, trades, charts=None):
                 "Auditor:  TBC.",
             ]
             _section_box(
-                left_cm=13.0, top_cm=3.7, width_cm=11.5, height_cm=6.5,
-                header="FEES & TERMS",
+                left_cm=13.0, top_cm=3.7, width_cm=11.5, height_cm=8.0,
+                header="FEES & TERMS", body_size=9,
                 body_lines=_fee_lines,
             )
 
             # --- Bottom-left: Key risks ---
             _section_box(
-                left_cm=1.0, top_cm=10.5, width_cm=11.5, height_cm=5.0,
+                left_cm=1.0, top_cm=12.0, width_cm=11.5, height_cm=5.0,
                 header="KEY RISKS",
                 body_lines=[
                     "• Equity-like volatility (backtest annualised ~14%).",
@@ -15166,7 +15169,7 @@ def export_to_ppt(results, trades, charts=None):
 
             # --- Bottom-right: Legal disclosures ---
             _section_box(
-                left_cm=13.0, top_cm=10.5, width_cm=11.5, height_cm=5.0,
+                left_cm=13.0, top_cm=12.0, width_cm=11.5, height_cm=5.0,
                 header="DISCLOSURES",
                 body_lines=[
                     "• Wholesale-only offer under Corporations Act s708/s761G.",
