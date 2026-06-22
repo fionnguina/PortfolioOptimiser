@@ -241,6 +241,14 @@ def main() -> int:
     parser.add_argument("--no-qualify", action="store_true",
                         help="Skip IBKR connection and contract qualification "
                              "(preview only; --execute is ignored if set).")
+    parser.add_argument("--only-tickers", type=str, default="",
+                        help="Comma-separated list of tickers to keep from the "
+                             "latest rec log. Use to retry specific orders after "
+                             "a partial fill or permission rejection without "
+                             "re-submitting the ones that already filled. "
+                             "Matching is case-sensitive; .AX suffix is optional "
+                             "(BEAR matches BEAR.AX, both match each other). "
+                             "Example: --only-tickers HBRD,BEAR,BBUS")
     args = parser.parse_args()
 
     rec_entry = _load_latest_run(Path(args.rec_log))
@@ -248,6 +256,30 @@ def main() -> int:
     if not trades_recs:
         print("[exec] latest run has no recommended_trades. Nothing to do.")
         return 0
+
+    # --only-tickers filter: keep only the requested tickers from the rec
+    # log so we can retry specific orders (e.g. after a permission rejection
+    # or partial fill) without re-submitting the ones that already filled.
+    # Suffix-tolerant: BEAR matches BEAR.AX, both match each other.
+    if args.only_tickers:
+        def _strip_ax(s: str) -> str:
+            return s[:-3] if s.endswith(".AX") else s
+        wanted = {t.strip() for t in args.only_tickers.split(",") if t.strip()}
+        wanted_norm = {_strip_ax(t) for t in wanted}
+        available_norm = {_strip_ax(r["ticker"]) for r in trades_recs}
+        missing = wanted_norm - available_norm
+        if missing:
+            print(f"[exec][WARN] --only-tickers requested {sorted(missing)} "
+                  f"which are not in the rec log. Continuing with the rest.")
+        original_count = len(trades_recs)
+        trades_recs = [r for r in trades_recs
+                        if _strip_ax(r["ticker"]) in wanted_norm]
+        kept = [r["ticker"] for r in trades_recs]
+        print(f"[exec] --only-tickers filtered {original_count} -> "
+              f"{len(trades_recs)} trades. Kept: {kept}")
+        if not trades_recs:
+            print(f"[exec] No matching tickers after filter. Nothing to do.")
+            return 0
 
     try:
         from ib_insync import IB
