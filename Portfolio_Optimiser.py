@@ -11796,9 +11796,17 @@ if USE_XLWINGS:
             slot_points: dict[str, tuple[float, float]] = {}
             ensemble_point = None
 
+            # Project everything in the LIVE basis (mu_ann_geo / Sigma_daily)
+            # — the same basis the slots and ensemble were solved in. This is
+            # the basis-consistent view: slot markers land ON the live frontier
+            # by construction, and Ensemble's distance below the curve is the
+            # pure concavity / regime tax. (Prior version used Sigma_opt which
+            # produced an idealised FF5-projected curve the engine can't
+            # actually achieve — visually misleading. Migrated 2026-06-22.)
             try:
-                mu_use = mu_vec_opt.reindex(Sigma_opt.index).fillna(0.0).values
-                S_use = Sigma_opt.values
+                _idx_live = list(Sigma_daily.index)
+                mu_use = pd.Series(mu_ann_geo).reindex(_idx_live).fillna(0.0).values
+                S_use = Sigma_daily.values
 
                 _slot_w_map = globals().get("LIVE_SLOT_WEIGHTS", {}) or {}
                 for _slot_name, _slot_w in _slot_w_map.items():
@@ -11806,7 +11814,7 @@ if USE_XLWINGS:
                         if not isinstance(_slot_w, pd.Series) or _slot_w.empty:
                             continue
                         _ws = pd.Series(_slot_w, dtype=float).reindex(
-                            Sigma_opt.index).fillna(0.0)
+                            _idx_live).fillna(0.0)
                         if float(_ws.sum()) <= 0:
                             continue
                         _ws = _ws / float(_ws.sum())
@@ -11824,7 +11832,7 @@ if USE_XLWINGS:
                 try:
                     _w_ens = globals().get("W_ENSEMBLE_SER", None)
                     if isinstance(_w_ens, pd.Series) and not _w_ens.empty:
-                        w_ens_ser = pd.Series(_w_ens, dtype=float).reindex(Sigma_opt.index).fillna(0.0)
+                        w_ens_ser = pd.Series(_w_ens, dtype=float).reindex(_idx_live).fillna(0.0)
                         if float(w_ens_ser.sum()) > 0:
                             w_ens_ser = w_ens_ser / float(w_ens_ser.sum())
                             wv_ens = w_ens_ser.values
@@ -11844,11 +11852,29 @@ if USE_XLWINGS:
             charts = globals().get("charts", {}) or {}
 
             try:
-                _x = pd.to_numeric(stats_df["Volatility (ann.)"], errors="coerce")
-                _y = pd.to_numeric(stats_df["Achieved Return"], errors="coerce")
-            
+                # Build the LIVE-basis frontier (mu_ann_geo / Sigma_daily) so
+                # the curve is the actual achievable frontier the engine
+                # optimises on. Slots solved by solve_candidate_portfolios are
+                # frontier points in this exact basis → they will land ON the
+                # curve. Falls back to the old stats_df (FF5-projected) curve
+                # if the live sweep fails for any reason.
+                try:
+                    _W_live, _stats_live, _, _ = _build_frontier(
+                        pd.Series(mu_ann_geo), Sigma_daily, n_points=24,
+                    )
+                    _x = pd.to_numeric(_stats_live["Volatility (ann.)"], errors="coerce")
+                    _y = pd.to_numeric(_stats_live["Achieved Return"], errors="coerce")
+                    print(f"[ef-chart] live frontier built: {len(_x)} points, "
+                          f"vol [{_x.min():.3f}, {_x.max():.3f}], "
+                          f"ret [{_y.min():.3f}, {_y.max():.3f}]")
+                except Exception as _e_live_fr:
+                    print(f"[ef-chart] live frontier build failed, "
+                          f"falling back to stats_df: {_e_live_fr}")
+                    _x = pd.to_numeric(stats_df["Volatility (ann.)"], errors="coerce")
+                    _y = pd.to_numeric(stats_df["Achieved Return"], errors="coerce")
+
                 fig, ax = plt.subplots(figsize=(7.5, 4.8))
-                ax.plot(_x, _y, linewidth=2.0)
+                ax.plot(_x, _y, linewidth=2.0, label="Frontier (live)")
                 ax.set_title(chart_title)
                 ax.set_xlabel("Volatility (ann.)")
                 ax.set_ylabel("Return (ann.)")
@@ -14495,73 +14521,12 @@ def export_to_ppt(results, trades, charts=None):
                     title="Portfolio",
                 )
 
-            # ---- Slide 5: Tilts table (With Tilts vs Without Tilts) ----
-            try:
-                tilt_rows = charts.get("tilts_comparison_rows", None) if isinstance(charts, dict) else None
-                print("[pptx] Slide 5 tilt_rows raw:", tilt_rows)
-
-                if tilt_rows:
-                    df_tilts = pd.DataFrame(tilt_rows)
-                    print("[pptx] Slide 5 df_tilts columns before rename:", list(df_tilts.columns))
-                    print("[pptx] Slide 5 df_tilts shape before rename:", df_tilts.shape)
-
-                    rename_map = {
-                        "With Tilts": "Achieved Tilt",
-                        "Target": "Target Tilt",
-                    }
-                    df_tilts = df_tilts.rename(columns=rename_map)
-
-                    keep_cols = ["Factor", "Achieved Tilt", "Target Tilt"]
-                    df_tilts = df_tilts[[c for c in keep_cols if c in df_tilts.columns]]
-                    print("[pptx] Slide 5 df_tilts columns after filter:", list(df_tilts.columns))
-                    print("[pptx] Slide 5 df_tilts preview:\n", df_tilts.head())
-
-                    required_cols = {"Factor", "Achieved Tilt", "Target Tilt"}
-                    if df_tilts.empty:
-                        print("[pptx] Slide 5 tilts table skipped: df_tilts is empty after filtering")
-                    elif not required_cols.issubset(df_tilts.columns):
-                        print(f"[pptx] Slide 5 tilts table skipped: missing required columns. Have {list(df_tilts.columns)}")
-                    else:
-                        left2, top2, width2, height2 = _ppt_anchor(
-                            slide5, slide_layout, "table_tilts",
-                            fb_left_cm=16.50, fb_top_cm=9.60, fb_w_cm=7.72, fb_h_cm=5.20,
-                        )
-
-                        shp2 = slide5.shapes.add_table(
-                            df_tilts.shape[0] + 1,
-                            df_tilts.shape[1],
-                            left2, top2, width2, height2,
-                        )
-                        tbl2 = shp2.table
-
-                        # Headers
-                        for j, col in enumerate(df_tilts.columns):
-                            tbl2.cell(0, j).text = str(col)
-
-                        # Body
-                        for i, (_, r) in enumerate(df_tilts.iterrows(), start=1):
-                            for j, col in enumerate(df_tilts.columns):
-                                val = r[col]
-                                if pd.isna(val):
-                                    txt = ""
-                                elif col == "Factor":
-                                    txt = str(val)
-                                else:
-                                    txt = f"{float(val):.3f}" if np.isfinite(float(val)) else ""
-                                tbl2.cell(i, j).text = txt
-
-                        # Format (uniform 11pt to match the frontier-points table above)
-                        for rr in range(df_tilts.shape[0] + 1):
-                            for cc in range(df_tilts.shape[1]):
-                                cell = tbl2.cell(rr, cc)
-                                cell.text_frame.word_wrap = False
-                                for p in cell.text_frame.paragraphs:
-                                    p.font.size = Pt(11)
-                                    p.font.bold = True
-                                    p.alignment = PP_ALIGN.CENTER
-
-            except Exception as _e_tilts_tbl:
-                print(f"[pptx] Slide 5 tilts comparison table skipped: {_e_tilts_tbl}")
+            # Tilts table dropped from Slide 5 (2026-06-22): the With Tilts
+            # vs Without Tilts contrast no longer appears anywhere on the
+            # slide (markers replaced by per-slot frontier points), so the
+            # table sat orphaned with identical Achieved/Target columns.
+            # The data is still stored in charts["tilts_comparison_rows"]
+            # if any other consumer wants it.
 
         except Exception as e:
             print(f"[pptx] Slide 5 skipped: {e}")
