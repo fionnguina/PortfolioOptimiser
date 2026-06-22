@@ -383,29 +383,134 @@ def _run_check_fills_mode() -> int:
         ib.sleep(3)
 
         all_trades = list(ib.trades())
-        trades_by_id = {t.order.orderId: t for t in all_trades}
         print(f"[check-fills] IBKR returned {len(all_trades)} known trades for "
               f"clientId={CLIENT_ID}.")
 
+        # Multi-strategy matching: orderId first (works for still-open orders),
+        # then fall back to (ticker, side, qty) for orders TWS has reassigned
+        # orderIds for. Completed orders re-served via reqCompletedOrders
+        # often come back with orderId=0 (TWS clears it post-close) and the
+        # contract symbol is the bare exchange code without our .AX suffix.
+        # Normalise both sides by stripping .AX so VAE.AX matches VAE+AUD.
+        def _norm_ticker(t: str) -> str:
+            t = str(t or "").upper()
+            return t[:-3] if t.endswith(".AX") else t
+
+        def _ticker_from_contract(c) -> str:
+            return _norm_ticker(str(getattr(c, "symbol", "") or ""))
+
+        def _original_qty(t) -> int:
+            """Best-effort recovery of original submission quantity.
+            Filled trades come back with totalQuantity=0 because IBKR clears
+            it post-fill; for those, the original qty = filled + remaining."""
+            try:
+                tq = int(t.order.totalQuantity or 0)
+                fq = int(t.filled() or 0)
+                rq = int(t.remaining() or 0)
+                return max(tq, fq + rq)
+            except Exception:
+                return 0
+
+        trades_by_id = {t.order.orderId: t for t in all_trades if t.order.orderId}
+        trades_by_key = {}      # (ticker, side, qty)  — qty-aware match
+        trades_by_ticker = {}   # (ticker, side)       — final fallback
+        for t in all_trades:
+            try:
+                tk = _ticker_from_contract(t.contract)
+                side = str(t.order.action)
+                qty = _original_qty(t)
+                # Qty-aware key first (handles batches with multiple orders
+                # on the same ticker e.g. TLH swap).
+                key = (tk, side, qty)
+                existing = trades_by_key.get(key)
+                if existing is None:
+                    trades_by_key[key] = t
+                else:
+                    existing_oid = existing.order.orderId or 0
+                    new_oid = t.order.orderId or 0
+                    existing_pid = int(getattr(existing.order, "permId", 0) or 0)
+                    new_pid = int(getattr(t.order, "permId", 0) or 0)
+                    if new_oid > existing_oid or new_pid > existing_pid:
+                        trades_by_key[key] = t
+                # Ticker-only fallback. Engines normally submit one order per
+                # ticker per batch, so this resolves cleanly. If collision,
+                # prefer highest permId (latest broker-accepted).
+                tkey = (tk, side)
+                existing_tk = trades_by_ticker.get(tkey)
+                if existing_tk is None:
+                    trades_by_ticker[tkey] = t
+                else:
+                    if int(getattr(t.order, "permId", 0) or 0) > int(
+                            getattr(existing_tk.order, "permId", 0) or 0):
+                        trades_by_ticker[tkey] = t
+            except Exception:
+                continue
+
         print()
-        print("=" * 96)
-        print(f"STATUS RE-CHECK — batch from {latest_ts}")
-        print("=" * 96)
+        print("=" * 100)
+        print(f"ALL TRADES IBKR KNOWS ABOUT (clientId={CLIENT_ID}, this session)")
+        print("=" * 100)
+        print(f"  {'Ticker':<12} {'OrderId':>7} {'PermId':>11} "
+              f"{'Side':<5} {'Status':<18} {'Filled':>8} {'Total':>8} "
+              f"{'Avg Px':>10}")
+        print(f"  {'-'*12} {'-'*7} {'-'*11} {'-'*5} {'-'*18} "
+              f"{'-'*8} {'-'*8} {'-'*10}")
+        for t in sorted(all_trades, key=lambda x: _ticker_from_contract(x.contract)):
+            try:
+                tk = _ticker_from_contract(t.contract)
+                filled = int(t.filled() or 0)
+                total = int(t.order.totalQuantity)
+                permid = int(getattr(t.order, "permId", 0) or 0)
+                fills = list(getattr(t, "fills", []) or [])
+                if filled > 0 and fills:
+                    avg_px = sum(float(fl.execution.price) * float(fl.execution.shares)
+                                  for fl in fills) / filled
+                    avg_px_str = f"{avg_px:>10.4f}"
+                else:
+                    avg_px_str = f"{'—':>10}"
+                print(f"  {tk:<12} {t.order.orderId:>7} {permid:>11} "
+                      f"{t.order.action:<5} {t.orderStatus.status:<18} "
+                      f"{filled:>8} {total:>8} {avg_px_str}")
+            except Exception as e:
+                print(f"  (trade read failed: {e})")
+        print(f"  {'-'*12} {'-'*7} {'-'*11} {'-'*5} {'-'*18} "
+              f"{'-'*8} {'-'*8} {'-'*10}")
+
+        print()
+        print("=" * 100)
+        print(f"BATCH STATUS RE-CHECK — fills_log entries from {latest_ts}")
+        print("=" * 100)
         print(f"  {'Ticker':<12} {'OrderId':>7} {'PermId':>11} "
               f"{'Status (logged)':<18} {'Status (now)':<18} "
-              f"{'Filled':>8} {'Avg Px':>10}")
+              f"{'Filled':>8} {'Avg Px':>10} {'Match':<10}")
         print(f"  {'-'*12} {'-'*7} {'-'*11} {'-'*18} {'-'*18} "
-              f"{'-'*8} {'-'*10}")
+              f"{'-'*8} {'-'*10} {'-'*10}")
         n_changed = 0
         n_filled_now = 0
         for row in batch:
             oid = int(row["order_id"])
-            trade = trades_by_id.get(oid)
             logged_status = row.get("status_final") or row.get("status") or "?"
+            trade = trades_by_id.get(oid)
+            match_method = "orderId"
+            if not trade:
+                # Fall back to (normalised-ticker, side, qty) match. Both
+                # sides have .AX stripped so VAE.AX in the log finds the
+                # bare VAE+AUD trade IBKR returns.
+                norm_tk = _norm_ticker(row["ticker"])
+                side = str(row["side"])
+                key = (norm_tk, side, int(row["qty_requested"]))
+                trade = trades_by_key.get(key)
+                if trade:
+                    match_method = "ticker+qty"
+                else:
+                    # Final fallback: ticker + side only. Safe for batches
+                    # with one order per ticker (the engine's normal case).
+                    trade = trades_by_ticker.get((norm_tk, side))
+                    match_method = "ticker-only" if trade else "—"
             if not trade:
                 print(f"  {row['ticker']:<12} {oid:>7} {'?':>11} "
-                      f"{logged_status:<18} {'(not in IBKR)':<18} "
-                      f"{'?':>8} {'?':>10}")
+                      f"{logged_status:<18} {'(not found)':<18} "
+                      f"{'?':>8} {'?':>10} {match_method:<10}")
                 continue
             try:
                 now_status = str(trade.orderStatus.status)
@@ -424,11 +529,11 @@ def _run_check_fills_mode() -> int:
                     n_filled_now += 1
                 print(f"  {row['ticker']:<12} {oid:>7} {permid:>11} "
                       f"{logged_status:<18} {now_status:<18} "
-                      f"{filled:>8} {avg_px_str}")
+                      f"{filled:>8} {avg_px_str} {match_method:<10}")
             except Exception as e:
                 print(f"  {row['ticker']:<12} {oid:>7} (read failed: {e})")
         print(f"  {'-'*12} {'-'*7} {'-'*11} {'-'*18} {'-'*18} "
-              f"{'-'*8} {'-'*10}")
+              f"{'-'*8} {'-'*10} {'-'*10}")
         print()
         print(f"  Status changed since log:  {n_changed:>3}")
         print(f"  Filled now (truth):        {n_filled_now:>3}")
