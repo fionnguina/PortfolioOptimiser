@@ -14,6 +14,17 @@ in [README.md](README.md) records which commit is bundled into the live `.exe`.
 ## [Unreleased]
 
 ### Added
+- **Semi-autonomous daily mode.** New `--auto-pipeline` CLI flag bypasses
+  the trade-plan dialog (forces `TRADE_PLAN_MODE="ensemble"`) and writes
+  a `[rebal-trigger]` verdict line to `dist/run.log` after computing
+  summed `|Δw|` between current portfolio and target. Verdict is
+  `SKIP` below `SKIP_REBAL_DELTA` threshold (3% by default), `RUN`
+  above. Companion PowerShell wrapper [daily_auto.ps1](daily_auto.ps1)
+  runs the engine, parses the verdict, fires a Windows toast
+  notification, and opens `Portfolio_Report.pptx` on RUN.
+  [AUTOMATION.md](AUTOMATION.md) documents Task Scheduler setup.
+  Phase 3 paper execution stays MANUAL by design — the toast prompts
+  the user to review + type YES rather than auto-confirming.
 - **Live TLH injection into the trade plan.** Engine now runs `_run_tlh_pass()`
   against the current lot book BEFORE building the rebalance plan, so the
   recommended trades already include any harvest swaps. Cooldown state

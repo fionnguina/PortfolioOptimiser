@@ -197,6 +197,14 @@ if _FACTOR_RECS_MODE:
 _PREFLIGHT_MODE = "--preflight" in sys.argv
 if _PREFLIGHT_MODE:
     print("[preflight] --preflight detected; will run system checks then exit")
+# `--auto-pipeline`: non-interactive run for the scheduled daily wrapper.
+# Skips the dialog (forces TRADE_PLAN_MODE='ensemble') and surfaces a
+# [rebal-trigger] verdict line in run.log so a wrapper script can decide
+# whether to notify the user / kick off Phase 3 execution.
+_AUTO_PIPELINE_MODE = "--auto-pipeline" in sys.argv
+if _AUTO_PIPELINE_MODE:
+    print("[auto-pipeline] --auto-pipeline detected; non-interactive run, "
+          "ensemble mode, rebal-trigger verdict written to run.log")
 # `--tilted-ensemble-test`: walk-forward CV with auto-factor-tilts ON vs OFF.
 # Threads dynamic tilt targets (recomputed per rebal from trailing-3M factor
 # Sharpes) through solve_candidate_portfolios so each ensemble slot expresses
@@ -352,6 +360,10 @@ user_opts = {}
 
 # Constants
 TRADE_PLAN_MODE = "ask"  # Options: "ask", "auto", "no_tilts", "with_tilts", "ensemble"
+# Force non-interactive ensemble mode when scheduled wrapper invokes the engine.
+if _AUTO_PIPELINE_MODE:
+    TRADE_PLAN_MODE = "ensemble"
+    print(f"[auto-pipeline] TRADE_PLAN_MODE forced to 'ensemble'")
 VALIDATION_LOOKBACK_DAYS = 252  # 1 year of daily data
 ANNUAL_TRADING_DAYS = 252  # For Sharpe calculation
 
@@ -12435,6 +12447,42 @@ if USE_XLWINGS:
                 trade_rec, resid_rec = trade_no, resid_no
             w_tradeplan = pd.Series(np.asarray(w_tradeplan_vals, dtype=float),
                                     index=w_tradeplan_idx)
+
+            # === Rebalance trigger verdict ============================================
+            # Compute summed |Δw| between current portfolio composition and the
+            # target (w_tradeplan). When run by the scheduled wrapper, this
+            # verdict line is what the wrapper parses to decide whether to send
+            # a "rebalance ready" notification or "no action needed today."
+            # The threshold is the same SKIP_REBAL_DELTA used in the backtest
+            # engine so live behaviour mirrors backtest behaviour.
+            try:
+                _curr_units_ser = pd.Series(units, dtype=float)
+                _px_for_w = pd.Series(last_px_hold, dtype=float)
+                _val_ser = (_curr_units_ser
+                              .reindex(_px_for_w.index, fill_value=0.0)
+                              * _px_for_w).dropna()
+                _curr_val_total = float(_val_ser.sum())
+                if _curr_val_total > 0:
+                    _curr_w = (_val_ser / _curr_val_total).reindex(
+                        w_tradeplan.index, fill_value=0.0)
+                else:
+                    _curr_w = pd.Series(0.0, index=w_tradeplan.index)
+                _target_w = w_tradeplan.reindex(_curr_w.index, fill_value=0.0)
+                _summed_abs_dw = float(np.abs(
+                    _target_w.values - _curr_w.values).sum())
+                _verdict = ("SKIP" if _summed_abs_dw < float(SKIP_REBAL_DELTA)
+                              else "RUN")
+                print(f"[rebal-trigger] summed_|Δw|={_summed_abs_dw:.4f}  "
+                      f"threshold={float(SKIP_REBAL_DELTA):.4f}  "
+                      f"verdict={_verdict}  "
+                      f"mode={_tp_mode}  "
+                      f"portfolio_aud={_curr_val_total:,.0f}")
+                globals()["REBAL_TRIGGER_VERDICT"] = _verdict
+                globals()["REBAL_TRIGGER_SUMMED_DW"] = _summed_abs_dw
+            except Exception as _e_rebal_trig:
+                print(f"[rebal-trigger] verdict computation failed: {_e_rebal_trig}")
+                globals()["REBAL_TRIGGER_VERDICT"] = "UNKNOWN"
+                globals()["REBAL_TRIGGER_SUMMED_DW"] = float("nan")
 
             # Persist labels/weights for PPT + achieved-tilts table
             globals()["TRADEPLAN_LABEL"] = _tp_mode
