@@ -76,8 +76,8 @@ Findings are triaged by **action**: 🔴 must-fix before live, 🟡 should-fix s
 | # | Item | State | Pri |
 |---|---|---|---|
 | L1 | Phase 1.5 — seed paper account | Script ready, dry-run not executed, `--execute` not run | 🔴 |
-| L2 | Phase 2 — dry-run trade preview through IBKR | Not started | 🔴 |
-| L3 | Phase 3 — paper execution (with fill capture into `Actual_Fills` sheet) | Not started | 🔴 |
+| L2 | Phase 2 — dry-run trade preview through IBKR | `ibkr_dry_run.py` shipped (commit `efdfd99`) | 🟢 |
+| L3 | Phase 3 — paper execution + fill tracking | `ibkr_paper_exec.py` shipped 2026-06-22: typed-YES gate, fill log to `ibkr_fills_log.jsonl`, reconciliation summary. Fill capture into Excel `Actual_Fills` sheet still pending. | 🟡 |
 | L4 | `LIVE_TRADING_START_DATE = None` — drift v3 monthly NAV comparison is dormant | Config flip pending | 🟡 (flip on first real fill) |
 
 ### 3b — Coverage + observability

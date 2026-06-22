@@ -14,6 +14,14 @@ in [README.md](README.md) records which commit is bundled into the live `.exe`.
 ## [Unreleased]
 
 ### Added
+- **IBKR Phase 3 — paper-account execution** ([ibkr_paper_exec.py](ibkr_paper_exec.py)).
+  Five-layer safety: hardcoded paper port 7497, account-prefix `DU` check,
+  `--execute` flag (default OFF = Phase 2 preview), interactive typed-YES
+  gate after preview, per-order try/except. Fills written to
+  `ibkr_fills_log.jsonl` (one row per submitted order). Reconciliation
+  summary prints fill table + status counts after orders settle (60s
+  timeout, configurable). Reuses contract-builder, preview formatter,
+  and `_refuse_if_live` from `ibkr_dry_run.py`.
 - **PDS slide — Guina Family Managed Investments real fund details.** Trustee
   + AFSL-pending notice, wholesale-only (s708/s761G) language, quarterly
   redemption term, IBKR Australia custody, direct-payment distribution.

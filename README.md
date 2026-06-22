@@ -104,6 +104,8 @@ Portfolio_Optimiser/
 ├── ibkr_seed_paper.py              # IBKR Phase 1.5: pretend-trade engine units → paper
 ├── ibkr_dry_run.py                 # IBKR Phase 2: format engine's rebalance as IBKR
 │                                   # Order objects, print, NO submit
+├── ibkr_paper_exec.py              # IBKR Phase 3: paper-account execution with
+│                                   # typed-YES gate, fill tracking, slippage log
 ├── dist/
 │   ├── Portfolio Optimiser.exe     # PyInstaller-built .exe (~165 MB)
 │   └── run.log + run.log.1..7      # Rotated run logs
