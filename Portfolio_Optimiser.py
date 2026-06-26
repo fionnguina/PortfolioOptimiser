@@ -409,6 +409,50 @@ BROKER_PROFILES = {
         "live_us_min_fee":                1.5,
         "live_us_rate":                   0.0002,   # ~2 bps avg (USD 0.0035/share, ETF universe)
     },
+    "saxo_au_classic": {
+        # Saxo Bank Australia — Classic tier (entry-level, no minimum
+        # account balance). Source: Saxo's published price list as of
+        # 2026-06. Numbers should be verified against the user's live
+        # quote since Saxo's AU fees can shift with promotional periods
+        # and currency. The "$X AUD min" floors bind much harder than
+        # IBKR's $5 at small trade sizes — for a $1k ASX trade, Classic
+        # commission is the AUD 8 min not the 0.10% rate.
+        #
+        # Why this is interesting: Saxo's free Simulation environment
+        # gives a full $1M+ paper account WITHOUT requiring real
+        # funding (IBKR caps paper at 5x cash, forcing the user to
+        # fund $200k to validate at the wholesale entry size). API is
+        # REST/WebSocket OpenAPI, distinct from IBKR's ib_insync.
+        "name":            "Saxo Bank AU (Classic)",
+        # OOS backtest cost model
+        "au_flat_fee_aud":  8.0,    # min binds for trades <~AUD 8k
+        "us_flat_fee_aud":  7.5,    # USD $5 min ≈ AUD $7.50
+        "au_spread_bps":    5.0,    # Wider than IBKR Smart routing
+        "us_spread_bps":    5.0,
+        "fx_spread_bps":    5.0,    # ~50 pip on majors at Classic tier
+        # Live trade-plan brokerage
+        "live_asx_min_fee":               8.0,      # AUD 8 min
+        "live_asx_rate":                  0.0010,   # 0.10% Classic
+        "live_asx_first_buy_free_thresh": 0.0,
+        "live_us_min_fee":                7.5,      # USD 5 → ~AUD 7.50
+        "live_us_rate":                   0.0008,   # ~0.02 USD/share, est 8 bps avg on ETFs
+    },
+    "saxo_au_platinum": {
+        # Saxo Platinum — requires AUD 250k balance (or 6mo trade
+        # volume). Tighter than Classic but still wider than IBKR.
+        # Listed for users who already meet the Platinum threshold.
+        "name":            "Saxo Bank AU (Platinum)",
+        "au_flat_fee_aud":  6.0,
+        "us_flat_fee_aud":  6.0,
+        "au_spread_bps":    4.0,
+        "us_spread_bps":    4.0,
+        "fx_spread_bps":    3.5,
+        "live_asx_min_fee":               6.0,
+        "live_asx_rate":                  0.0008,
+        "live_asx_first_buy_free_thresh": 0.0,
+        "live_us_min_fee":                6.0,
+        "live_us_rate":                   0.0006,
+    },
 }
 
 # Switch broker here. BROKER_CONFIG + downstream BROKERAGE follow automatically.
@@ -15400,20 +15444,49 @@ def export_to_ppt(results, trades, charts=None):
                 spy_rs = _bench_rets("SPY").reindex(rs_strat.index).fillna(0.0)
                 aord_rs = _bench_rets("^AORD").reindex(rs_strat.index).fillna(0.0)
 
-                # Wealth curves anchored at the same NAV the OOS backtest
-                # actually ran at. Without this the chart compounds
-                # $1M-scale percentage returns onto an unrelated $100k
-                # display base — friction (IBKR $5 min) doesn't match
-                # what an investor at the displayed scale would face.
-                base = float(globals().get("_oos_starting_nav_aud", 100_000.0))
-                w_strat = base * (1.0 + rs_strat).cumprod()
-                w_spy = base * (1.0 + spy_rs).cumprod()
-                w_aord = base * (1.0 + aord_rs).cumprod()
+                # Normalized cumulative-return curves (all series start at
+                # 100%). This is the apples-to-apples view requested by
+                # the user 2026-06-26: comparing Fund @ $X to SPY @ $Y in
+                # absolute dollars is a category error (different starting
+                # points), so plot everything as % cumulative return and
+                # let the slope/final speak. The actual starting NAV is
+                # still preserved in `_oos_starting_nav_aud` for the
+                # title + the metrics table.
+                #
+                # Guard against the 2026-06-26 dual-mode bug where a
+                # silently-corrupted SPY benchmark series produced flat
+                # 0% lines and degenerate metrics: refuse to render the
+                # chart if any series collapses to zero variance or is
+                # all-zero — surface the issue instead of shipping a
+                # broken slide.
+                def _is_degenerate(s, label):
+                    if not isinstance(s, pd.Series) or s.empty:
+                        return f"{label}: series empty"
+                    if not np.isfinite(s).any():
+                        return f"{label}: no finite values"
+                    if float(s.abs().sum()) < 1e-9:
+                        return f"{label}: all-zero (likely silent fetch failure)"
+                    return None
 
-                # Optional roadshow-NAV second strategy curve. Compounds
-                # the dual-NAV backtest's returns onto a base equal to
-                # ROADSHOW_BASE_NAV so the chart shows both scales' real
-                # friction outcomes side-by-side.
+                _series_health = [
+                    _is_degenerate(rs_strat, "Fund returns"),
+                    _is_degenerate(spy_rs, "SPY returns"),
+                    _is_degenerate(aord_rs, "AORD returns"),
+                ]
+                _bad = [m for m in _series_health if m]
+                if _bad:
+                    print(f"[pptx] Roadshow chart degenerate; refusing to render: "
+                          f"{'; '.join(_bad)}")
+                    raise RuntimeError(f"Roadshow chart degenerate: {_bad}")
+
+                w_strat = (1.0 + rs_strat).cumprod()
+                w_spy = (1.0 + spy_rs).cumprod()
+                w_aord = (1.0 + aord_rs).cumprod()
+
+                # Starting NAVs preserved for title + metric-table labels.
+                _user_nav = float(globals().get(
+                    "_oos_starting_nav_aud", 1_000_000.0))
+
                 _rs_rets_rs = globals().get("oos_returns_daily_roadshow",
                                             pd.Series(dtype=float))
                 _has_rs_strat = (isinstance(_rs_rets_rs, pd.Series)
@@ -15423,11 +15496,23 @@ def export_to_ppt(results, trades, charts=None):
                         (_rs_rets_rs.index >= start_dt_rs) &
                         (_rs_rets_rs.index <= end_dt_rs)
                     ].copy()
-                    _rs_base = float(globals().get("_roadshow_nav_aud", 1_000_000.0))
-                    w_strat_rs = _rs_base * (1.0 + rs_strat_rs).cumprod()
+                    if _is_degenerate(rs_strat_rs, "Fund@RS returns"):
+                        print("[pptx] Roadshow second backtest degenerate; "
+                              "dropping the @RS line but keeping the rest")
+                        _has_rs_strat = False
+                        w_strat_rs = pd.Series(dtype=float)
+                        _rs_base = None
+                    else:
+                        _rs_base = float(globals().get(
+                            "_roadshow_nav_aud", 1_000_000.0))
+                        w_strat_rs = (1.0 + rs_strat_rs).cumprod()
                 else:
                     w_strat_rs = pd.Series(dtype=float)
                     _rs_base = None
+
+                # `base` retained for downstream code that expects it.
+                # Now represents the normalised start (1.0 == 100%).
+                base = 1.0
 
                 # Date callout under title (using actual rendered range).
                 _add_date_callout(road, w_strat.index.min(), w_strat.index.max(),
@@ -15453,7 +15538,7 @@ def export_to_ppt(results, trades, charts=None):
                             else f"${nav/1000:,.0f}k")
 
                 _strat_main_label = (
-                    f"Fund @ {_nav_label(base)}" if _has_rs_strat
+                    f"Fund @ {_nav_label(_user_nav)}" if _has_rs_strat
                     else "Fund (Strategy)"
                 )
                 ax.plot(w_strat.index, w_strat.values, linewidth=2.2,
@@ -15469,25 +15554,26 @@ def export_to_ppt(results, trades, charts=None):
                 ax.set_xlim(w_strat.index.min(), w_strat.index.max())
                 ax.xaxis.set_major_locator(mdates.YearLocator())
                 ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+                # Y-axis: cumulative return as %. 1.0 → 0%, 2.0 → +100%, etc.
                 ax.yaxis.set_major_formatter(mtick.FuncFormatter(
-                    lambda x, _p: f"${x/1000:,.0f}k"))
-                _base_label = _nav_label(base)
+                    lambda x, _p: f"{(x-1.0)*100:+.0f}%"))
+                ax.axhline(1.0, color="#888888", linewidth=0.8, linestyle=":", alpha=0.6)
                 if _has_rs_strat and _rs_base is not None:
-                    _title_lhs = (f"{_base_label} vs {_nav_label(_rs_base)} "
-                                  f"invested")
+                    _scale_note = (f"Fund @ {_nav_label(_user_nav)} + "
+                                   f"Fund @ {_nav_label(_rs_base)}")
                 else:
-                    _title_lhs = f"{_base_label} invested"
+                    _scale_note = f"Fund @ {_nav_label(_user_nav)}"
                 ax.set_title(
-                    f"{_title_lhs} — terminal value vs benchmarks    "
-                    f"(net of {BROKER_CONFIG['name']} brokerage + AU CGT "
-                    f"[{ACTIVE_CGT_PROFILE}])",
+                    f"Cumulative return — normalised to 0% start    "
+                    f"({_scale_note}; net of {BROKER_CONFIG['name']} "
+                    f"brokerage + AU CGT [{ACTIVE_CGT_PROFILE}])",
                     fontsize=10,
                 )
-                ax.set_ylabel("Portfolio Value (AUD)")
+                ax.set_ylabel("Cumulative return")
                 ax.legend(loc="upper left", frameon=False)
                 ax.grid(True, linestyle="--", alpha=0.4)
 
-                # Terminal-value annotations on right edge.
+                # Terminal-value annotations on right edge: show final %.
                 _annotations = [(w_strat, "Fund", "#1f4e8a")]
                 if _has_rs_strat and not w_strat_rs.empty:
                     _annotations.append((w_strat_rs, "Fund(RS)", "#1f4e8a"))
@@ -15497,7 +15583,7 @@ def export_to_ppt(results, trades, charts=None):
                 ])
                 for s, lbl, col in _annotations:
                     if not s.empty:
-                        ax.annotate(f"  ${s.iloc[-1]/1000:,.0f}k",
+                        ax.annotate(f"  {(s.iloc[-1]-1.0)*100:+.0f}%",
                                     xy=(s.index[-1], s.iloc[-1]),
                                     xytext=(4, 0), textcoords="offset points",
                                     va="center", fontsize=9,
@@ -15652,14 +15738,16 @@ def export_to_ppt(results, trades, charts=None):
                                     p.font.bold = True
 
                 _rs_terminal_msg = (
-                    f", Fund@RS({_nav_label(_rs_base)}) 10y end = ${w_strat_rs.iloc[-1]:,.0f}"
+                    f", Fund@RS({_nav_label(_rs_base)}) 10y = "
+                    f"{(w_strat_rs.iloc[-1]-1.0)*100:+.1f}%"
                     if _has_rs_strat and not w_strat_rs.empty
                     else ""
                 )
-                print(f"[pptx] Roadshow slide built — base ${base:,.0f}, "
-                      f"Fund 10y end = ${w_strat.iloc[-1]:,.0f}"
+                print(f"[pptx] Roadshow slide built (normalised view) — "
+                      f"Fund @ {_nav_label(_user_nav)} 10y = "
+                      f"{(w_strat.iloc[-1]-1.0)*100:+.1f}%"
                       f"{_rs_terminal_msg}, "
-                      f"SPY = ${w_spy.iloc[-1]:,.0f}")
+                      f"SPY = {(w_spy.iloc[-1]-1.0)*100:+.1f}%")
         except Exception as e:
             print(f"[pptx] Roadshow slide skipped: {e}")
 
