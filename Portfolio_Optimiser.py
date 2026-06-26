@@ -2238,6 +2238,17 @@ LOT_MATCH_METHOD = CFG["lot_match_method"].upper()
 # if every recommended order filled) was the source of the 2026-06 lot
 # inflation bug — it's no longer reachable from the engine.
 LOTS_REBUILD_MODE = str(CFG.get("lots_rebuild_mode", os.environ.get("LOTS_REBUILD_MODE", "fills"))).lower()
+# Dual-NAV Roadshow chart. When ROADSHOW_DUAL_NAV is truthy (env var or
+# config), the engine runs a second OOS backtest at ROADSHOW_BASE_NAV in
+# addition to the existing one driven by portfolio_state.json. The
+# Roadshow PPT slide then plots both Strategy lines and the metrics
+# table gets three extra rows (one per horizon) for the larger-NAV run.
+# Default OFF — daily ops keeps single-backtest speed.
+ROADSHOW_DUAL_NAV = bool(int(os.environ.get("ROADSHOW_DUAL_NAV", "0") or "0"))
+try:
+    ROADSHOW_BASE_NAV = float(os.environ.get("ROADSHOW_BASE_NAV") or CFG.get("roadshow_base_nav", 1_000_000.0))
+except Exception:
+    ROADSHOW_BASE_NAV = 1_000_000.0
 OPEN_AFTER_SAVE = CFG.get("open_after_save", True)
 USE_XLWINGS = CFG.get("use_xlwings", True)
 
@@ -11730,6 +11741,38 @@ if bool(CFG.get("oos_validation", True)):
         globals()["_oos_starting_nav_aud"] = float(_oos_nav)
         oos_returns_daily = ensemble_out["blended_returns"]
         oos_weights_history = ensemble_out["blended_weights"]
+
+        # Optional second OOS backtest at ROADSHOW_BASE_NAV — for the PDS /
+        # Roadshow chart, which compares the fund at the user's NAV vs at
+        # the assumed wholesale entry size. Both lines appear on the
+        # chart and three extra rows in the metrics table. Off by default
+        # so daily ops aren't slowed.
+        oos_returns_daily_roadshow = pd.Series(dtype=float)
+        oos_weights_history_roadshow = pd.DataFrame()
+        if ROADSHOW_DUAL_NAV and abs(ROADSHOW_BASE_NAV - _oos_nav) > 1.0:
+            try:
+                print(f"[oos-roadshow] running second backtest at "
+                      f"${ROADSHOW_BASE_NAV:,.0f} for dual-NAV chart...")
+                ensemble_out_rs = run_oos_ensemble_walk_forward(
+                    oos_prices_aud_long,
+                    train_window_months=24,
+                    rebalance=REBALANCE_FREQ,
+                    benchmark_ticker="SPY",
+                    score_lookback_days=252,
+                    lambda_temp=3.0,
+                    starting_nav_aud=float(ROADSHOW_BASE_NAV),
+                    slot_weights_override=PRODUCTION_SLOT_OVERRIDE,
+                    crash_hedge=PRODUCTION_CRASH_HEDGE,
+                )
+                oos_returns_daily_roadshow = ensemble_out_rs["blended_returns"]
+                oos_weights_history_roadshow = ensemble_out_rs["blended_weights"]
+                print(f"[oos-roadshow] second backtest complete, "
+                      f"{len(oos_returns_daily_roadshow)} days")
+            except Exception as _e_rs:
+                print(f"[oos-roadshow] second backtest failed: {_e_rs}")
+        globals()["oos_returns_daily_roadshow"] = oos_returns_daily_roadshow
+        globals()["oos_weights_history_roadshow"] = oos_weights_history_roadshow
+        globals()["_roadshow_nav_aud"] = float(ROADSHOW_BASE_NAV)
         # Per-candidate returns + softmax history available for downstream
         # ensemble-mix displays (roadshow stacked area, trade-plan regime row).
         globals()["oos_per_candidate_returns"] = ensemble_out["per_candidate_returns"]
@@ -11941,6 +11984,33 @@ if not oos_returns_daily.empty and not oos_prices_aud_long.empty:
     except Exception as _e:
         print(f"[oos] metrics computation failed: {_e}")
 globals()["oos_metrics_table"] = oos_metrics_table
+
+# Optional roadshow-NAV metrics table — only the "Strategy" columns are
+# kept (benchmarks are identical) and renamed so the Roadshow slide can
+# discriminate. Quiet no-op when dual mode is off.
+oos_metrics_table_roadshow = pd.DataFrame()
+_oos_rets_rs = globals().get("oos_returns_daily_roadshow", pd.Series(dtype=float))
+if isinstance(_oos_rets_rs, pd.Series) and not _oos_rets_rs.empty:
+    try:
+        _spy_aud_rs = oos_prices_aud_long.get("SPY") if "SPY" in oos_prices_aud_long.columns else None
+        _aord_rs = oos_prices_aud_long.get("^AORD") if "^AORD" in oos_prices_aud_long.columns else None
+        _spy_ret_rs = _spy_aud_rs.pct_change().dropna() if _spy_aud_rs is not None else pd.Series(dtype=float)
+        _aord_ret_rs = _aord_rs.pct_change().dropna() if _aord_rs is not None else pd.Series(dtype=float)
+        _ff5_rs = globals().get("ff5_raw", None)
+        oos_metrics_table_roadshow = compute_oos_metrics(
+            strat_returns=_oos_rets_rs,
+            spy_returns=_spy_ret_rs,
+            aord_returns=_aord_ret_rs,
+            ff5_factors=_ff5_rs,
+            weights_history=globals().get("oos_weights_history_roadshow", pd.DataFrame()),
+            horizons_years=(3, 5, 10),
+        )
+        if not oos_metrics_table_roadshow.empty:
+            print(f"[oos-roadshow] metrics computed: "
+                  f"{oos_metrics_table_roadshow.shape[1]} cols")
+    except Exception as _e_rs_mtx:
+        print(f"[oos-roadshow] metrics computation failed: {_e_rs_mtx}")
+globals()["oos_metrics_table_roadshow"] = oos_metrics_table_roadshow
 
 # Persist a metrics snapshot to metrics_history.jsonl + warn on regressions.
 # Compares 10Y Sharpe / MaxDD / α-vs-SPY to the prior run. Non-fatal —
@@ -15340,6 +15410,25 @@ def export_to_ppt(results, trades, charts=None):
                 w_spy = base * (1.0 + spy_rs).cumprod()
                 w_aord = base * (1.0 + aord_rs).cumprod()
 
+                # Optional roadshow-NAV second strategy curve. Compounds
+                # the dual-NAV backtest's returns onto a base equal to
+                # ROADSHOW_BASE_NAV so the chart shows both scales' real
+                # friction outcomes side-by-side.
+                _rs_rets_rs = globals().get("oos_returns_daily_roadshow",
+                                            pd.Series(dtype=float))
+                _has_rs_strat = (isinstance(_rs_rets_rs, pd.Series)
+                                 and not _rs_rets_rs.empty)
+                if _has_rs_strat:
+                    rs_strat_rs = _rs_rets_rs[
+                        (_rs_rets_rs.index >= start_dt_rs) &
+                        (_rs_rets_rs.index <= end_dt_rs)
+                    ].copy()
+                    _rs_base = float(globals().get("_roadshow_nav_aud", 1_000_000.0))
+                    w_strat_rs = _rs_base * (1.0 + rs_strat_rs).cumprod()
+                else:
+                    w_strat_rs = pd.Series(dtype=float)
+                    _rs_base = None
+
                 # Date callout under title (using actual rendered range).
                 _add_date_callout(road, w_strat.index.min(), w_strat.index.max(),
                                   prefix="Backtest")
@@ -15359,8 +15448,20 @@ def export_to_ppt(results, trades, charts=None):
                     fig, ax = plt.subplots(figsize=(11.5, 4.5))
                     ax_mix = None
 
+                def _nav_label(nav):
+                    return (f"${nav/1_000_000:,.2f}M" if nav >= 1_000_000
+                            else f"${nav/1000:,.0f}k")
+
+                _strat_main_label = (
+                    f"Fund @ {_nav_label(base)}" if _has_rs_strat
+                    else "Fund (Strategy)"
+                )
                 ax.plot(w_strat.index, w_strat.values, linewidth=2.2,
-                        label="Fund (Strategy)", color="#1f4e8a")
+                        label=_strat_main_label, color="#1f4e8a")
+                if _has_rs_strat and not w_strat_rs.empty:
+                    ax.plot(w_strat_rs.index, w_strat_rs.values, linewidth=2.2,
+                            label=f"Fund @ {_nav_label(_rs_base)}",
+                            color="#1f4e8a", linestyle="--")
                 ax.plot(w_spy.index, w_spy.values, linewidth=1.6,
                         label="SPY (AUD)", color="#c53030", alpha=0.85)
                 ax.plot(w_aord.index, w_aord.values, linewidth=1.6,
@@ -15370,11 +15471,14 @@ def export_to_ppt(results, trades, charts=None):
                 ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
                 ax.yaxis.set_major_formatter(mtick.FuncFormatter(
                     lambda x, _p: f"${x/1000:,.0f}k"))
-                _base_label = (f"${base/1_000_000:,.2f}M"
-                               if base >= 1_000_000
-                               else f"${base/1000:,.0f}k")
+                _base_label = _nav_label(base)
+                if _has_rs_strat and _rs_base is not None:
+                    _title_lhs = (f"{_base_label} vs {_nav_label(_rs_base)} "
+                                  f"invested")
+                else:
+                    _title_lhs = f"{_base_label} invested"
                 ax.set_title(
-                    f"{_base_label} invested — terminal value vs benchmarks    "
+                    f"{_title_lhs} — terminal value vs benchmarks    "
                     f"(net of {BROKER_CONFIG['name']} brokerage + AU CGT "
                     f"[{ACTIVE_CGT_PROFILE}])",
                     fontsize=10,
@@ -15384,9 +15488,14 @@ def export_to_ppt(results, trades, charts=None):
                 ax.grid(True, linestyle="--", alpha=0.4)
 
                 # Terminal-value annotations on right edge.
-                for s, lbl, col in [(w_strat, "Fund", "#1f4e8a"),
-                                    (w_spy, "SPY", "#c53030"),
-                                    (w_aord, "^AORD", "#2f855a")]:
+                _annotations = [(w_strat, "Fund", "#1f4e8a")]
+                if _has_rs_strat and not w_strat_rs.empty:
+                    _annotations.append((w_strat_rs, "Fund(RS)", "#1f4e8a"))
+                _annotations.extend([
+                    (w_spy, "SPY", "#c53030"),
+                    (w_aord, "^AORD", "#2f855a"),
+                ])
+                for s, lbl, col in _annotations:
                     if not s.empty:
                         ax.annotate(f"  ${s.iloc[-1]/1000:,.0f}k",
                                     xy=(s.index[-1], s.iloc[-1]),
@@ -15450,6 +15559,28 @@ def export_to_ppt(results, trades, charts=None):
                 display_metrics = ["Annualised Return", "Annualised Volatility",
                                    "Sharpe Ratio", "Sortino Ratio",
                                    "Max Drawdown"]
+                # Optional roadshow-NAV strategy gets its own per-horizon
+                # row pulled from oos_metrics_table_roadshow (Strategy
+                # column only — benchmarks are identical).
+                _oos_mtx_rs = globals().get(
+                    "oos_metrics_table_roadshow", pd.DataFrame())
+                _has_rs_mtx = (isinstance(_oos_mtx_rs, pd.DataFrame)
+                               and not _oos_mtx_rs.empty)
+                _rs_nav_for_label = float(globals().get(
+                    "_roadshow_nav_aud", 1_000_000.0))
+                _rs_label_suffix = (
+                    f"${_rs_nav_for_label/1_000_000:,.2f}M"
+                    if _rs_nav_for_label >= 1_000_000
+                    else f"${_rs_nav_for_label/1000:,.0f}k"
+                )
+                _user_nav_for_label = float(globals().get(
+                    "_oos_starting_nav_aud", 100_000.0))
+                _user_label_suffix = (
+                    f"${_user_nav_for_label/1_000_000:,.2f}M"
+                    if _user_nav_for_label >= 1_000_000
+                    else f"${_user_nav_for_label/1000:,.0f}k"
+                )
+
                 rows = []
                 row_labels = []
                 for h in ("3Y", "5Y", "10Y"):
@@ -15462,7 +15593,23 @@ def export_to_ppt(results, trades, charts=None):
                             v = oos_mtx.at[m, col_key] if m in oos_mtx.index else np.nan
                             row.append(v)
                         rows.append(row)
-                        row_labels.append(f"{h} — {series_name}")
+                        if series_name == "Strategy" and _has_rs_mtx:
+                            row_labels.append(
+                                f"{h} — Strategy @ {_user_label_suffix}")
+                        else:
+                            row_labels.append(f"{h} — {series_name}")
+
+                    if _has_rs_mtx:
+                        col_key_rs = (h, "Strategy")
+                        if col_key_rs in _oos_mtx_rs.columns:
+                            row_rs = []
+                            for m in display_metrics:
+                                v = (_oos_mtx_rs.at[m, col_key_rs]
+                                     if m in _oos_mtx_rs.index else np.nan)
+                                row_rs.append(v)
+                            rows.append(row_rs)
+                            row_labels.append(
+                                f"{h} — Strategy @ {_rs_label_suffix}")
 
                 if rows:
                     n_rows = len(rows) + 1  # +1 header
@@ -15504,8 +15651,14 @@ def export_to_ppt(results, trades, charts=None):
                                 if rr == 0 or (rr > 0 and "Strategy" in row_labels[rr-1]):
                                     p.font.bold = True
 
+                _rs_terminal_msg = (
+                    f", Fund@RS({_nav_label(_rs_base)}) 10y end = ${w_strat_rs.iloc[-1]:,.0f}"
+                    if _has_rs_strat and not w_strat_rs.empty
+                    else ""
+                )
                 print(f"[pptx] Roadshow slide built — base ${base:,.0f}, "
-                      f"Fund 10y end = ${w_strat.iloc[-1]:,.0f}, "
+                      f"Fund 10y end = ${w_strat.iloc[-1]:,.0f}"
+                      f"{_rs_terminal_msg}, "
                       f"SPY = ${w_spy.iloc[-1]:,.0f}")
         except Exception as e:
             print(f"[pptx] Roadshow slide skipped: {e}")
