@@ -2228,6 +2228,16 @@ filename = CFG["excel_path"]
 MARGINAL_TAX_RATE = CFG["marginal_tax_rate"]
 CAPITAL_LOSS_CARRY_FWD = CFG["carry_forward_losses"]
 LOT_MATCH_METHOD = CFG["lot_match_method"].upper()
+# How the Lots sheet is reconstructed at the end of each run.
+#   'fills'    — read ibkr_fills_log.jsonl (only confirmed fills count).
+#                Default and what production runs use.
+#   'holdings' — single-lot-per-ticker at today's last AUD price. Loses
+#                cost-basis history; intended as a fallback for brokers
+#                without a per-fill export.
+# The legacy 'recommendations' path (applying the engine's trade plan as
+# if every recommended order filled) was the source of the 2026-06 lot
+# inflation bug — it's no longer reachable from the engine.
+LOTS_REBUILD_MODE = str(CFG.get("lots_rebuild_mode", os.environ.get("LOTS_REBUILD_MODE", "fills"))).lower()
 OPEN_AFTER_SAVE = CFG.get("open_after_save", True)
 USE_XLWINGS = CFG.get("use_xlwings", True)
 
@@ -6467,6 +6477,193 @@ def evaluate_transaction_costs(
     }
 
 
+def _build_lots_from_fills_log(
+    fills_path,
+    fx_map: "pd.Series | dict | None" = None,
+    lot_match_method: str = "HIFO",
+    seed_path = None,
+) -> pd.DataFrame:
+    """Reconstruct the lot book from `ibkr_fills_log.jsonl`.
+
+    The fills log is the authoritative record of what transacted. Only
+    rows with `qty_filled > 0` contribute. BUYs add a new lot at
+    `avg_fill_price_local` converted to AUD; SELLs decrement matched
+    lots using HIFO/FIFO so the resulting book reflects the live
+    position basis at any point in time.
+
+    Optional `seed_path` — a JSON list of lot dicts (Security, AcqDate,
+    Units, CostBaseAUD) representing positions that existed BEFORE the
+    fills log started. Required when migrating an existing portfolio
+    onto the engine; the triage script writes this file. Fills are
+    replayed on top of the seed, so a sell after the seed correctly
+    decrements the seed lot.
+
+    Cost basis AUD priority per BUY row:
+      1. `avg_fill_price_local * fx_map[ticker]` if both present
+      2. `rec_px_aud` (the engine's planned AUD price) as fallback
+      3. row skipped if neither produces a positive cost basis
+
+    Returns an empty Lots-format DataFrame if no seed AND no filled
+    rows are available.
+    """
+    base_cols = ["Security", "AcqDate", "Units", "CostBaseAUD"]
+    p = Path(fills_path) if not hasattr(fills_path, "exists") else fills_path
+
+    seed_lots: list[dict] = []
+    if seed_path is not None:
+        sp = Path(seed_path) if not hasattr(seed_path, "exists") else seed_path
+        if sp.exists():
+            try:
+                seed_data = json.loads(sp.read_text(encoding="utf-8"))
+                for item in seed_data:
+                    try:
+                        u = int(round(float(item.get("Units") or 0)))
+                        cb = float(item.get("CostBaseAUD") or 0)
+                        if u <= 0 or cb <= 0:
+                            continue
+                        seed_lots.append({
+                            "Security": str(item.get("Security", "")).strip(),
+                            "AcqDate": pd.Timestamp(item.get("AcqDate")),
+                            "Units": u,
+                            "CostBaseAUD": cb,
+                        })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+    if not p.exists() and not seed_lots:
+        return pd.DataFrame(columns=base_cols)
+
+    if isinstance(fx_map, pd.Series):
+        fx_lookup = {str(k).strip(): float(v) for k, v in fx_map.items()
+                     if pd.notna(v) and float(v) > 0}
+    elif isinstance(fx_map, dict):
+        fx_lookup = {str(k).strip(): float(v) for k, v in fx_map.items()
+                     if v is not None and float(v) > 0}
+    else:
+        fx_lookup = {}
+
+    rows = []
+    if p.exists():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line.replace("NaN", "null"))
+                    except Exception:
+                        continue
+                    qf = float(r.get("qty_filled") or 0)
+                    if qf <= 0:
+                        continue
+                    rows.append(r)
+        except Exception:
+            rows = []
+
+    if not rows and not seed_lots:
+        return pd.DataFrame(columns=base_cols)
+
+    rows.sort(key=lambda r: r.get("exec_timestamp", ""))
+    lots: list[dict] = list(seed_lots)
+
+    for r in rows:
+        sec = str(r.get("ticker", "")).strip()
+        if not sec:
+            continue
+        qty = float(r.get("qty_filled") or 0)
+        side = str(r.get("side", "")).upper()
+        ts = r.get("exec_timestamp") or r.get("rec_log_run_at")
+        try:
+            acq = pd.Timestamp(ts)
+        except Exception:
+            acq = pd.Timestamp.utcnow()
+
+        if side == "BUY":
+            local_px = r.get("avg_fill_price_local")
+            try:
+                local_px = float(local_px) if local_px is not None else None
+            except Exception:
+                local_px = None
+            fx = fx_lookup.get(sec, 1.0 if sec.endswith(".AX") else None)
+            if local_px is not None and fx is not None and fx > 0:
+                cost_aud = local_px * fx
+            else:
+                cost_aud = float(r.get("rec_px_aud") or 0.0)
+            if cost_aud <= 0:
+                continue
+            lots.append({
+                "Security": sec,
+                "AcqDate": acq,
+                "Units": int(round(qty)),
+                "CostBaseAUD": cost_aud,
+            })
+        elif side == "SELL":
+            block_idx = [i for i, lt in enumerate(lots) if lt["Security"] == sec]
+            if not block_idx:
+                continue
+            if str(lot_match_method).upper() == "HIFO":
+                block_idx.sort(key=lambda i: (-lots[i]["CostBaseAUD"], lots[i]["AcqDate"]))
+            else:
+                block_idx.sort(key=lambda i: lots[i]["AcqDate"])
+            remaining = qty
+            for i in block_idx:
+                if remaining <= 0:
+                    break
+                have = float(lots[i]["Units"])
+                take = min(remaining, have)
+                lots[i]["Units"] = have - take
+                remaining -= take
+            lots = [lt for lt in lots if lt["Units"] > 0]
+
+    if not lots:
+        return pd.DataFrame(columns=base_cols)
+    return pd.DataFrame(lots, columns=base_cols)
+
+
+def _build_lots_from_holdings(
+    units: "pd.Series | dict",
+    last_px_aud: "pd.Series | dict",
+    today: "pd.Timestamp | None" = None,
+) -> pd.DataFrame:
+    """CGT-naive baseline: single lot per held ticker at today's AUD price.
+
+    Plumbed-but-not-wired alternative for users who don't have a fills
+    history (e.g. moving off IBKR to a broker without per-fill export).
+    Loses any real cost-basis history — every existing position is
+    treated as freshly acquired at the current price.
+    """
+    base_cols = ["Security", "AcqDate", "Units", "CostBaseAUD"]
+    if today is None:
+        today = pd.Timestamp.utcnow().normalize()
+
+    u = pd.Series(units, dtype=float) if not isinstance(units, pd.Series) else units.astype(float)
+    px = pd.Series(last_px_aud, dtype=float) if not isinstance(last_px_aud, pd.Series) else last_px_aud.astype(float)
+
+    rows = []
+    for tk, qty in u.items():
+        try:
+            qty_i = int(round(float(qty)))
+        except Exception:
+            continue
+        if qty_i <= 0:
+            continue
+        p = float(px.get(tk, 0.0) or 0.0)
+        if p <= 0:
+            continue
+        rows.append({
+            "Security": str(tk),
+            "AcqDate": pd.Timestamp(today),
+            "Units": qty_i,
+            "CostBaseAUD": p,
+        })
+    if not rows:
+        return pd.DataFrame(columns=base_cols)
+    return pd.DataFrame(rows, columns=base_cols)
+
+
 def _update_lots_after_trades(
     lots_df: pd.DataFrame,
     trade_df: pd.DataFrame,
@@ -6474,6 +6671,12 @@ def _update_lots_after_trades(
     fx_map: pd.Series | dict,
 ):
     """
+    DEPRECATED — kept only because some test paths still call it.
+    The previous trade-plan-driven write was the source of the SMH/SOXX
+    corruption (3.4M phantom lots). Production code now rebuilds the
+    Lots sheet each run via _build_lots_from_fills_log (or
+    _build_lots_from_holdings when LOTS_REBUILD_MODE='holdings').
+
     Apply executed trades to lots table.
       - Sells: decrement matched lots using LOT_MATCH_METHOD.
       - Buys: append a new lot at current Last Px (AUD).
@@ -13367,11 +13570,41 @@ if USE_XLWINGS:
             except Exception as _e_fills:
                 print(f"[excel] Actual_Fills write skipped: {_e_fills}")
 
-            # ---- Update Lots and overwrite Holdings with target units (for next run) ----
-            UPDATED_LOTS = _update_lots_after_trades(lots_df, trade_rec, pd.Timestamp(prices.index[-1]), fx_map_all)
+            # ---- Rebuild Lots from authoritative source ---------------------
+            # 'fills' (default): only count confirmed IBKR fills. Empty until
+            #   the first real fill — exactly the right baseline for a paper
+            #   account whose past 12 orders all Cancelled.
+            # 'holdings': single lot per held ticker at today's AUD price.
+            #   Plumbed for brokers without per-fill export. Loses CGT
+            #   history — use only when no fills log is available.
+            #
+            # Replaces the legacy `_update_lots_after_trades(lots_df, trade_rec, ...)`
+            # path which wrote the engine's *recommended* trades as if they'd
+            # filled. After many runs that inflated SMH lots to 3.4M units
+            # and triggered the -1.7M/+1.7M trade plan corruption (2026-06).
+            _mode = str(globals().get("LOTS_REBUILD_MODE", "fills")).lower()
+            _fills_path = APP_DIR / "ibkr_fills_log.jsonl"
+            _seed_path = APP_DIR / "lots_seed.json"
+            if _mode == "holdings":
+                UPDATED_LOTS = _build_lots_from_holdings(
+                    units, last_px_hold, today=pd.Timestamp(prices.index[-1]),
+                )
+                print(f"[lots] rebuilt from Holdings ({len(UPDATED_LOTS)} positions, "
+                      f"CGT-naive baseline)")
+            else:
+                UPDATED_LOTS = _build_lots_from_fills_log(
+                    _fills_path, fx_map=fx_map_all,
+                    lot_match_method=LOT_MATCH_METHOD,
+                    seed_path=_seed_path,
+                )
+                _seed_note = " (with seed)" if _seed_path.exists() else ""
+                print(f"[lots] rebuilt from {_fills_path.name}{_seed_note} "
+                      f"({len(UPDATED_LOTS)} lots)")
+
             sht_lots = get_or_clear_sheet(wb, 'Lots')
             sht_lots.range("A1").value = [["Security","AcqDate","Units","CostBaseAUD"]]
-            sht_lots.range("A2").options(index=False, header=False).value = UPDATED_LOTS
+            if not UPDATED_LOTS.empty:
+                sht_lots.range("A2").options(index=False, header=False).value = UPDATED_LOTS
             
             tgt_units_full = compute_target_units_for_holdings(units, last_px_hold, fx_map_all, w_star, include_flags, portfolio_value_override=portfolio_value_override)
 
