@@ -7237,6 +7237,26 @@ else:
     else:
         units, last_px_hold, prices, include_flags, tilt_df = res
 
+# Fallback: in --auto-pipeline / skip-live-pipeline modes the dialog never
+# fires, so portfolio_value_override stays None. Read portfolio_state.json
+# so the OOS backtest runs at the investor's actual NAV (matters because
+# IBKR's $5 min binds tighter at $100k than at $1M — friction scales).
+# The Roadshow chart's base is also driven from this value so the
+# "$X invested" label matches what was actually simulated.
+if portfolio_value_override is None:
+    try:
+        if os.path.exists(state_path):
+            with open(state_path, "r") as _f_state:
+                _state = json.load(_f_state)
+            _pv = float(_state.get("portfolio_value", 0) or 0)
+            if np.isfinite(_pv) and _pv > 0:
+                portfolio_value_override = _pv
+                print(f"[oos-nav] using portfolio_state.json value "
+                      f"${_pv:,.0f} as starting_nav_aud for backtest + "
+                      f"Roadshow base")
+    except Exception as _e_pv_state:
+        print(f"[oos-nav] portfolio_state.json read skipped: {_e_pv_state}")
+
     current_holdings_units = units.copy()
 
 # DIALOG-FIRST: regardless of whether the dialog was saved or cancelled, run
@@ -11683,6 +11703,16 @@ if bool(CFG.get("oos_validation", True)):
             oos_prices_aud_long.update(_oos_long_px.loc[:, _usd_cols].mul(_fx, axis=0))
         oos_prices_aud_long = oos_prices_aud_long.ffill().bfill()
 
+        # Use the investor's actual NAV so brokerage friction (IBKR $5 min)
+        # scales correctly — at $100k the min binds, at $1M the rate
+        # dominates. Without this the Roadshow slide would compound
+        # $1M-scale returns onto a $100k chart base and overstate
+        # achievable net returns at small scale.
+        _oos_nav = (float(portfolio_value_override)
+                    if portfolio_value_override is not None
+                       and np.isfinite(portfolio_value_override)
+                       and portfolio_value_override > 0
+                    else 1_000_000.0)
         ensemble_out = run_oos_ensemble_walk_forward(
             oos_prices_aud_long,
             train_window_months=24,
@@ -11690,12 +11720,14 @@ if bool(CFG.get("oos_validation", True)):
             benchmark_ticker="SPY",
             score_lookback_days=252,
             lambda_temp=3.0,
+            starting_nav_aud=_oos_nav,
             # PRODUCTION CONFIG: the metrics shown in PPT/Excel must match
             # what the live trade plan actually trades. See PRODUCTION_*
             # constants at the top of the file for the empirical rationale.
             slot_weights_override=PRODUCTION_SLOT_OVERRIDE,
             crash_hedge=PRODUCTION_CRASH_HEDGE,
         )
+        globals()["_oos_starting_nav_aud"] = float(_oos_nav)
         oos_returns_daily = ensemble_out["blended_returns"]
         oos_weights_history = ensemble_out["blended_weights"]
         # Per-candidate returns + softmax history available for downstream
@@ -15298,8 +15330,12 @@ def export_to_ppt(results, trades, charts=None):
                 spy_rs = _bench_rets("SPY").reindex(rs_strat.index).fillna(0.0)
                 aord_rs = _bench_rets("^AORD").reindex(rs_strat.index).fillna(0.0)
 
-                # Wealth curves: $100k base.
-                base = 100_000.0
+                # Wealth curves anchored at the same NAV the OOS backtest
+                # actually ran at. Without this the chart compounds
+                # $1M-scale percentage returns onto an unrelated $100k
+                # display base — friction (IBKR $5 min) doesn't match
+                # what an investor at the displayed scale would face.
+                base = float(globals().get("_oos_starting_nav_aud", 100_000.0))
                 w_strat = base * (1.0 + rs_strat).cumprod()
                 w_spy = base * (1.0 + spy_rs).cumprod()
                 w_aord = base * (1.0 + aord_rs).cumprod()
@@ -15334,8 +15370,11 @@ def export_to_ppt(results, trades, charts=None):
                 ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
                 ax.yaxis.set_major_formatter(mtick.FuncFormatter(
                     lambda x, _p: f"${x/1000:,.0f}k"))
+                _base_label = (f"${base/1_000_000:,.2f}M"
+                               if base >= 1_000_000
+                               else f"${base/1000:,.0f}k")
                 ax.set_title(
-                    f"$100,000 invested — terminal value vs benchmarks    "
+                    f"{_base_label} invested — terminal value vs benchmarks    "
                     f"(net of {BROKER_CONFIG['name']} brokerage + AU CGT "
                     f"[{ACTIVE_CGT_PROFILE}])",
                     fontsize=10,
@@ -15465,7 +15504,9 @@ def export_to_ppt(results, trades, charts=None):
                                 if rr == 0 or (rr > 0 and "Strategy" in row_labels[rr-1]):
                                     p.font.bold = True
 
-                print(f"[pptx] Roadshow slide built — Fund 10y end = ${w_strat.iloc[-1]:,.0f}, SPY = ${w_spy.iloc[-1]:,.0f}")
+                print(f"[pptx] Roadshow slide built — base ${base:,.0f}, "
+                      f"Fund 10y end = ${w_strat.iloc[-1]:,.0f}, "
+                      f"SPY = ${w_spy.iloc[-1]:,.0f}")
         except Exception as e:
             print(f"[pptx] Roadshow slide skipped: {e}")
 
