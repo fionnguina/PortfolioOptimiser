@@ -11848,9 +11848,14 @@ if bool(CFG.get("oos_validation", True)):
                 _existing[float(ROADSHOW_BASE_NAV)] = oos_returns_daily_roadshow
 
             for _nav in SCALE_SENSITIVITY_NAVS:
-                # Reuse if an existing backtest matches this NAV.
+                # Reuse if an existing backtest matches this NAV within
+                # ±1% (covers the common case where portfolio_state.json
+                # has $250,542 and the requested scale point is $250k —
+                # friction at those NAVs is indistinguishable, no point
+                # spending another ~100s on a duplicate backtest).
+                _tol = max(1.0, 0.01 * _nav)
                 _match = next((k for k in _existing
-                               if abs(k - _nav) <= 1.0), None)
+                               if abs(k - _nav) <= _tol), None)
                 if _match is not None:
                     oos_scale_results[float(_nav)] = {
                         "returns": _existing[_match],
@@ -15951,12 +15956,44 @@ def export_to_ppt(results, trades, charts=None):
                 ax_sc.legend(loc="upper left", frameon=False, fontsize=8)
                 ax_sc.grid(True, linestyle="--", alpha=0.4)
 
-                for lbl, val, col in _scale_terminals:
-                    ax_sc.annotate(f"  {(val-1.0)*100:+.0f}%",
-                                   xy=(_scale_end, val),
-                                   xytext=(4, 0), textcoords="offset points",
-                                   va="center", fontsize=8,
-                                   fontweight="bold", color=col)
+                # Auto-spread overlapping terminal annotations. With 4
+                # Fund lines stacked within a 5pp band (e.g. $100k +297%,
+                # $250k +319%, $500k +321%, $1M +333%) the per-line text
+                # labels overprint at the right edge. Sort by y-value,
+                # walk top-down, and nudge each label up only if the
+                # previous one is closer than `_min_gap_data` units in
+                # data-y space. Anchor points (the line endpoints) stay
+                # exactly on the curves — only the text positions move.
+                _y_min, _y_max = ax_sc.get_ylim()
+                _min_gap_data = 0.030 * (_y_max - _y_min)
+                _terminals_sorted = sorted(_scale_terminals,
+                                            key=lambda t: t[1])
+                _adj_y = [t[1] for t in _terminals_sorted]
+                for _i in range(1, len(_adj_y)):
+                    if _adj_y[_i] - _adj_y[_i-1] < _min_gap_data:
+                        _adj_y[_i] = _adj_y[_i-1] + _min_gap_data
+                for (lbl, val, col), _ty in zip(_terminals_sorted, _adj_y):
+                    # Leader from line endpoint to nudged y if displaced.
+                    if abs(_ty - val) > 1e-9:
+                        ax_sc.annotate(
+                            "",
+                            xy=(_scale_end, val),
+                            xytext=(_scale_end, _ty),
+                            arrowprops=dict(arrowstyle="-",
+                                             color=col,
+                                             linewidth=0.6,
+                                             alpha=0.5),
+                            annotation_clip=False,
+                        )
+                    ax_sc.annotate(
+                        f"  {(val-1.0)*100:+.0f}%",
+                        xy=(_scale_end, _ty),
+                        xytext=(8, 0),
+                        textcoords="offset points",
+                        va="center", fontsize=8,
+                        fontweight="bold", color=col,
+                        annotation_clip=False,
+                    )
 
                 # Bottom strip: ensemble regime mix from the primary
                 # backtest (regime mix is NAV-independent — same engine,
@@ -16007,8 +16044,6 @@ def export_to_ppt(results, trades, charts=None):
                                                height=_CmSc(8.61))
 
                 # ---- Metrics table: NAV-as-row × horizon-as-col ----
-                _table_metrics = ["Annualised Return", "Sharpe Ratio",
-                                  "Sortino Ratio", "Max Drawdown"]
                 _horizons = ("3Y", "5Y", "10Y")
                 _nav_label_row = lambda n: (
                     f"Strategy @ ${n/1_000_000:,.2f}M"
@@ -16019,13 +16054,11 @@ def export_to_ppt(results, trades, charts=None):
                 _row_labels_sc = [_nav_label_row(n) for n in _navs_sorted]
                 _row_labels_sc.append("SPY (AUD)")
 
-                # Header: Series | 3Y Ret | 3Y Sharpe | 3Y DD | 5Y... |
-                # 10Y... — return + Sharpe + MaxDD for each horizon, all
-                # in one wide table.
+                # Header: Series | 3Y Ret/Shr/Sort/DD | 5Y... | 10Y...
                 _header_cells = ["NAV / Series"]
                 for h in _horizons:
                     _header_cells.extend([f"{h} Return", f"{h} Sharpe",
-                                          f"{h} MaxDD"])
+                                          f"{h} Sortino", f"{h} MaxDD"])
                 _ncols_sc = len(_header_cells)
                 _nrows_sc = len(_row_labels_sc) + 1
                 _tbl_shape_sc = scale_slide.shapes.add_table(
@@ -16046,28 +16079,36 @@ def export_to_ppt(results, trades, charts=None):
                         return ""
                     return f"{v:.2f}"
 
+                def _fill_horizon_block(row_idx, mtx, series_name):
+                    """Write Return / Sharpe / Sortino / MaxDD for each
+                    horizon into 4 cells starting at column 1. Returns
+                    the next free column index after all horizons."""
+                    j = 1
+                    for h in _horizons:
+                        _col = (h, series_name)
+                        if _col not in mtx.columns:
+                            j += 4
+                            continue
+                        _ret = (mtx.at["Annualised Return", _col]
+                                if "Annualised Return" in mtx.index else None)
+                        _shr = (mtx.at["Sharpe Ratio", _col]
+                                if "Sharpe Ratio" in mtx.index else None)
+                        _sor = (mtx.at["Sortino Ratio", _col]
+                                if "Sortino Ratio" in mtx.index else None)
+                        _dd = (mtx.at["Max Drawdown", _col]
+                               if "Max Drawdown" in mtx.index else None)
+                        _tbl_sc.cell(row_idx, j).text = _fmt_pct(_ret)
+                        _tbl_sc.cell(row_idx, j+1).text = _fmt_ratio(_shr)
+                        _tbl_sc.cell(row_idx, j+2).text = _fmt_ratio(_sor)
+                        _tbl_sc.cell(row_idx, j+3).text = _fmt_pct(_dd)
+                        j += 4
+
                 # Per-NAV rows
                 for i, _nav in enumerate(_navs_sorted, start=1):
                     _mtx_for_nav = _scale_metrics_pptx.get(_nav, pd.DataFrame())
                     _tbl_sc.cell(i, 0).text = _nav_label_row(_nav)
-                    if _mtx_for_nav.empty:
-                        continue
-                    j = 1
-                    for h in _horizons:
-                        _col = (h, "Strategy")
-                        if _col not in _mtx_for_nav.columns:
-                            j += 3
-                            continue
-                        _ret = (_mtx_for_nav.at["Annualised Return", _col]
-                                if "Annualised Return" in _mtx_for_nav.index else None)
-                        _shr = (_mtx_for_nav.at["Sharpe Ratio", _col]
-                                if "Sharpe Ratio" in _mtx_for_nav.index else None)
-                        _dd = (_mtx_for_nav.at["Max Drawdown", _col]
-                               if "Max Drawdown" in _mtx_for_nav.index else None)
-                        _tbl_sc.cell(i, j).text = _fmt_pct(_ret)
-                        _tbl_sc.cell(i, j+1).text = _fmt_ratio(_shr)
-                        _tbl_sc.cell(i, j+2).text = _fmt_pct(_dd)
-                        j += 3
+                    if not _mtx_for_nav.empty:
+                        _fill_horizon_block(i, _mtx_for_nav, "Strategy")
 
                 # SPY row — pull from the primary metrics table (SPY is
                 # NAV-invariant: same daily returns regardless of strategy
@@ -16077,32 +16118,26 @@ def export_to_ppt(results, trades, charts=None):
                 _any_mtx = next(iter(_scale_metrics_pptx.values()),
                                 pd.DataFrame())
                 if not _any_mtx.empty:
-                    j = 1
-                    for h in _horizons:
-                        _col = (h, "SPY (AUD)")
-                        if _col not in _any_mtx.columns:
-                            j += 3
-                            continue
-                        _ret = (_any_mtx.at["Annualised Return", _col]
-                                if "Annualised Return" in _any_mtx.index else None)
-                        _shr = (_any_mtx.at["Sharpe Ratio", _col]
-                                if "Sharpe Ratio" in _any_mtx.index else None)
-                        _dd = (_any_mtx.at["Max Drawdown", _col]
-                               if "Max Drawdown" in _any_mtx.index else None)
-                        _tbl_sc.cell(_spy_row_idx, j).text = _fmt_pct(_ret)
-                        _tbl_sc.cell(_spy_row_idx, j+1).text = _fmt_ratio(_shr)
-                        _tbl_sc.cell(_spy_row_idx, j+2).text = _fmt_pct(_dd)
-                        j += 3
+                    _fill_horizon_block(_spy_row_idx, _any_mtx, "SPY (AUD)")
+
+                # Summary print: cumulative return at end of period for
+                # each NAV. Series indexed by date, so we need iloc[-1]
+                # AFTER cumprod — the raw 'returns' field is daily
+                # percentage returns, not cumulative.
+                def _nav_summary(n):
+                    _r = _scale_results_pptx[n]["returns"]
+                    if not isinstance(_r, pd.Series) or _r.empty:
+                        return ("$1.00M" if n >= 1_000_000
+                                else f"${n/1000:.0f}k") + " (no data)"
+                    _w = (1.0 + _r).cumprod()
+                    _final = float(_w.iloc[-1])
+                    _lbl = (f"${n/1_000_000:.2f}M" if n >= 1_000_000
+                            else f"${n/1000:.0f}k")
+                    return f"@{_lbl} {(_final-1.0)*100:+.1f}%"
 
                 print(f"[pptx] Scale slide built — "
                       f"{len(_navs_sorted)} NAVs: "
-                      + ", ".join(
-                          f"@${n/1_000_000:.2f}M {(_scale_results_pptx[n]['returns'][-1]-1)*100:+.1f}%"
-                          if n >= 1_000_000
-                          else f"@${n/1000:.0f}k "
-                          for n in _navs_sorted
-                      )
-                )
+                      + ", ".join(_nav_summary(n) for n in _navs_sorted))
 
                 # Reorder: insert immediately after Roadshow (position 3).
                 try:
