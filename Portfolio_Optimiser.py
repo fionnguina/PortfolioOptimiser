@@ -2293,6 +2293,19 @@ try:
     ROADSHOW_BASE_NAV = float(os.environ.get("ROADSHOW_BASE_NAV") or CFG.get("roadshow_base_nav", 1_000_000.0))
 except Exception:
     ROADSHOW_BASE_NAV = 1_000_000.0
+# Scale-sensitivity slide. When SCALE_SENSITIVITY truthy, the engine
+# runs N additional OOS backtests (one per NAV in SCALE_SENSITIVITY_NAVS)
+# and adds a dedicated slide after Roadshow showing how friction scales
+# from $100k to $1M. Off by default because each extra backtest adds
+# ~100s — only useful when generating PDS / Roadshow PPTs.
+SCALE_SENSITIVITY = bool(int(os.environ.get("SCALE_SENSITIVITY", "0") or "0"))
+try:
+    _scale_str = os.environ.get("SCALE_SENSITIVITY_NAVS") or CFG.get(
+        "scale_sensitivity_navs", "100000,250000,500000,1000000")
+    SCALE_SENSITIVITY_NAVS = sorted({float(x.strip()) for x in str(_scale_str).split(",")
+                                     if x.strip() and float(x.strip()) > 0})
+except Exception:
+    SCALE_SENSITIVITY_NAVS = [100_000.0, 250_000.0, 500_000.0, 1_000_000.0]
 OPEN_AFTER_SAVE = CFG.get("open_after_save", True)
 USE_XLWINGS = CFG.get("use_xlwings", True)
 
@@ -11817,6 +11830,59 @@ if bool(CFG.get("oos_validation", True)):
         globals()["oos_returns_daily_roadshow"] = oos_returns_daily_roadshow
         globals()["oos_weights_history_roadshow"] = oos_weights_history_roadshow
         globals()["_roadshow_nav_aud"] = float(ROADSHOW_BASE_NAV)
+
+        # Scale-sensitivity sweep — N additional OOS backtests at the
+        # NAVs in SCALE_SENSITIVITY_NAVS. Used by the dedicated scale
+        # slide that follows Roadshow in the PDS deck. Reuses already-
+        # computed results where the NAVs match (within $1 tolerance)
+        # so we don't waste 100s per duplicate.
+        oos_scale_results: dict[float, dict] = {}
+        if SCALE_SENSITIVITY and SCALE_SENSITIVITY_NAVS:
+            # Index the primary + roadshow runs by NAV for reuse.
+            _existing: dict[float, pd.Series] = {}
+            if not oos_returns_daily.empty:
+                _existing[float(_oos_nav)] = oos_returns_daily
+            if (ROADSHOW_DUAL_NAV
+                and not oos_returns_daily_roadshow.empty
+                and abs(ROADSHOW_BASE_NAV - _oos_nav) > 1.0):
+                _existing[float(ROADSHOW_BASE_NAV)] = oos_returns_daily_roadshow
+
+            for _nav in SCALE_SENSITIVITY_NAVS:
+                # Reuse if an existing backtest matches this NAV.
+                _match = next((k for k in _existing
+                               if abs(k - _nav) <= 1.0), None)
+                if _match is not None:
+                    oos_scale_results[float(_nav)] = {
+                        "returns": _existing[_match],
+                        "nav_aud": float(_nav),
+                        "reused": True,
+                    }
+                    print(f"[scale] @ ${_nav:,.0f}: reused existing backtest")
+                    continue
+                try:
+                    print(f"[scale] running OOS at ${_nav:,.0f}...")
+                    _scale_out = run_oos_ensemble_walk_forward(
+                        oos_prices_aud_long,
+                        train_window_months=24,
+                        rebalance=REBALANCE_FREQ,
+                        benchmark_ticker="SPY",
+                        score_lookback_days=252,
+                        lambda_temp=3.0,
+                        starting_nav_aud=float(_nav),
+                        slot_weights_override=PRODUCTION_SLOT_OVERRIDE,
+                        crash_hedge=PRODUCTION_CRASH_HEDGE,
+                    )
+                    oos_scale_results[float(_nav)] = {
+                        "returns": _scale_out["blended_returns"],
+                        "nav_aud": float(_nav),
+                        "reused": False,
+                    }
+                    print(f"[scale] @ ${_nav:,.0f}: complete, "
+                          f"{len(_scale_out['blended_returns'])} days")
+                except Exception as _e_scale:
+                    print(f"[scale] @ ${_nav:,.0f}: failed — {_e_scale}")
+        globals()["oos_scale_results"] = oos_scale_results
+        globals()["_scale_sensitivity_navs"] = list(SCALE_SENSITIVITY_NAVS)
         # Per-candidate returns + softmax history available for downstream
         # ensemble-mix displays (roadshow stacked area, trade-plan regime row).
         globals()["oos_per_candidate_returns"] = ensemble_out["per_candidate_returns"]
@@ -12055,6 +12121,40 @@ if isinstance(_oos_rets_rs, pd.Series) and not _oos_rets_rs.empty:
     except Exception as _e_rs_mtx:
         print(f"[oos-roadshow] metrics computation failed: {_e_rs_mtx}")
 globals()["oos_metrics_table_roadshow"] = oos_metrics_table_roadshow
+
+# Per-NAV metrics for the scale-sensitivity slide. Same compute_oos_metrics
+# call as Roadshow, applied to each scale backtest.
+oos_scale_metrics: dict[float, pd.DataFrame] = {}
+_scale_results_local = globals().get("oos_scale_results", {})
+if _scale_results_local:
+    try:
+        _spy_aud_sc = oos_prices_aud_long.get("SPY") if "SPY" in oos_prices_aud_long.columns else None
+        _aord_sc = oos_prices_aud_long.get("^AORD") if "^AORD" in oos_prices_aud_long.columns else None
+        _spy_ret_sc = _spy_aud_sc.pct_change().dropna() if _spy_aud_sc is not None else pd.Series(dtype=float)
+        _aord_ret_sc = _aord_sc.pct_change().dropna() if _aord_sc is not None else pd.Series(dtype=float)
+        _ff5_sc = globals().get("ff5_raw", None)
+        for _nav, _payload in _scale_results_local.items():
+            _rets_for_nav = _payload.get("returns", pd.Series(dtype=float))
+            if not isinstance(_rets_for_nav, pd.Series) or _rets_for_nav.empty:
+                continue
+            try:
+                _mtx = compute_oos_metrics(
+                    strat_returns=_rets_for_nav,
+                    spy_returns=_spy_ret_sc,
+                    aord_returns=_aord_ret_sc,
+                    ff5_factors=_ff5_sc,
+                    weights_history=pd.DataFrame(),
+                    horizons_years=(3, 5, 10),
+                )
+                if not _mtx.empty:
+                    oos_scale_metrics[float(_nav)] = _mtx
+            except Exception as _e_sc:
+                print(f"[scale] metrics @ ${_nav:,.0f}: {_e_sc}")
+        if oos_scale_metrics:
+            print(f"[scale] metrics computed for {len(oos_scale_metrics)} NAVs")
+    except Exception as _e_sc_all:
+        print(f"[scale] metrics computation failed: {_e_sc_all}")
+globals()["oos_scale_metrics"] = oos_scale_metrics
 
 # Persist a metrics snapshot to metrics_history.jsonl + warn on regressions.
 # Compares 10Y Sharpe / MaxDD / α-vs-SPY to the prior run. Non-fatal —
@@ -15761,6 +15861,261 @@ def export_to_ppt(results, trades, charts=None):
                 _xml_slides.insert(1, _last)
         except Exception as _e_reorder:
             print(f"[pptx] Roadshow reorder skipped: {_e_reorder}")
+
+        # ---- SCALE-SENSITIVITY SLIDE ----
+        # Strategy at N NAVs (default $100k / $250k / $500k / $1M) on
+        # a single normalised chart + per-NAV metrics table. Gated by
+        # SCALE_SENSITIVITY=1 because the extra backtests cost ~100s
+        # each. Inserted after Roadshow in the deck (position 3).
+        _scale_results_pptx = globals().get("oos_scale_results", {})
+        _scale_metrics_pptx = globals().get("oos_scale_metrics", {})
+        if _scale_results_pptx and _scale_metrics_pptx:
+            try:
+                scale_layout = prs.slide_layouts[20]
+                scale_slide = prs.slides.add_slide(scale_layout)
+                if scale_slide.shapes.title:
+                    scale_slide.shapes.title.text = "Performance by Portfolio Scale"
+
+                # Common 10Y window aligned to the longest available series.
+                _scale_end = max(p["returns"].index.max()
+                                 for p in _scale_results_pptx.values()
+                                 if isinstance(p["returns"], pd.Series)
+                                 and not p["returns"].empty)
+                _scale_start = _scale_end - pd.DateOffset(years=10)
+                _add_date_callout(scale_slide, _scale_start, _scale_end,
+                                  prefix="Backtest")
+
+                # SPY benchmark — common reference across scales.
+                def _bench_pct(col):
+                    if col not in oos_prices_aud_long.columns:
+                        return pd.Series(dtype=float)
+                    px = pd.to_numeric(oos_prices_aud_long[col], errors="coerce").dropna()
+                    return px.pct_change().dropna()
+                _spy_full = _bench_pct("SPY")
+
+                fig_sc, (ax_sc, ax_sc_mix) = plt.subplots(
+                    2, 1, figsize=(11.5, 5.5),
+                    gridspec_kw={"height_ratios": [3.5, 1.0]},
+                    sharex=True,
+                )
+
+                # Blue palette ramping from light (small NAV) to dark
+                # (large NAV) so the friction-tax visual is intuitive.
+                _navs_sorted = sorted(_scale_results_pptx.keys())
+                _palette = ["#a8c5e6", "#6c9bd2", "#3f73b8", "#1f4e8a", "#0a2f5c"]
+                _line_colors = {nav: _palette[min(i, len(_palette)-1)]
+                                for i, nav in enumerate(_navs_sorted)}
+
+                _scale_terminals: list[tuple[str, float, str]] = []
+                _common_idx = None
+                for _nav in _navs_sorted:
+                    _rets = _scale_results_pptx[_nav]["returns"]
+                    _slice = _rets[(_rets.index >= _scale_start) &
+                                   (_rets.index <= _scale_end)]
+                    if _slice.empty:
+                        continue
+                    _w = (1.0 + _slice).cumprod()
+                    if _common_idx is None:
+                        _common_idx = _w.index
+                    _lbl = (f"Fund @ ${_nav/1_000_000:,.2f}M"
+                            if _nav >= 1_000_000
+                            else f"Fund @ ${_nav/1000:,.0f}k")
+                    ax_sc.plot(_w.index, _w.values, linewidth=2.0,
+                               label=_lbl, color=_line_colors[_nav])
+                    _scale_terminals.append((_lbl, float(_w.iloc[-1]),
+                                              _line_colors[_nav]))
+
+                if _common_idx is not None and not _spy_full.empty:
+                    _spy_slice = _spy_full.reindex(_common_idx).fillna(0.0)
+                    _w_spy_sc = (1.0 + _spy_slice).cumprod()
+                    ax_sc.plot(_w_spy_sc.index, _w_spy_sc.values,
+                               linewidth=1.6, label="SPY (AUD)",
+                               color="#c53030", alpha=0.85)
+                    _scale_terminals.append(("SPY", float(_w_spy_sc.iloc[-1]),
+                                              "#c53030"))
+
+                ax_sc.axhline(1.0, color="#888888", linewidth=0.8,
+                              linestyle=":", alpha=0.6)
+                ax_sc.set_xlim(_scale_start, _scale_end)
+                ax_sc.xaxis.set_major_locator(mdates.YearLocator())
+                ax_sc.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+                ax_sc.yaxis.set_major_formatter(mtick.FuncFormatter(
+                    lambda x, _p: f"{(x-1.0)*100:+.0f}%"))
+                ax_sc.set_title(
+                    f"Cumulative return by portfolio scale — normalised to "
+                    f"0% start    (net of {BROKER_CONFIG['name']} brokerage "
+                    f"+ AU CGT [{ACTIVE_CGT_PROFILE}])",
+                    fontsize=10,
+                )
+                ax_sc.set_ylabel("Cumulative return")
+                ax_sc.legend(loc="upper left", frameon=False, fontsize=8)
+                ax_sc.grid(True, linestyle="--", alpha=0.4)
+
+                for lbl, val, col in _scale_terminals:
+                    ax_sc.annotate(f"  {(val-1.0)*100:+.0f}%",
+                                   xy=(_scale_end, val),
+                                   xytext=(4, 0), textcoords="offset points",
+                                   va="center", fontsize=8,
+                                   fontweight="bold", color=col)
+
+                # Bottom strip: ensemble regime mix from the primary
+                # backtest (regime mix is NAV-independent — same engine,
+                # same softmax).
+                _soft_sc = globals().get("oos_softmax_history", pd.DataFrame())
+                if (isinstance(_soft_sc, pd.DataFrame) and not _soft_sc.empty
+                        and _common_idx is not None):
+                    _regime_colors_sc = {
+                        "Modest (SPY+0%)":      "#5b9bd5",
+                        "Aggressive (SPY+5%)":  "#70ad47",
+                        "Bold (SPY+10%)":       "#ffc000",
+                        "Maximum (SPY+15%)":    "#ed7d31",
+                        "Stretch (SPY+25%)":    "#c00000",
+                    }
+                    _cols_in_order_sc = [n for n in ENSEMBLE_SLOT_NAMES
+                                         if n in _soft_sc.columns]
+                    if _cols_in_order_sc:
+                        _soft_plot_sc = _soft_sc[_cols_in_order_sc].reindex(
+                            _common_idx, method="ffill").fillna(0.0)
+                        ax_sc_mix.stackplot(
+                            _soft_plot_sc.index,
+                            *[_soft_plot_sc[c].values for c in _cols_in_order_sc],
+                            labels=[c.split(" ")[0] for c in _cols_in_order_sc],
+                            colors=[_regime_colors_sc.get(c, "#888888")
+                                    for c in _cols_in_order_sc],
+                            alpha=0.85,
+                        )
+                        ax_sc_mix.set_xlim(_scale_start, _scale_end)
+                        ax_sc_mix.set_ylim(0, 1)
+                        ax_sc_mix.yaxis.set_major_formatter(mtick.FuncFormatter(
+                            lambda y, _p: f"{y*100:.0f}%"))
+                        ax_sc_mix.set_ylabel("Regime")
+                        ax_sc_mix.legend(loc="lower center",
+                                         bbox_to_anchor=(0.5, -0.45),
+                                         ncol=5, frameon=False, fontsize=7)
+
+                import io as _io_sc
+                _sc_buf = _io_sc.BytesIO()
+                fig_sc.tight_layout()
+                fig_sc.savefig(_sc_buf, format="png", dpi=180,
+                               bbox_inches="tight")
+                plt.close(fig_sc)
+                _sc_buf.seek(0)
+
+                from pptx.util import Cm as _CmSc
+                scale_slide.shapes.add_picture(_sc_buf, _CmSc(1.4), _CmSc(2.78),
+                                               width=_CmSc(22.6),
+                                               height=_CmSc(8.61))
+
+                # ---- Metrics table: NAV-as-row × horizon-as-col ----
+                _table_metrics = ["Annualised Return", "Sharpe Ratio",
+                                  "Sortino Ratio", "Max Drawdown"]
+                _horizons = ("3Y", "5Y", "10Y")
+                _nav_label_row = lambda n: (
+                    f"Strategy @ ${n/1_000_000:,.2f}M"
+                    if n >= 1_000_000 else f"Strategy @ ${n/1000:,.0f}k"
+                )
+
+                # Row labels: one per NAV + SPY benchmark row.
+                _row_labels_sc = [_nav_label_row(n) for n in _navs_sorted]
+                _row_labels_sc.append("SPY (AUD)")
+
+                # Header: Series | 3Y Ret | 3Y Sharpe | 3Y DD | 5Y... |
+                # 10Y... — return + Sharpe + MaxDD for each horizon, all
+                # in one wide table.
+                _header_cells = ["NAV / Series"]
+                for h in _horizons:
+                    _header_cells.extend([f"{h} Return", f"{h} Sharpe",
+                                          f"{h} MaxDD"])
+                _ncols_sc = len(_header_cells)
+                _nrows_sc = len(_row_labels_sc) + 1
+                _tbl_shape_sc = scale_slide.shapes.add_table(
+                    _nrows_sc, _ncols_sc,
+                    _CmSc(1.4), _CmSc(11.39),
+                    _CmSc(22.6), _CmSc(6.77),
+                )
+                _tbl_sc = _tbl_shape_sc.table
+                for j, h in enumerate(_header_cells):
+                    _tbl_sc.cell(0, j).text = h
+
+                def _fmt_pct(v):
+                    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                        return ""
+                    return f"{v*100:+.2f}%"
+                def _fmt_ratio(v):
+                    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                        return ""
+                    return f"{v:.2f}"
+
+                # Per-NAV rows
+                for i, _nav in enumerate(_navs_sorted, start=1):
+                    _mtx_for_nav = _scale_metrics_pptx.get(_nav, pd.DataFrame())
+                    _tbl_sc.cell(i, 0).text = _nav_label_row(_nav)
+                    if _mtx_for_nav.empty:
+                        continue
+                    j = 1
+                    for h in _horizons:
+                        _col = (h, "Strategy")
+                        if _col not in _mtx_for_nav.columns:
+                            j += 3
+                            continue
+                        _ret = (_mtx_for_nav.at["Annualised Return", _col]
+                                if "Annualised Return" in _mtx_for_nav.index else None)
+                        _shr = (_mtx_for_nav.at["Sharpe Ratio", _col]
+                                if "Sharpe Ratio" in _mtx_for_nav.index else None)
+                        _dd = (_mtx_for_nav.at["Max Drawdown", _col]
+                               if "Max Drawdown" in _mtx_for_nav.index else None)
+                        _tbl_sc.cell(i, j).text = _fmt_pct(_ret)
+                        _tbl_sc.cell(i, j+1).text = _fmt_ratio(_shr)
+                        _tbl_sc.cell(i, j+2).text = _fmt_pct(_dd)
+                        j += 3
+
+                # SPY row — pull from the primary metrics table (SPY is
+                # NAV-invariant: same daily returns regardless of strategy
+                # NAV, so any of the existing per-NAV metric tables work).
+                _spy_row_idx = len(_navs_sorted) + 1
+                _tbl_sc.cell(_spy_row_idx, 0).text = "SPY (AUD)"
+                _any_mtx = next(iter(_scale_metrics_pptx.values()),
+                                pd.DataFrame())
+                if not _any_mtx.empty:
+                    j = 1
+                    for h in _horizons:
+                        _col = (h, "SPY (AUD)")
+                        if _col not in _any_mtx.columns:
+                            j += 3
+                            continue
+                        _ret = (_any_mtx.at["Annualised Return", _col]
+                                if "Annualised Return" in _any_mtx.index else None)
+                        _shr = (_any_mtx.at["Sharpe Ratio", _col]
+                                if "Sharpe Ratio" in _any_mtx.index else None)
+                        _dd = (_any_mtx.at["Max Drawdown", _col]
+                               if "Max Drawdown" in _any_mtx.index else None)
+                        _tbl_sc.cell(_spy_row_idx, j).text = _fmt_pct(_ret)
+                        _tbl_sc.cell(_spy_row_idx, j+1).text = _fmt_ratio(_shr)
+                        _tbl_sc.cell(_spy_row_idx, j+2).text = _fmt_pct(_dd)
+                        j += 3
+
+                print(f"[pptx] Scale slide built — "
+                      f"{len(_navs_sorted)} NAVs: "
+                      + ", ".join(
+                          f"@${n/1_000_000:.2f}M {(_scale_results_pptx[n]['returns'][-1]-1)*100:+.1f}%"
+                          if n >= 1_000_000
+                          else f"@${n/1000:.0f}k "
+                          for n in _navs_sorted
+                      )
+                )
+
+                # Reorder: insert immediately after Roadshow (position 3).
+                try:
+                    _xml_slides_sc = prs.slides._sldIdLst
+                    _sl_sc = list(_xml_slides_sc)
+                    if len(_sl_sc) >= 4:
+                        _last_sc = _sl_sc[-1]
+                        _xml_slides_sc.remove(_last_sc)
+                        _xml_slides_sc.insert(2, _last_sc)
+                except Exception as _e_reorder_sc:
+                    print(f"[pptx] Scale slide reorder skipped: {_e_reorder_sc}")
+            except Exception as _e_scale_slide:
+                print(f"[pptx] Scale slide skipped: {_e_scale_slide}")
 
         # --- FINAL SLIDE: Headline Metrics Dashboard (dump slide) ---
         # All the key numbers in one place: build/config stamp, 10Y headline
