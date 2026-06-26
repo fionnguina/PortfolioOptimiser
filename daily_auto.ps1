@@ -56,6 +56,29 @@ if (-not $LogPath) {
     $LogPath = Join-Path $ScriptDir "dist\run.log"
 }
 $DailyLogPath = Join-Path $ScriptDir "dist\daily_auto.log"
+$FlagPath = Join-Path $ScriptDir "dist\engine_done.flag"
+$EngineTimeoutSec = 600
+
+# --- IBKR / TWS autostart settings ----------------------------------------
+# Port 7497 = paper TWS (7496 is live, never used here).
+$IbkrPort = 7497
+# Where TWS is installed. Allow override via env var so different machines
+# don't need to edit the script. Falls back to the standard Windows
+# install location. If autodetection fails, the wrapper just skips
+# autostart and the engine falls back to yfinance prices.
+$TwsPath = $env:IBKR_TWS_PATH
+if (-not $TwsPath) {
+    $candidates = @(
+        "$env:USERPROFILE\Jts\latest\tws.exe",
+        "$env:USERPROFILE\Jts\tws.exe",
+        "C:\Jts\tws.exe",
+        "C:\Program Files\Trader Workstation\tws.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { $TwsPath = $c; break }
+    }
+}
+$TwsReadyTimeoutSec = 60
 
 function Write-Log {
     param([string]$Msg)
@@ -104,6 +127,47 @@ function Show-Toast {
     }
 }
 
+function Test-IbkrPort {
+    param([int]$Port = 7497)
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    try {
+        $tcp.Connect("127.0.0.1", $Port)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $tcp.Close()
+    }
+}
+
+function Start-TwsIfNeeded {
+    if (Test-IbkrPort -Port $IbkrPort) {
+        Write-Log "TWS already listening on 127.0.0.1:$IbkrPort."
+        return $true
+    }
+    if (-not $TwsPath -or -not (Test-Path $TwsPath)) {
+        Write-Log "TWS not running and tws.exe not found (looked in `$env:IBKR_TWS_PATH and standard install paths). Engine will fall back to yfinance prices."
+        return $false
+    }
+    Write-Log "TWS not listening; launching $TwsPath..."
+    try {
+        Start-Process -FilePath $TwsPath -WindowStyle Minimized | Out-Null
+    } catch {
+        Write-Log "TWS launch failed: $($_.Exception.Message). Engine will fall back to yfinance."
+        return $false
+    }
+    $deadline = (Get-Date).AddSeconds($TwsReadyTimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-IbkrPort -Port $IbkrPort) {
+            Write-Log "TWS port ${IbkrPort} ready."
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    Write-Log "TWS launch timed out after ${TwsReadyTimeoutSec}s waiting for port ${IbkrPort}. May still be on the login screen — engine will fall back to yfinance."
+    return $false
+}
+
 # --- Sanity checks ---
 if (-not (Test-Path $ExePath)) {
     Write-Log "FATAL: $ExePath not found. Rebuild via build_helper.py."
@@ -113,6 +177,9 @@ if (-not (Test-Path $ExePath)) {
 Write-Log "Starting daily auto run."
 Write-Log "  Engine: $ExePath"
 Write-Log "  Log:    $LogPath"
+
+# --- Ensure TWS is up before running the engine ---
+[void](Start-TwsIfNeeded)
 
 # --- Truncate the engine's run.log so this run's lines are easy to parse ---
 # The engine ALSO rotates its log, but we want a clean per-invocation read.
@@ -125,19 +192,36 @@ try {
 }
 
 # --- Run engine with --auto-pipeline ---
-# Use Start-Process -Wait, NOT "& $ExePath | Out-Null". The engine is
-# PyInstaller --noconsole, which spawns child processes (Tk, matplotlib,
-# COM workers) that inherit any stdout pipe handle. With `| Out-Null` the
-# wrapper would block forever waiting for those children to release the
-# pipe even after the main engine process terminated (observed 2026-06-22
-# under scheduled-task execution). Start-Process -Wait waits on the
-# specific engine PID instead, so child-process pipes don't matter.
+# Two-channel completion detection because PowerShell's Start-Process -Wait
+# can hang waiting for child processes that PyInstaller --noconsole exes
+# spawn (Tk, matplotlib, Excel COM workers) even after the engine PID has
+# exited — observed 2026-06-22 and again 2026-06-26 under scheduled-task
+# execution. The previous Start-Process -Wait fix proved insufficient on
+# its own.
+#
+# Channel 1 (primary): drop a sentinel file `dist\engine_done.flag` at the
+#   very end of the engine. Wrapper polls for that file's mtime exceeding
+#   $EngineStart — definitive "engine completed cleanly" signal.
+# Channel 2 (fallback): direct .NET Process.WaitForExit(timeoutMs). Bounded
+#   so we never block past $EngineTimeoutSec regardless of child-process
+#   behavior.
+#
+# If either fires we proceed to parse run.log. If neither fires within the
+# timeout we still proceed — partial-log verdict is more useful than a
+# silently-hung wrapper.
+
+# Pre-emptively clear any stale sentinel from a prior run.
+if (Test-Path $FlagPath) { Remove-Item $FlagPath -Force -ErrorAction SilentlyContinue }
+
 $EngineStart = Get-Date
 try {
-    $proc = Start-Process -FilePath $ExePath `
-        -ArgumentList "--auto-pipeline" `
-        -Wait -PassThru -WindowStyle Hidden
-    $engineExit = $proc.ExitCode
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ExePath
+    $psi.Arguments = "--auto-pipeline"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.WindowStyle = "Hidden"
+    $engineProc = [System.Diagnostics.Process]::Start($psi)
 } catch {
     Write-Log "Engine launch threw: $($_.Exception.Message)"
     Show-Toast `
@@ -146,8 +230,49 @@ try {
         -Verdict "ERROR" | Out-Null
     exit 2
 }
+
+Write-Log "Engine launched (PID=$($engineProc.Id)); awaiting sentinel or process exit (timeout ${EngineTimeoutSec}s)."
+
+$pollIntervalMs = 1000
+$deadline = $EngineStart.AddSeconds($EngineTimeoutSec)
+$engineExit = $null
+$sentinelHit = $false
+while ((Get-Date) -lt $deadline) {
+    # Channel 1: sentinel
+    if (Test-Path $FlagPath) {
+        $flagMtime = (Get-Item $FlagPath).LastWriteTime
+        if ($flagMtime -ge $EngineStart) {
+            $sentinelHit = $true
+            break
+        }
+    }
+    # Channel 2: process exit
+    if ($engineProc.HasExited) {
+        $engineExit = $engineProc.ExitCode
+        break
+    }
+    Start-Sleep -Milliseconds $pollIntervalMs
+}
+
+# After breaking out, give the process up to 5 more seconds to settle so
+# we get its exit code if it just finished (sentinel fires before exit).
+if (-not $engineProc.HasExited) {
+    [void]$engineProc.WaitForExit(5000)
+}
+if ($engineProc.HasExited) {
+    $engineExit = $engineProc.ExitCode
+}
+
 $EngineDuration = (Get-Date) - $EngineStart
-Write-Log "Engine exited (code=$engineExit) after $($EngineDuration.TotalSeconds.ToString('F1'))s."
+if ($sentinelHit -and $engineExit -ne $null) {
+    Write-Log "Engine exited (code=$engineExit, sentinel hit) after $($EngineDuration.TotalSeconds.ToString('F1'))s."
+} elseif ($sentinelHit) {
+    Write-Log "Engine sentinel hit after $($EngineDuration.TotalSeconds.ToString('F1'))s (process still wrapping up child handles)."
+} elseif ($engineExit -ne $null) {
+    Write-Log "Engine exited (code=$engineExit) after $($EngineDuration.TotalSeconds.ToString('F1'))s (no sentinel — engine may have crashed before completing health summary)."
+} else {
+    Write-Log "Engine TIMEOUT after $($EngineDuration.TotalSeconds.ToString('F1'))s — proceeding with partial log."
+}
 
 # --- Parse [rebal-trigger] verdict from run.log ---
 $verdict = "UNKNOWN"

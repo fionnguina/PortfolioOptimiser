@@ -16066,3 +16066,23 @@ try:
     _print_run_health_summary()
 except Exception as _e_health:
     print(f"[health] summary print failed: {_e_health}")
+
+# === Sentinel for the daily_auto wrapper =====================================
+# The wrapper's Start-Process -Wait can hang on PyInstaller --noconsole
+# child processes (Tk, matplotlib, Excel COM workers) even after the
+# engine PID has exited. By dropping a flag file with the finish
+# timestamp here, the wrapper can poll for a definitive "engine done"
+# signal instead of relying solely on Process.WaitForExit().
+#
+# File is small (one JSON line) and overwritten each run. Wrapper
+# compares mtime > its own start time to filter out stale sentinels.
+try:
+    import json as _json_done
+    from datetime import datetime as _dt_done
+    _flag_path = APP_DIR / "engine_done.flag"
+    _flag_path.write_text(_json_done.dumps({
+        "finished_at": _dt_done.now().isoformat(timespec="seconds"),
+        "build_stamp": str(globals().get("BUILD_STAMP", "?")),
+    }))
+except Exception as _e_flag:
+    print(f"[sentinel] engine_done.flag write failed: {_e_flag}")
