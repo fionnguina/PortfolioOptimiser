@@ -95,10 +95,21 @@ REC_LOG_PATH = APP_DIR / "trade_recommendation_log.jsonl"
 SEED_PATH = APP_DIR / "lots_seed.json"
 STATE_PATH = APP_DIR / "portfolio_state.json"
 
-# Output paths — append-only JSONL
-AUDIT_FILLS_PATH = APP_DIR / "simulator_fills.jsonl"
-AUDIT_NAV_PATH = APP_DIR / "simulator_nav.jsonl"
-AUDIT_SANITY_PATH = APP_DIR / "simulator_sanity.jsonl"
+# Output paths — append-only JSONL. Multi-NAV mode suffixes label.
+def audit_paths(label: str = "default") -> dict[str, Path]:
+    """Return the trio of audit log paths for a given simulator label.
+    Default label = "default" (no suffix). Multi-NAV mode passes
+    label = "100k" / "250k" / etc. so each NAV's logs stay isolated."""
+    suffix = "" if label == "default" else f"_{label}"
+    return {
+        "fills":  APP_DIR / f"simulator_fills{suffix}.jsonl",
+        "nav":    APP_DIR / f"simulator_nav{suffix}.jsonl",
+        "sanity": APP_DIR / f"simulator_sanity{suffix}.jsonl",
+    }
+
+# Live broker NAV history — written by the engine's drift tracker.
+# Used by --compare mode for divergence diagnostics.
+LIVE_NAV_PATH = APP_DIR / "live_nav_history.jsonl"
 
 # IBKR Pro AU fee model (matches BROKER_PROFILES["ibkr_pro_au"] in the
 # main engine; copied here intentionally rather than imported so the
@@ -347,61 +358,103 @@ def apply_spread(side: str, mid_price: float) -> float:
 # ============================================================================
 
 _price_cache: dict[tuple[str, pd.Timestamp], float] = {}
+_fx_cache: dict[pd.Timestamp, float] = {}
+
+
+def _is_aud_native(ticker: str) -> bool:
+    """ASX tickers (.AX) and AU index (^AORD) are AUD-denominated; everything
+    else (US ETFs, indices like ^GSPC) is USD."""
+    return ticker.endswith(".AX") or ticker.startswith("^AORD")
+
+
+def get_aud_per_usd(date: pd.Timestamp) -> float:
+    """Returns AUD per USD on the given date. Caches per-day so a
+    daily-rebalance walk doesn't hit yfinance more than once per
+    trading session. Defaults to a conservative 1.50 if the fetch
+    fails — same fallback the engine uses elsewhere."""
+    key = pd.Timestamp(date).normalize()
+    if key in _fx_cache:
+        return _fx_cache[key]
+    try:
+        end = date + timedelta(days=10)
+        df = yf.download("USDAUD=X", start=date.strftime("%Y-%m-%d"),
+                          end=end.strftime("%Y-%m-%d"),
+                          interval="1d", progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            _fx_cache[key] = 1.50
+            return 1.50
+        if "Close" in df.columns:
+            fx = float(df["Close"].iloc[0])
+        elif isinstance(df.columns, pd.MultiIndex):
+            fx = float(df[("Close", "USDAUD=X")].iloc[0])
+        else:
+            _fx_cache[key] = 1.50
+            return 1.50
+        if not np.isfinite(fx) or fx <= 0:
+            fx = 1.50
+        _fx_cache[key] = fx
+        return fx
+    except Exception:
+        _fx_cache[key] = 1.50
+        return 1.50
+
+
+def _fetch_price_native(ticker: str, date: pd.Timestamp,
+                         field: str = "Open") -> Optional[float]:
+    """Internal: pull price in the ticker's native currency. AUD for
+    .AX/^AORD, USD for everything else."""
+    try:
+        end = date + timedelta(days=10)
+        df = yf.download(ticker, start=date.strftime("%Y-%m-%d"),
+                          end=end.strftime("%Y-%m-%d"),
+                          interval="1d", progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        if field in df.columns:
+            return float(df[field].iloc[0])
+        if isinstance(df.columns, pd.MultiIndex):
+            return float(df[(field, ticker)].iloc[0])
+        return None
+    except Exception:
+        return None
 
 
 def get_open_price(ticker: str, date: pd.Timestamp) -> Optional[float]:
-    """Return open price for the next trading session at or after `date`.
-    Caches per (ticker, date) so repeat calls don't re-hit yfinance.
-    Returns None if no data available (delisted, market closed all
-    surrounding days, etc.)."""
+    """Return open price for the next trading session at or after `date`,
+    converted to AUD for non-AUD tickers. Caches per (ticker, date)
+    so a daily-rebalance walk doesn't re-hit yfinance."""
     key = (ticker, pd.Timestamp(date).normalize())
     if key in _price_cache:
         return _price_cache[key]
-    try:
-        end = date + timedelta(days=10)
-        df = yf.download(ticker, start=date.strftime("%Y-%m-%d"),
-                          end=end.strftime("%Y-%m-%d"),
-                          interval="1d", progress=False, auto_adjust=True)
-        if df is None or df.empty:
-            _price_cache[key] = None
-            return None
-        if "Open" in df.columns:
-            first_open = float(df["Open"].iloc[0])
-        elif isinstance(df.columns, pd.MultiIndex):
-            first_open = float(df[("Open", ticker)].iloc[0])
-        else:
-            return None
-        _price_cache[key] = first_open
-        return first_open
-    except Exception:
+    native = _fetch_price_native(ticker, date, field="Open")
+    if native is None:
         _price_cache[key] = None
         return None
+    if _is_aud_native(ticker):
+        aud_px = native
+    else:
+        fx = get_aud_per_usd(date)
+        aud_px = native * fx
+    _price_cache[key] = aud_px
+    return aud_px
 
 
 def get_close_price(ticker: str, date: pd.Timestamp) -> Optional[float]:
-    """Close price for `date` (or nearest trading day after)."""
+    """Close price for `date` in AUD."""
     key = ("close::" + ticker, pd.Timestamp(date).normalize())
     if key in _price_cache:
         return _price_cache[key]
-    try:
-        end = date + timedelta(days=10)
-        df = yf.download(ticker, start=date.strftime("%Y-%m-%d"),
-                          end=end.strftime("%Y-%m-%d"),
-                          interval="1d", progress=False, auto_adjust=True)
-        if df is None or df.empty:
-            _price_cache[key] = None
-            return None
-        if "Close" in df.columns:
-            close = float(df["Close"].iloc[0])
-        elif isinstance(df.columns, pd.MultiIndex):
-            close = float(df[("Close", ticker)].iloc[0])
-        else:
-            return None
-        _price_cache[key] = close
-        return close
-    except Exception:
+    native = _fetch_price_native(ticker, date, field="Close")
+    if native is None:
         _price_cache[key] = None
         return None
+    if _is_aud_native(ticker):
+        aud_px = native
+    else:
+        fx = get_aud_per_usd(date)
+        aud_px = native * fx
+    _price_cache[key] = aud_px
+    return aud_px
 
 
 # ============================================================================
@@ -414,14 +467,27 @@ class SimulatorState:
     lot_book: LotBook = field(default_factory=LotBook)
     fills_count: int = 0
     sanity_violations_count: int = 0
+    batches_rejected: int = 0
+    label: str = "default"   # used by multi-NAV mode to suffix audit files
 
 
 def load_seed(seed_path: Path = SEED_PATH,
-              state_path: Path = STATE_PATH) -> SimulatorState:
-    """Initialize simulator state from lots_seed.json + portfolio_state.json.
-    Cash = portfolio_value - sum(units × cost_basis). Negative cash
-    flagged but not blocked (matches engine behavior)."""
-    state = SimulatorState()
+              state_path: Path = STATE_PATH,
+              starting_cash_override: Optional[float] = None,
+              label: str = "default") -> SimulatorState:
+    """Initialize simulator state.
+
+    Two modes:
+      - Default: read positions from lots_seed.json + cash from
+        portfolio_state.json (matches the user's real broker state).
+      - Cash-only (starting_cash_override set): no positions, all
+        capital in cash. Used for multi-NAV runs that want to compare
+        "start with $X cash on lockbox-date+1, let engine recommend
+        from scratch" across multiple NAVs."""
+    state = SimulatorState(label=label)
+    if starting_cash_override is not None:
+        state.cash_aud = float(starting_cash_override)
+        return state
     if seed_path.exists():
         try:
             seed = json.loads(seed_path.read_text(encoding="utf-8"))
@@ -468,11 +534,12 @@ def load_rec_log_window(rec_log: Path, start: pd.Timestamp,
 
 
 def apply_recommendation(rec: dict, state: SimulatorState,
-                          audit_path: Path) -> None:
+                          paths: dict[str, Path]) -> None:
     """Apply one rec_log entry's recommended_trades to state.
     Fills at next trading day's open + spread + brokerage.
-    Records every fill to audit_path. Runs sanity check on the batch
-    and records violations to AUDIT_SANITY_PATH (non-blocking)."""
+    Records every fill to paths['fills']. Sanity violations record
+    to paths['sanity'] AND block the batch from being applied
+    (Phase 2b)."""
     rec_date = pd.Timestamp(rec.get("run_at"))
     rec_trades = rec.get("recommended_trades", []) or []
     if not rec_trades:
@@ -509,24 +576,32 @@ def apply_recommendation(rec: dict, state: SimulatorState,
             "fill_date": fill_date.isoformat(),
         })
 
-    # Sanity check on the batch BEFORE applying
+    # Sanity check on the batch BEFORE applying. Phase 2b: violations
+    # BLOCK the fill batch — the rec_log entry is recorded as rejected,
+    # cash and lot book are untouched, the walk advances. This matches
+    # what the engine's sanity layer does (halt before side effects),
+    # adapted for a non-halting simulator (we want to see how many
+    # batches WOULD have been blocked over a window).
     prices_now = {f["ticker"]: f["mid_price"] for f in fills}
     pre_fill_nav = state.cash_aud + state.lot_book.total_units_at(prices_now)
     violations = check_fill_batch_sanity(fills, pre_fill_nav,
                                           state.lot_book, prices_now)
     if violations:
-        with AUDIT_SANITY_PATH.open("a", encoding="utf-8") as f:
+        with paths["sanity"].open("a", encoding="utf-8") as f:
             f.write(json.dumps({
+                "label": state.label,
                 "rec_run_at": str(rec.get("run_at")),
                 "fill_date": fill_date.isoformat(),
                 "pre_fill_nav_aud": pre_fill_nav,
                 "n_fills": len(fills),
+                "batch_rejected": True,
                 "violations": violations,
             }) + "\n")
         state.sanity_violations_count += len(violations)
-        # Phase 2a: record but continue. Phase 2b will gate execution.
-        print(f"[sim] sanity violations at {fill_date.date()}: "
-              f"{len(violations)} — see {AUDIT_SANITY_PATH.name}")
+        state.batches_rejected += 1
+        print(f"[sim:{state.label}] BATCH REJECTED at {fill_date.date()}: "
+              f"{len(violations)} sanity violations — see {paths['sanity'].name}")
+        return  # do not apply any of this batch's fills
 
     # Apply fills to lot book + cash
     for f in fills:
@@ -547,8 +622,9 @@ def apply_recommendation(rec: dict, state: SimulatorState,
         state.fills_count += 1
 
         # Append audit entry per fill
-        with audit_path.open("a", encoding="utf-8") as af:
+        with paths["fills"].open("a", encoding="utf-8") as af:
             af.write(json.dumps({
+                "label": state.label,
                 "rec_run_at": str(rec.get("run_at")),
                 "cash_aud_after": state.cash_aud,
                 **f,
@@ -562,6 +638,7 @@ def snapshot_nav(state: SimulatorState, date: pd.Timestamp,
     positions_value = state.lot_book.total_units_at(prices)
     nav = state.cash_aud + positions_value
     snapshot = {
+        "label": state.label,
         "date": date.isoformat(),
         "cash_aud": state.cash_aud,
         "positions_value_aud": positions_value,
@@ -569,6 +646,7 @@ def snapshot_nav(state: SimulatorState, date: pd.Timestamp,
         "n_positions": len(state.lot_book.all_tickers()),
         "fills_to_date": state.fills_count,
         "sanity_violations_to_date": state.sanity_violations_count,
+        "batches_rejected_to_date": state.batches_rejected,
     }
     with audit_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(snapshot) + "\n")
@@ -579,57 +657,200 @@ def snapshot_nav(state: SimulatorState, date: pd.Timestamp,
 # CLI entry
 # ============================================================================
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Paper-account simulator — forward-walks the engine's "
-                    "trade recommendations against post-lockbox market data")
-    parser.add_argument("--from", dest="start", required=True,
-                        help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--to", dest="end", required=True,
-                        help="End date (YYYY-MM-DD)")
-    parser.add_argument("--rec-log", default=str(REC_LOG_PATH),
-                        help="Path to trade_recommendation_log.jsonl")
-    parser.add_argument("--reset", action="store_true",
-                        help="Truncate the simulator audit logs before running")
-    args = parser.parse_args()
-
-    start = pd.Timestamp(args.start)
-    end = pd.Timestamp(args.end)
-    rec_log = Path(args.rec_log)
-
-    if args.reset:
-        for p in (AUDIT_FILLS_PATH, AUDIT_NAV_PATH, AUDIT_SANITY_PATH):
+def run_single(start: pd.Timestamp, end: pd.Timestamp, rec_log: Path,
+                state: SimulatorState, reset: bool) -> SimulatorState:
+    """Run one simulator instance over a date window. Used by both
+    single-NAV (default) and multi-NAV modes."""
+    paths = audit_paths(state.label)
+    if reset:
+        for p in paths.values():
             if p.exists():
                 p.unlink()
-        print(f"[sim] audit logs reset")
-
-    state = load_seed()
-    print(f"[sim] seed loaded: cash=${state.cash_aud:,.0f} AUD, "
-          f"{len(state.lot_book.all_tickers())} held tickers")
 
     recs = load_rec_log_window(rec_log, start, end)
-    print(f"[sim] {len(recs)} rec_log entries in window "
+    print(f"[sim:{state.label}] seed: cash=${state.cash_aud:,.0f} AUD, "
+          f"{len(state.lot_book.all_tickers())} held tickers · "
+          f"{len(recs)} rec_log entries in window "
           f"{start.date()} → {end.date()}")
     if not recs:
-        print("[sim] nothing to simulate, exiting")
-        return 0
-
+        return state
     recs.sort(key=lambda r: r.get("run_at", ""))
 
     for rec in recs:
-        apply_recommendation(rec, state, AUDIT_FILLS_PATH)
-        # Snapshot NAV at close of fill day for marking
+        apply_recommendation(rec, state, paths)
         fill_date = pd.Timestamp(rec.get("run_at")) + timedelta(days=1)
         prices_close: dict[str, float] = {}
         for ticker in state.lot_book.all_tickers():
             cp = get_close_price(ticker, fill_date)
             if cp is not None:
                 prices_close[ticker] = cp
-        snapshot_nav(state, fill_date, prices_close, AUDIT_NAV_PATH)
+        snapshot_nav(state, fill_date, prices_close, paths["nav"])
 
-    print(f"[sim] complete — {state.fills_count} fills, "
-          f"{state.sanity_violations_count} sanity violations, "
+    print(f"[sim:{state.label}] done — {state.fills_count} fills, "
+          f"{state.batches_rejected} batches rejected, "
+          f"{state.sanity_violations_count} violations, "
           f"final cash ${state.cash_aud:,.0f}")
+    return state
+
+
+def compare_to_live_nav(simulator_label: str = "default") -> None:
+    """Post-hoc comparison: align simulator NAV time series against
+    live_nav_history.jsonl (engine drift tracker's actual broker
+    NAV record). Prints divergence per common date + summary stats.
+    Does NOT run a simulation — read-only analysis of existing logs."""
+    sim_paths = audit_paths(simulator_label)
+    sim_nav_path = sim_paths["nav"]
+    if not sim_nav_path.exists():
+        print(f"[compare] {sim_nav_path.name} missing — run a simulation first")
+        return
+    if not LIVE_NAV_PATH.exists():
+        print(f"[compare] {LIVE_NAV_PATH.name} missing — engine hasn't logged "
+              f"live NAV yet (needs LIVE_TRADING_START_DATE to be reached)")
+        return
+
+    def _read_jsonl(p: Path) -> pd.DataFrame:
+        rows = []
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+        return pd.DataFrame(rows)
+
+    sim_df = _read_jsonl(sim_nav_path)
+    live_df = _read_jsonl(LIVE_NAV_PATH)
+    if sim_df.empty or live_df.empty:
+        print(f"[compare] one of the logs is empty: "
+              f"sim={len(sim_df)} live={len(live_df)}")
+        return
+
+    # Normalise date columns. live_nav_history.jsonl writes a different
+    # schema than simulator_nav.jsonl — be defensive.
+    def _to_date_series(df: pd.DataFrame) -> pd.Series:
+        for col in ("date", "timestamp", "as_of"):
+            if col in df.columns:
+                return pd.to_datetime(df[col]).dt.date
+        raise ValueError(f"no date column in {df.columns.tolist()}")
+
+    def _to_nav_series(df: pd.DataFrame) -> pd.Series:
+        for col in ("nav_aud", "nav", "portfolio_value_aud", "portfolio_value"):
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce")
+        raise ValueError(f"no nav column in {df.columns.tolist()}")
+
+    try:
+        sim_df["_date"] = _to_date_series(sim_df)
+        sim_df["_nav"]  = _to_nav_series(sim_df)
+        live_df["_date"] = _to_date_series(live_df)
+        live_df["_nav"]  = _to_nav_series(live_df)
+    except Exception as e:
+        print(f"[compare] schema problem: {e}")
+        return
+
+    # Per-day comparison (last sim NAV per day vs last live NAV per day).
+    sim_daily = sim_df.groupby("_date")["_nav"].last().rename("sim")
+    live_daily = live_df.groupby("_date")["_nav"].last().rename("live")
+    joined = pd.concat([sim_daily, live_daily], axis=1, join="inner").dropna()
+
+    if joined.empty:
+        print("[compare] no overlapping dates between sim and live NAV logs")
+        return
+
+    joined["diff"] = joined["sim"] - joined["live"]
+    joined["pct_diff"] = (joined["sim"] - joined["live"]) / joined["live"]
+    print(f"[compare] {len(joined)} overlapping dates "
+          f"{joined.index.min()} → {joined.index.max()}")
+    print(f"  Mean abs diff:   ${joined['diff'].abs().mean():,.0f} AUD")
+    print(f"  Max  abs diff:   ${joined['diff'].abs().max():,.0f} AUD")
+    print(f"  Mean abs %:      {joined['pct_diff'].abs().mean()*100:.2f}%")
+    print(f"  Max  abs %:      {joined['pct_diff'].abs().max()*100:.2f}%")
+    print()
+    print(joined.tail(10).to_string())
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Paper-account simulator — forward-walks the engine's "
+                    "trade recommendations against post-lockbox market data")
+    parser.add_argument("--from", dest="start",
+                        help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--to", dest="end",
+                        help="End date (YYYY-MM-DD)")
+    parser.add_argument("--rec-log", default=str(REC_LOG_PATH),
+                        help="Path to trade_recommendation_log.jsonl")
+    parser.add_argument("--reset", action="store_true",
+                        help="Truncate the simulator audit logs before running")
+    parser.add_argument("--starting-cash", type=float, default=None,
+                        help="Override seed: start with this much AUD cash "
+                             "and no positions. Used for greenfield runs "
+                             "from the lockbox date.")
+    parser.add_argument("--multi-nav", action="store_true",
+                        help="Run 4 simulations in parallel at $100k / $250k "
+                             "/ $500k / $1M starting cash. Audit files get "
+                             "NAV suffix. Same window for all four.")
+    parser.add_argument("--multi-nav-amounts", default="100000,250000,500000,1000000",
+                        help="Comma-separated NAVs for --multi-nav mode")
+    parser.add_argument("--compare", action="store_true",
+                        help="Post-hoc compare simulator_nav.jsonl vs "
+                             "live_nav_history.jsonl. Does not simulate; "
+                             "just analyses existing logs.")
+    parser.add_argument("--compare-label", default="default",
+                        help="Simulator label to compare against (for "
+                             "multi-NAV runs you'd pass e.g. '1M')")
+    args = parser.parse_args()
+
+    if args.compare:
+        compare_to_live_nav(args.compare_label)
+        return 0
+
+    if not args.start or not args.end:
+        parser.error("--from and --to are required (unless --compare)")
+        return 2
+
+    start = pd.Timestamp(args.start)
+    end = pd.Timestamp(args.end)
+    rec_log = Path(args.rec_log)
+
+    if args.multi_nav:
+        try:
+            navs = sorted({float(x.strip()) for x in args.multi_nav_amounts.split(",")
+                            if x.strip()})
+        except Exception as e:
+            print(f"[sim] bad --multi-nav-amounts: {e}")
+            return 2
+
+        def _nav_label(nav: float) -> str:
+            return (f"{int(nav/1_000_000)}M" if nav >= 1_000_000
+                    else f"{int(nav/1000)}k")
+
+        results: list[tuple[float, SimulatorState]] = []
+        for nav in navs:
+            label = _nav_label(nav)
+            print(f"\n=== Multi-NAV run @ ${nav:,.0f} (label={label}) ===")
+            state = load_seed(starting_cash_override=nav, label=label)
+            state = run_single(start, end, rec_log, state, args.reset)
+            results.append((nav, state))
+
+        # Summary table
+        print()
+        print("=" * 88)
+        print("Multi-NAV summary")
+        print("=" * 88)
+        print(f"{'NAV':>12}  {'Final Cash':>14}  {'Fills':>6}  {'Rejected':>9}  {'Violations':>11}")
+        for nav, st in results:
+            print(f"  ${nav:>10,.0f}  ${st.cash_aud:>13,.0f}  "
+                  f"{st.fills_count:>6}  {st.batches_rejected:>9}  "
+                  f"{st.sanity_violations_count:>11}")
+        print("=" * 88)
+        return 0
+
+    # Single-NAV mode
+    state = load_seed(starting_cash_override=args.starting_cash, label="default")
+    run_single(start, end, rec_log, state, args.reset)
     return 0
 
 
