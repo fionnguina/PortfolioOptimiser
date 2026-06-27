@@ -2377,6 +2377,78 @@ except Exception:
 OPEN_AFTER_SAVE = CFG.get("open_after_save", True)
 USE_XLWINGS = CFG.get("use_xlwings", True)
 
+# === STRICT DATA LOCKBOX (2026-06-27 — user directive) ====================
+# All decision-making data must end at DATA_LOCKBOX_DATE so the engine is
+# truly blind to the future. From the lockbox date onward, NEW market data
+# (prices, FF5 factors, FX) gets clamped at every ingestion point. Forward
+# walk-through validation lives in paper_simulator.py (Phase 2), which
+# applies the engine's frozen logic to post-lockbox market data WITHOUT
+# the engine itself seeing it.
+#
+# User can override via env var DATA_LOCKBOX_DATE=YYYY-MM-DD if a future
+# session re-extends the validation window. Set DATA_LOCKBOX_DATE="" (empty)
+# to fully disable — DON'T DO THIS without a deliberate methodology
+# justification. Default is the user's directed lockbox.
+#
+# Implementation: monkey-patch yfinance + wrap FF5 loader. Any DataFrame
+# or Series with a DatetimeIndex returned by yf.download gets truncated.
+# Verification check at engine startup raises if any data source returns
+# rows past the lockbox — defends against bypass.
+_lockbox_env = os.environ.get("DATA_LOCKBOX_DATE")
+if _lockbox_env is None:
+    DATA_LOCKBOX_DATE = pd.Timestamp("2026-06-30")
+elif _lockbox_env.strip() == "":
+    DATA_LOCKBOX_DATE = None
+    print("[lockbox] DISABLED (DATA_LOCKBOX_DATE='') — engine sees all available data")
+else:
+    try:
+        DATA_LOCKBOX_DATE = pd.Timestamp(_lockbox_env.strip())
+    except Exception:
+        print(f"[lockbox] env var DATA_LOCKBOX_DATE={_lockbox_env!r} unparseable; "
+              f"falling back to 2026-06-30")
+        DATA_LOCKBOX_DATE = pd.Timestamp("2026-06-30")
+
+if DATA_LOCKBOX_DATE is not None:
+    _orig_yf_download = yf.download
+
+    def _yf_download_lockbox(*args, **kwargs):
+        """Yfinance wrapper that truncates results at DATA_LOCKBOX_DATE so
+        the engine cannot see post-lockbox market data. Applied globally
+        via monkey-patch — every existing yf.download call site
+        automatically picks this up without code changes."""
+        df = _orig_yf_download(*args, **kwargs)
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return df
+        try:
+            if isinstance(df.index, pd.DatetimeIndex):
+                return df[df.index <= DATA_LOCKBOX_DATE].copy()
+        except Exception:
+            pass
+        return df
+    yf.download = _yf_download_lockbox
+
+    def _apply_data_lockbox(df_or_series):
+        """Helper for non-yfinance data sources (FF5 CSV, custom loaders).
+        Truncates any DatetimeIndex-keyed object at DATA_LOCKBOX_DATE.
+        Returns the input unchanged if not a date-indexed pandas object."""
+        if df_or_series is None:
+            return df_or_series
+        try:
+            if hasattr(df_or_series, "index") and isinstance(
+                    df_or_series.index, pd.DatetimeIndex):
+                return df_or_series[df_or_series.index <= DATA_LOCKBOX_DATE].copy()
+        except Exception:
+            pass
+        return df_or_series
+
+    print(f"[lockbox] ENABLED — all market data truncated at "
+          f"{DATA_LOCKBOX_DATE.date().isoformat()} "
+          f"(engine cannot see future)")
+else:
+    # No-op helper so call sites work whether or not lockbox is active.
+    def _apply_data_lockbox(df_or_series):
+        return df_or_series
+
 # ---------------------------------------------------------------------
 # Risk-Free Rate (AU): RBA Cash Rate
 # ---------------------------------------------------------------------
@@ -2955,14 +3027,18 @@ expected_cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM", "RF"]
 def _safe_load_region(region: str) -> pd.DataFrame:
     """Load a region's FF5+MOM with friendly fallback. On failure logs a warning
     and returns the US series so downstream regressions degrade gracefully
-    rather than crashing the pipeline."""
+    rather than crashing the pipeline. Applies the data lockbox to the
+    loaded factor frame so post-lockbox factor returns can't leak into
+    the engine's regressions."""
     try:
         df = get_ff5_mom_daily(region=region)
-        return df.loc[:, ~df.columns.duplicated()].reindex(columns=expected_cols).copy()
+        df = df.loc[:, ~df.columns.duplicated()].reindex(columns=expected_cols).copy()
+        return _apply_data_lockbox(df)
     except Exception as e:
         print(f"[ff5] {region} factor download failed ({e}); falling back to US factors for this region")
         df = get_ff5_mom_daily(region="US")
-        return df.loc[:, ~df.columns.duplicated()].reindex(columns=expected_cols).copy()
+        df = df.loc[:, ~df.columns.duplicated()].reindex(columns=expected_cols).copy()
+        return _apply_data_lockbox(df)
 
 ff5_raw = _safe_load_region("US")
 ff5_win_for_betas = ff5_raw.tail(FF5_BETA_WINDOW_DAYS)
@@ -5419,6 +5495,178 @@ def make_trade_plan(
 
     residual_cash = float(df["Cash Flow (AUD)"].sum())
     return df, residual_cash
+
+
+class SanityViolation(Exception):
+    """Raised when a trade plan fails structural sanity checks. Halts
+    the engine BEFORE PPT generation, exec log writes, or state file
+    updates — i.e. before any side effects that the corrupted plan
+    could leak into. The violations list is attached for forensic
+    triage in sanity_alerts.jsonl.
+    """
+    def __init__(self, violations: list[dict]):
+        self.violations = violations
+        super().__init__(
+            f"{len(violations)} sanity violation(s) — see sanity_alerts.jsonl"
+        )
+
+
+def _validate_trade_plan_sanity(
+    trade_rec: "pd.DataFrame",
+    portfolio_value_aud: float,
+    *,
+    max_turnover: float = 2.0,
+    max_single_trade_pct: float = 0.20,
+    max_position_multiple: float = 5.0,
+    max_total_volume_multiple: float = 3.0,
+) -> None:
+    """Halt the engine on structurally absurd trade plans.
+
+    Designed to catch silent state-corruption bugs like the 2026-06-26
+    SMH→SOXX phantom-lots incident: the lot book had accumulated 3.4M
+    units of SMH from broken `_update_lots_after_trades` logic,
+    producing a trade plan with $6.3B turnover on a $1M portfolio.
+    The wrapper's [rebal-trigger] verdict was RUN; only TWS being
+    down prevented submission. In a live account that's bankruptcy.
+
+    Four checks, each tunable but defaulting to thresholds that
+    comfortably accommodate the engine's legitimate behavior under
+    PRODUCTION_SLOT_OVERRIDE (typical Σ|Δw| ≈ 1.5-2.0 on first run
+    after triage; <0.5 on subsequent runs) while flagging anything
+    above:
+
+      1. Σ|Δw| ≤ 2.0  — gross turnover bounded
+      2. Single trade ≤ 20% of NAV — no one position dominates
+      3. Current position value ≤ 5× NAV — catches state corruption
+      4. Total trade volume ≤ 3× NAV — caps round-trip churn
+
+    On violation: writes a structured record to sanity_alerts.jsonl,
+    prints a prominent block to stdout, and raises SanityViolation.
+    The caller MUST not catch this exception silently — that defeats
+    the purpose. Let it propagate to the top-level run loop where it
+    aborts the run with a clear error message.
+    """
+    if portfolio_value_aud is None or not np.isfinite(portfolio_value_aud) or portfolio_value_aud <= 0:
+        # Without NAV we cannot validate ratios. Refuse to skip silently —
+        # NAV being missing is itself a bug.
+        print("[sanity] WARNING: portfolio_value_aud invalid — skipping sanity check (this is itself a bug)")
+        return
+    if trade_rec is None or trade_rec.empty:
+        return
+
+    violations: list[dict] = []
+
+    _delta_col = (_trade_delta_col(trade_rec) if "_trade_delta_col" in globals()
+                  else ("Delta Units" if "Delta Units" in trade_rec.columns else None))
+    _last_px_col = "Last Px (AUD)" if "Last Px (AUD)" in trade_rec.columns else None
+    _curr_units_col = "Curr Units" if "Curr Units" in trade_rec.columns else None
+
+    if _delta_col is None or _last_px_col is None:
+        # Can't compute the checks without these. Don't claim sanity if we
+        # haven't actually checked anything.
+        print("[sanity] WARNING: trade_rec missing required columns "
+              f"(delta_col={_delta_col}, last_px_col={_last_px_col}) — skipping check")
+        return
+
+    _delta_units = pd.to_numeric(trade_rec[_delta_col], errors="coerce").fillna(0.0)
+    _last_px = pd.to_numeric(trade_rec[_last_px_col], errors="coerce").fillna(0.0)
+    _delta_value_aud = (_delta_units * _last_px).abs()
+    _trade_pcts = _delta_value_aud / portfolio_value_aud
+
+    # Check 1: Σ|Δw|
+    sum_abs_dw = float(_trade_pcts.sum())
+    if sum_abs_dw > max_turnover:
+        violations.append({
+            "check": "turnover_too_high",
+            "actual": sum_abs_dw,
+            "limit": max_turnover,
+            "msg": (f"Σ|Δw|={sum_abs_dw:.2f} > {max_turnover} — trade plan would rebalance "
+                    f"{sum_abs_dw*100:.0f}% of NAV in one run (limit {max_turnover*100:.0f}%)")
+        })
+
+    # Check 2: any single trade > max_single_trade_pct of NAV
+    worst_trade_pct = float(_trade_pcts.max()) if not _trade_pcts.empty else 0.0
+    if worst_trade_pct > max_single_trade_pct:
+        worst_trade_ticker = str(_trade_pcts.idxmax())
+        worst_trade_dv = float(_delta_value_aud.loc[_trade_pcts.idxmax()])
+        violations.append({
+            "check": "single_trade_too_big",
+            "actual_pct": worst_trade_pct,
+            "limit_pct": max_single_trade_pct,
+            "ticker": worst_trade_ticker,
+            "delta_value_aud": worst_trade_dv,
+            "msg": (f"Trade in {worst_trade_ticker} = ${worst_trade_dv:,.0f} "
+                    f"({worst_trade_pct*100:.1f}% of NAV) > {max_single_trade_pct*100:.0f}% limit")
+        })
+
+    # Check 3: any current position quantity × price > max_position_multiple × NAV
+    if _curr_units_col is not None:
+        _curr_units = pd.to_numeric(trade_rec[_curr_units_col], errors="coerce").fillna(0.0)
+        _curr_value_abs = (_curr_units.abs() * _last_px)
+        max_pos_value = float(_curr_value_abs.max()) if not _curr_value_abs.empty else 0.0
+        max_pos_limit = max_position_multiple * portfolio_value_aud
+        if max_pos_value > max_pos_limit:
+            worst_pos_ticker = str(_curr_value_abs.idxmax())
+            worst_pos_units = float(_curr_units.loc[_curr_value_abs.idxmax()])
+            violations.append({
+                "check": "position_absurd",
+                "actual_value_aud": max_pos_value,
+                "limit_value_aud": max_pos_limit,
+                "ticker": worst_pos_ticker,
+                "units": worst_pos_units,
+                "portfolio_value_aud": float(portfolio_value_aud),
+                "msg": (f"Current position in {worst_pos_ticker} = {worst_pos_units:,.0f} units "
+                        f"(${max_pos_value:,.0f}) > {max_position_multiple}× NAV — "
+                        f"almost certainly state corruption (lot book / holdings / fills log)")
+            })
+
+    # Check 4: total trade volume > max_total_volume_multiple × NAV
+    total_volume = float(_delta_value_aud.sum())
+    total_volume_limit = max_total_volume_multiple * portfolio_value_aud
+    if total_volume > total_volume_limit:
+        violations.append({
+            "check": "total_volume_too_high",
+            "actual_aud": total_volume,
+            "limit_aud": total_volume_limit,
+            "msg": (f"Total trade volume ${total_volume:,.0f} > "
+                    f"{max_total_volume_multiple}× NAV (${total_volume_limit:,.0f})")
+        })
+
+    if not violations:
+        return
+
+    # Persist forensic record before raising — survival of the alert
+    # matters more than survival of the run.
+    try:
+        _alert_path = APP_DIR / "sanity_alerts.jsonl"
+        _alert = {
+            "timestamp": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "portfolio_value_aud": float(portfolio_value_aud),
+            "n_trades": int((_delta_units != 0).sum()),
+            "violations": violations,
+        }
+        with _alert_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(_alert) + "\n")
+    except Exception as _e_alert:
+        print(f"[sanity] failed to write alert log: {_e_alert}")
+
+    # Loud, structured stdout output so the user sees the problem
+    # immediately and the daily_auto toast surfaces it.
+    _bar = "=" * 88
+    print()
+    print(_bar)
+    print("[SANITY VIOLATION] Trade plan rejected — engine halting before any side effects")
+    print(_bar)
+    for v in violations:
+        print(f"  • {v['msg']}")
+    print(_bar)
+    print(f"  NAV: ${portfolio_value_aud:,.0f}  ·  Alerts logged to: sanity_alerts.jsonl")
+    print(f"  Most likely cause: state corruption in lot book, Holdings, or ibkr_fills_log.")
+    print(f"  Do NOT execute this trade plan. Investigate state files before re-running.")
+    print(_bar)
+    print()
+
+    raise SanityViolation(violations)
 
 
 def append_trade_recommendation_log(
@@ -13080,6 +13328,30 @@ if USE_XLWINGS:
                 errors="ignore",
                 inplace=True
             )
+
+            # === Sanity layer (2026-06-27) =====================================
+            # Halt the engine on structurally absurd trade plans BEFORE any
+            # side effects (recommendation log, PPT, state file, paper exec).
+            # Defends against silent state-corruption bugs like the
+            # 2026-06-26 SMH→SOXX phantom-lots incident — see
+            # _validate_trade_plan_sanity() docstring for thresholds and
+            # the SanityViolation class for the contract.
+            #
+            # Resolve NAV the same way the drift-log block does immediately
+            # below, so the check uses the same number the rest of the run
+            # operates on.
+            if (portfolio_value_override is not None
+                    and np.isfinite(portfolio_value_override)
+                    and portfolio_value_override > 0):
+                _sanity_nav = float(portfolio_value_override)
+            else:
+                _cu_s = pd.to_numeric(trade_rec.get("Curr Units", 0), errors="coerce").fillna(0)
+                _lp_s = pd.to_numeric(trade_rec.get("Last Px (AUD)", 0), errors="coerce").fillna(0)
+                _sanity_nav = float((_cu_s * _lp_s).sum())
+            # Let SanityViolation propagate — top-level run loop will catch
+            # and exit with a clear error. We intentionally do NOT wrap this
+            # in try/except — that would defeat the entire purpose.
+            _validate_trade_plan_sanity(trade_rec, _sanity_nav)
 
             # === Drift tracker (Tier-1 #3): recommendation log =================
             # One JSONL line per run. Foundation for later fill/slippage compare
