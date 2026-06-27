@@ -16061,10 +16061,14 @@ def export_to_ppt(results, trades, charts=None):
                                           f"{h} Sortino", f"{h} MaxDD"])
                 _ncols_sc = len(_header_cells)
                 _nrows_sc = len(_row_labels_sc) + 1
+                # User-specified table geometry (2026-06-27):
+                # position (left, top) = (0.59cm, 11.7cm)
+                # size (width, height) = (24.39cm, 3.56cm)
+                # Font: 8pt bold for every cell.
                 _tbl_shape_sc = scale_slide.shapes.add_table(
                     _nrows_sc, _ncols_sc,
-                    _CmSc(1.4), _CmSc(11.39),
-                    _CmSc(22.6), _CmSc(6.77),
+                    _CmSc(0.59), _CmSc(11.7),
+                    _CmSc(24.39), _CmSc(3.56),
                 )
                 _tbl_sc = _tbl_shape_sc.table
                 for j, h in enumerate(_header_cells):
@@ -16119,6 +16123,17 @@ def export_to_ppt(results, trades, charts=None):
                                 pd.DataFrame())
                 if not _any_mtx.empty:
                     _fill_horizon_block(_spy_row_idx, _any_mtx, "SPY (AUD)")
+
+                # User-specified formatting (2026-06-27): every cell 8pt
+                # bold. Iterate all rows × cols × paragraphs × runs so
+                # both header and data rows pick up the styling.
+                for _ri in range(_nrows_sc):
+                    for _ci in range(_ncols_sc):
+                        _cell = _tbl_sc.cell(_ri, _ci)
+                        for _para in _cell.text_frame.paragraphs:
+                            for _run in _para.runs:
+                                _run.font.size = Pt(8)
+                                _run.font.bold = True
 
                 # Summary print: cumulative return at end of period for
                 # each NAV. Series indexed by date, so we need iloc[-1]
