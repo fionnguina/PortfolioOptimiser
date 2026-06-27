@@ -453,6 +453,34 @@ BROKER_PROFILES = {
         "live_us_min_fee":                6.0,
         "live_us_rate":                   0.0006,
     },
+    "tiger_au": {
+        # Tiger Brokers Australia Pty Ltd. ASIC-regulated AU entity,
+        # OpenAPI via the official `tigeropen` Python SDK.
+        #
+        # FEE FIGURES BELOW ARE BEST-GUESS AGAINST 2026 PUBLISHED RATES
+        # AND MUST BE VERIFIED AGAINST THE USER'S LIVE QUOTE BEFORE ANY
+        # LIVE EXECUTION. See TIGER_AU_VERIFICATION.md for the question
+        # list to pose to Tiger AU support before relying on these.
+        #
+        # If verified, Tiger AU's fees are materially cheaper than both
+        # IBKR Pro AU and Saxo Classic — which would make it the most
+        # attractive broker for a fee-conscious wholesale fund. The
+        # catch is asset-coverage and paper-account terms (both
+        # AU-entity specific and historically tighter than global Tiger).
+        "name":            "Tiger Brokers AU (PROVISIONAL)",
+        # OOS backtest cost model
+        "au_flat_fee_aud":  2.99,   # very low minimum
+        "us_flat_fee_aud":  1.5,    # USD 0.99 ≈ AUD 1.50
+        "au_spread_bps":    4.0,    # retail SOR — tighter than Saxo retail, wider than IBKR Smart
+        "us_spread_bps":    4.0,
+        "fx_spread_bps":    5.0,    # ~50 pip retail FX
+        # Live trade-plan brokerage
+        "live_asx_min_fee":               2.99,
+        "live_asx_rate":                  0.00029,  # 0.029% — Tiger's headline AU rate
+        "live_asx_first_buy_free_thresh": 0.0,
+        "live_us_min_fee":                1.5,
+        "live_us_rate":                   0.0005,   # ~5 bps avg on ETFs (USD 0.0049/share)
+    },
 }
 
 # Switch broker here. BROKER_CONFIG + downstream BROKERAGE follow automatically.
