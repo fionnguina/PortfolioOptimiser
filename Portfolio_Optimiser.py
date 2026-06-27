@@ -5573,6 +5573,21 @@ def _validate_trade_plan_sanity(
     _delta_value_aud = (_delta_units * _last_px).abs()
     _trade_pcts = _delta_value_aud / portfolio_value_aud
 
+    # Ticker resolver — when trade_rec has Security as a column (engine's
+    # actual layout, with a default RangeIndex), `series.idxmax()` returns
+    # the positional integer instead of the ticker name. Caused
+    # 2026-06-27 violation to read "Trade in 7" instead of "Trade in HBRD".
+    # When Security is the index, both paths return the same value.
+    def _ticker_label(idx_val) -> str:
+        try:
+            if "Security" in trade_rec.columns:
+                return str(trade_rec["Security"].iloc[int(idx_val)]
+                          if isinstance(idx_val, (int, np.integer))
+                          else trade_rec.loc[idx_val, "Security"])
+        except Exception:
+            pass
+        return str(idx_val)
+
     # Check 1: Σ|Δw|
     sum_abs_dw = float(_trade_pcts.sum())
     if sum_abs_dw > max_turnover:
@@ -5587,8 +5602,9 @@ def _validate_trade_plan_sanity(
     # Check 2: any single trade > max_single_trade_pct of NAV
     worst_trade_pct = float(_trade_pcts.max()) if not _trade_pcts.empty else 0.0
     if worst_trade_pct > max_single_trade_pct:
-        worst_trade_ticker = str(_trade_pcts.idxmax())
-        worst_trade_dv = float(_delta_value_aud.loc[_trade_pcts.idxmax()])
+        _wt_idx = _trade_pcts.idxmax()
+        worst_trade_ticker = _ticker_label(_wt_idx)
+        worst_trade_dv = float(_delta_value_aud.loc[_wt_idx])
         violations.append({
             "check": "single_trade_too_big",
             "actual_pct": worst_trade_pct,
@@ -5606,8 +5622,9 @@ def _validate_trade_plan_sanity(
         max_pos_value = float(_curr_value_abs.max()) if not _curr_value_abs.empty else 0.0
         max_pos_limit = max_position_multiple * portfolio_value_aud
         if max_pos_value > max_pos_limit:
-            worst_pos_ticker = str(_curr_value_abs.idxmax())
-            worst_pos_units = float(_curr_units.loc[_curr_value_abs.idxmax()])
+            _wp_idx = _curr_value_abs.idxmax()
+            worst_pos_ticker = _ticker_label(_wp_idx)
+            worst_pos_units = float(_curr_units.loc[_wp_idx])
             violations.append({
                 "check": "position_absurd",
                 "actual_value_aud": max_pos_value,
@@ -7525,6 +7542,71 @@ def update_efficient_frontier_chart(
 
 seed_units, seed_include = _read_holdings_seed_from_path(filename, sheet_name="Holdings")
 tilt_seed = _read_tilts_seed_from_path(filename, sheet_name="Tilts")
+
+# Holdings staleness check (2026-06-27). If ibkr_fills_log.jsonl has
+# fills newer than the last engine run that reconciled Holdings, refuse
+# to start — the engine would otherwise compute trades against stale
+# positions. User must run triage_reset_*.py or update Holdings.Units
+# manually before re-running. The check is bypassable via env var
+# HOLDINGS_FRESHNESS_BYPASS=1 for triage runs and dev work.
+try:
+    if not bool(int(os.environ.get("HOLDINGS_FRESHNESS_BYPASS", "0") or "0")):
+        _fills_path_check = APP_DIR / "ibkr_fills_log.jsonl"
+        _holdings_path_check = APP_DIR / "Stock Analysis.xlsm"
+        if _fills_path_check.exists() and _holdings_path_check.exists():
+            # Latest FILLED row's exec_timestamp vs Holdings file mtime.
+            # Holdings is rewritten by every engine run regardless of
+            # reconciliation, so mtime is an UPPER BOUND on last touch
+            # — using it means false-negatives (skipped checks) are
+            # possible but no false-positives (spurious blocks).
+            _latest_fill_ts = None
+            try:
+                with _fills_path_check.open("r", encoding="utf-8") as _f:
+                    for _line in _f:
+                        try:
+                            _r = json.loads(_line.replace("NaN", "null"))
+                            if int(_r.get("qty_filled") or 0) <= 0:
+                                continue
+                            _ts = _r.get("exec_timestamp")
+                            if not _ts:
+                                continue
+                            _ts_parsed = pd.Timestamp(_ts)
+                            if _latest_fill_ts is None or _ts_parsed > _latest_fill_ts:
+                                _latest_fill_ts = _ts_parsed
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            if _latest_fill_ts is not None:
+                _holdings_mtime = pd.Timestamp(_holdings_path_check.stat().st_mtime,
+                                                unit="s", tz=None)
+                # Permit some clock skew. If holdings is at least 5 minutes
+                # older than the latest fill, that's a stale signal.
+                if _latest_fill_ts - _holdings_mtime > pd.Timedelta(minutes=5):
+                    print()
+                    print("=" * 88)
+                    print("[HOLDINGS STALE] Engine refusing to run.")
+                    print("=" * 88)
+                    print(f"  Latest IBKR fill: {_latest_fill_ts}")
+                    print(f"  Holdings mtime:   {_holdings_mtime}")
+                    print(f"  Holdings is older than the latest broker fill.")
+                    print(f"  Run engine against stale positions = trade plan against fiction.")
+                    print()
+                    print("  RESOLUTION:")
+                    print("    1. Reconcile Holdings.Units against your actual IBKR positions")
+                    print("       (open the sheet, update Units column, save)")
+                    print("    2. OR re-run a triage script (triage_reset_*.py) to seed")
+                    print("       Holdings from broker truth")
+                    print("    3. Bypass for triage/dev only: HOLDINGS_FRESHNESS_BYPASS=1")
+                    print("=" * 88)
+                    raise SystemExit(2)
+                else:
+                    print(f"[holdings] freshness OK — latest fill {_latest_fill_ts.date()}, "
+                          f"holdings touched {_holdings_mtime.date()}")
+except SystemExit:
+    raise
+except Exception as _e_fresh:
+    print(f"[holdings] freshness check skipped: {_e_fresh}")
 
 # Ensure MOM exists in the seed and rows are in the canonical order
 if not isinstance(tilt_seed, pd.DataFrame) or tilt_seed.empty:
@@ -14203,7 +14285,26 @@ if USE_XLWINGS:
             
             tgt_units_full = compute_target_units_for_holdings(units, last_px_hold, fx_map_all, w_star, include_flags, portfolio_value_override=portfolio_value_override)
 
-            _write_holdings_sheet(wb, prices, tgt_units_full, include_flags, sheet_name="Holdings", fx_to_aud_map=fx_map_all)
+            # Holdings reconciliation fix (2026-06-27): pass the engine's
+            # CURRENT units, NOT the new target. Writing target back to
+            # Holdings.Units created a self-referential loop where the
+            # engine read its own previous target as next run's "current".
+            # The HBRD=17,122 anomaly on 2026-06-27 originated here:
+            # user's actual paper position was HBRD=2,034 (per 2026-06-26
+            # triage), but successive engine runs each wrote larger
+            # target_units to Holdings until "current" no longer matched
+            # broker reality.
+            #
+            # Holdings.Units is now immutable from the engine's perspective.
+            # User updates it via:
+            #   - triage_reset_*.py for initial seeding
+            #   - manual edit after broker fills
+            #   - (future) ibkr_paper_exec.py --reconcile flag
+            #
+            # Prices / Market Value / Weight still get refreshed here
+            # because those are derivable from current units + current
+            # market data; only Units stays sticky.
+            _write_holdings_sheet(wb, prices, units, include_flags, sheet_name="Holdings", fx_to_aud_map=fx_map_all)
 
             # --- Step 1: Compute current portfolio values ---
             if not trade_rec.empty:
@@ -14345,6 +14446,19 @@ if USE_XLWINGS:
             wb.save()
             wb.close()
 
+    except SanityViolation:
+        # NEVER swallow a sanity violation here. The whole point of the
+        # safety layer is to halt the engine BEFORE side effects ship.
+        # If this catch were broad enough to consume SanityViolation,
+        # the engine would continue past the violation and generate
+        # the PPT / write state / submit orders — exactly the failure
+        # mode the layer exists to prevent. Bug surfaced 2026-06-27:
+        # an Excel COM exception handler was catching SanityViolation
+        # and treating it as "Excel had a hiccup, fall back to CSVs".
+        # The engine then completed the run as if nothing was wrong.
+        # Re-raising here propagates to the top-level handler, which
+        # exits the run cleanly with a clear error.
+        raise
     except Exception as e:
         import traceback as _tb_xl
         print(f"[Excel fallback] xlwings/COM error â†’ exporting CSVs instead: {e}")
