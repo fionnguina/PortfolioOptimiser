@@ -1401,7 +1401,8 @@ def _print_sweep_verdict(eval_result: dict) -> None:
 
 def _append_metrics_snapshot(metrics_table, ensemble_mix_live, w_ensemble_live,
                               tlh_events_n: int = 0, tlh_loss_aud: float = 0.0,
-                              n_executed: int = 0, n_skipped: int = 0) -> None:
+                              n_executed: int = 0, n_skipped: int = 0,
+                              scale_metrics: dict | None = None) -> None:
     """Append a metrics snapshot to metrics_history.jsonl + warn on regressions.
 
     Captures git_sha + build_time + PRODUCTION_* config + 3Y/5Y/10Y Strategy
@@ -1409,6 +1410,15 @@ def _append_metrics_snapshot(metrics_table, ensemble_mix_live, w_ensemble_live,
     snapshot and prints [metrics-warn] lines if 10Y Sharpe regressed by
     ≥0.10, MaxDD deepened by ≥5%, or alpha worsened by ≥1%. Non-fatal —
     purely diagnostic.
+
+    Optional `scale_metrics`: dict keyed by NAV_aud (float) → DataFrame
+    of OOS metrics at that NAV (output of compute_oos_metrics on the
+    scale-sensitivity backtests). When provided, the per-NAV Strategy
+    rows for 3Y/5Y/10Y get nested under a `per_nav_horizons` field so
+    metrics_history.jsonl accumulates a continuous track at every scale
+    in parallel — used for the wholesale-fund pitch evidence narrative
+    (user can answer "what was the Sharpe at $1M six months ago?"
+    without re-running the backtest).
     """
     try:
         if metrics_table is None or metrics_table.empty:
@@ -1469,6 +1479,35 @@ def _append_metrics_snapshot(metrics_table, ensemble_mix_live, w_ensemble_live,
         except Exception:
             pass
 
+        # Optional per-NAV evidence track. Populated when SCALE_SENSITIVITY
+        # is on and the scale-sensitivity sweep ran. Strategy-only (SPY
+        # is NAV-invariant, already captured in horizons[*].spy_*).
+        per_nav_horizons: list[dict] = []
+        if scale_metrics:
+            for _nav, _mtx in scale_metrics.items():
+                if not isinstance(_mtx, pd.DataFrame) or _mtx.empty:
+                    continue
+                _nav_block: dict = {"nav_aud": float(_nav), "horizons": []}
+                for hz in ["3Y", "5Y", "10Y"]:
+                    def _gm(metric_name, hz=hz, _mtx=_mtx):
+                        try:
+                            return float(_mtx.loc[metric_name, (hz, "Strategy")])
+                        except Exception:
+                            return None
+                    _row = {
+                        "horizon": hz,
+                        "strategy_ann_return": _gm("Annualised Return"),
+                        "strategy_sharpe":     _gm("Sharpe Ratio"),
+                        "strategy_sortino":    _gm("Sortino Ratio"),
+                        "strategy_max_drawdown": _gm("Max Drawdown"),
+                        "strategy_alpha_vs_spy": _gm("Alpha vs SPY (ann)"),
+                    }
+                    if not all(v is None for k, v in _row.items() if k != "horizon"):
+                        _nav_block["horizons"].append(_row)
+                if _nav_block["horizons"]:
+                    per_nav_horizons.append(_nav_block)
+            per_nav_horizons.sort(key=lambda b: b["nav_aud"])
+
         snapshot = {
             "timestamp": pd.Timestamp.now().isoformat(timespec="seconds"),
             "git_sha": gsha,
@@ -1487,6 +1526,7 @@ def _append_metrics_snapshot(metrics_table, ensemble_mix_live, w_ensemble_live,
                 "cgt_profile": ACTIVE_CGT_PROFILE,
             },
             "horizons": horizons,
+            "per_nav_horizons": per_nav_horizons,
             "tlh_events": int(tlh_events_n),
             "tlh_loss_realised_aud": float(tlh_loss_aud),
             "n_rebal_executed": int(n_executed),
@@ -12204,6 +12244,10 @@ try:
         tlh_loss_aud=_tlh_loss_for_log,
         n_executed=int(_ens_out_local.get("n_executed", 0)) if isinstance(_ens_out_local, dict) else 0,
         n_skipped=int(_ens_out_local.get("n_skipped", 0)) if isinstance(_ens_out_local, dict) else 0,
+        # When SCALE_SENSITIVITY=1 (default in daily_auto.ps1), the per-NAV
+        # metrics are populated and get logged so metrics_history.jsonl
+        # accumulates a continuous multi-scale evidence track over time.
+        scale_metrics=globals().get("oos_scale_metrics", {}) or None,
     )
 except Exception as _e_metrics:
     print(f"[metrics] snapshot call failed: {_e_metrics}")

@@ -221,6 +221,14 @@ try {
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.WindowStyle = "Hidden"
+    # Hybrid evidence config (2026-06-27): daily scheduled runs auto-
+    # enable SCALE_SENSITIVITY so metrics_history.jsonl accumulates a
+    # continuous track at every NAV ($100k / $250k / $500k / $1M) in
+    # parallel. User decided to skip QuantConnect — the existing engine
+    # at multiple scales is the evidence pipeline for the wholesale-
+    # fund pitch. Interactive runs (without this wrapper) stay fast by
+    # leaving SCALE_SENSITIVITY off unless explicitly enabled.
+    $psi.EnvironmentVariables["SCALE_SENSITIVITY"] = "1"
     $engineProc = [System.Diagnostics.Process]::Start($psi)
 } catch {
     Write-Log "Engine launch threw: $($_.Exception.Message)"
