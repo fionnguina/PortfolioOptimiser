@@ -905,6 +905,204 @@ def run_single(start: pd.Timestamp, end: pd.Timestamp, rec_log: Path,
     return state
 
 
+def produce_nav_chart(simulator_label: str = "default",
+                       output_path: Optional[Path] = None) -> Optional[Path]:
+    """Produce a PNG chart of the simulator's NAV time series with
+    rejected-batch dates marked in red. Returns the output path, or
+    None if there's not enough data to plot.
+
+    Read-only: consumes simulator_nav{_label}.jsonl + simulator_sanity{_label}.jsonl,
+    writes simulator_nav_chart{_label}.png. Doesn't modify simulator state.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        print("[chart] matplotlib not available — skipping chart")
+        return None
+
+    paths = audit_paths(simulator_label)
+    nav_path = paths["nav"]
+    sanity_path = paths["sanity"]
+
+    if not nav_path.exists():
+        print(f"[chart] {nav_path.name} missing — run a simulation first")
+        return None
+
+    # Load NAV time series
+    nav_records: list[dict] = []
+    with nav_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                nav_records.append(json.loads(line))
+            except Exception:
+                continue
+    if not nav_records:
+        print(f"[chart] {nav_path.name} is empty")
+        return None
+
+    nav_df = pd.DataFrame(nav_records)
+    nav_df["date"] = pd.to_datetime(nav_df["date"])
+    nav_df = nav_df.sort_values("date")
+
+    # Load sanity rejections (filter to batch_rejected:True)
+    rejected_dates: list[pd.Timestamp] = []
+    if sanity_path.exists():
+        with sanity_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    if r.get("batch_rejected"):
+                        d = r.get("fill_date") or r.get("rec_run_at")
+                        if d:
+                            rejected_dates.append(pd.Timestamp(d))
+                except Exception:
+                    continue
+
+    if output_path is None:
+        suffix = "" if simulator_label == "default" else f"_{simulator_label}"
+        output_path = APP_DIR / f"simulator_nav_chart{suffix}.png"
+
+    fig, ax = plt.subplots(figsize=(11.5, 5))
+    ax.plot(nav_df["date"], nav_df["nav_aud"], linewidth=1.6,
+            label=f"Simulator NAV ({simulator_label})", color="#1f4e8a")
+    ax.fill_between(nav_df["date"], nav_df["nav_aud"], 0,
+                     alpha=0.10, color="#1f4e8a")
+
+    # Vertical lines at rejected batch dates
+    if rejected_dates:
+        for d in rejected_dates:
+            ax.axvline(d, color="#c53030", linewidth=0.8, alpha=0.4)
+        ax.axvline(rejected_dates[0], color="#c53030", linewidth=0.8,
+                    alpha=0.4, label=f"Batch rejected ({len(rejected_dates)} total)")
+
+    # Horizontal line at starting NAV for reference
+    starting_nav = float(nav_df["nav_aud"].iloc[0])
+    ax.axhline(starting_nav, color="#888888", linewidth=0.8,
+                linestyle=":", alpha=0.7,
+                label=f"Starting NAV: ${starting_nav:,.0f}")
+
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(
+        lambda x, _p: f"${x/1000:,.0f}k"))
+    ax.set_title(
+        f"Simulator NAV — {simulator_label}    "
+        f"({nav_df['date'].min().date()} → {nav_df['date'].max().date()}; "
+        f"{len(nav_df)} snapshots, {len(rejected_dates)} batches rejected)",
+        fontsize=10,
+    )
+    ax.set_ylabel("NAV (AUD)")
+    ax.set_xlabel("Date")
+    ax.legend(loc="upper left", frameon=False, fontsize=8)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[chart] wrote {output_path.name}")
+    return output_path
+
+
+def compare_to_metrics_history(simulator_label: str = "default",
+                                 metrics_path: Optional[Path] = None) -> None:
+    """Cross-check: align simulator NAV against the engine's
+    metrics_history.jsonl expected NAV per snapshot date. Engine
+    records `expected_brokerage_aud`, regime mix, 10Y annualised
+    return, etc. — we derive an "expected NAV" by compounding the
+    annualised return from snapshot to today and comparing.
+
+    Note: this is approximate. Engine's metrics_history captures
+    BACKTEST stats, not forward NAV. True forward divergence requires
+    live broker NAV via --compare. This mode is a sanity-check that
+    the engine's reported metrics are at least directionally
+    consistent with the simulator's forward walk."""
+    sim_paths = audit_paths(simulator_label)
+    nav_path = sim_paths["nav"]
+    if not nav_path.exists():
+        print(f"[vs-metrics] {nav_path.name} missing — run a sim first")
+        return
+    if metrics_path is None:
+        metrics_path = APP_DIR / "metrics_history.jsonl"
+    if not metrics_path.exists():
+        print(f"[vs-metrics] {metrics_path.name} missing — engine hasn't logged")
+        return
+
+    # Read simulator NAV per day (last snapshot per date)
+    sim_recs = []
+    with nav_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                sim_recs.append(json.loads(line.strip()))
+            except Exception:
+                continue
+    if not sim_recs:
+        print(f"[vs-metrics] sim NAV log empty")
+        return
+    sim_df = pd.DataFrame(sim_recs)
+    sim_df["date"] = pd.to_datetime(sim_df["date"]).dt.date
+    sim_daily = sim_df.groupby("date")["nav_aud"].last()
+
+    # Read engine snapshots
+    eng_recs = []
+    with metrics_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                eng_recs.append(json.loads(line.strip()))
+            except Exception:
+                continue
+    if not eng_recs:
+        print(f"[vs-metrics] metrics_history log empty")
+        return
+
+    # For each engine snapshot, extract 10Y annualised return + timestamp
+    # and project the implied NAV trajectory forward.
+    eng_points: list[tuple] = []
+    for r in eng_recs:
+        try:
+            ts = pd.Timestamp(r["timestamp"]).date()
+            horizons = r.get("horizons", [])
+            tenY = next((h for h in horizons
+                          if h.get("horizon") == "10Y"), None)
+            if tenY is None:
+                continue
+            ann_ret = tenY.get("strategy_ann_return")
+            if ann_ret is None:
+                continue
+            eng_points.append((ts, float(ann_ret)))
+        except Exception:
+            continue
+
+    if not eng_points:
+        print(f"[vs-metrics] no 10Y Strategy points in metrics_history")
+        return
+
+    print(f"[vs-metrics] {len(eng_points)} engine snapshots, "
+          f"{len(sim_daily)} simulator NAV days")
+    print(f"  Sim NAV: ${sim_daily.iloc[0]:,.0f} (first) → "
+          f"${sim_daily.iloc[-1]:,.0f} (last) over "
+          f"{(sim_daily.index[-1] - sim_daily.index[0]).days} days")
+    sim_days = (sim_daily.index[-1] - sim_daily.index[0]).days
+    if sim_days > 0:
+        sim_implied_ann = ((sim_daily.iloc[-1] / sim_daily.iloc[0])
+                            ** (365.0 / sim_days) - 1.0)
+        print(f"  Sim implied annualised: {sim_implied_ann*100:+.2f}%")
+    print(f"  Engine 10Y Strategy ann return (latest snapshot): "
+          f"{eng_points[-1][1]*100:+.2f}% @ {eng_points[-1][0]}")
+    diff = (sim_implied_ann - eng_points[-1][1]
+            if sim_days > 0 else 0.0)
+    print(f"  Divergence: {diff*100:+.2f} pp  "
+          f"({'OK — within 5 pp' if abs(diff) < 0.05 else 'INVESTIGATE'})")
+
+
 def compare_to_live_nav(simulator_label: str = "default") -> None:
     """Post-hoc comparison: align simulator NAV time series against
     live_nav_history.jsonl (engine drift tracker's actual broker
@@ -1039,6 +1237,14 @@ def main() -> int:
                         help="Post-hoc compare simulator_nav.jsonl vs "
                              "live_nav_history.jsonl. Does not simulate; "
                              "just analyses existing logs.")
+    parser.add_argument("--vs-metrics", action="store_true",
+                        help="Cross-check sim NAV against engine's "
+                             "metrics_history.jsonl 10Y annualised return. "
+                             "Read-only — does not simulate.")
+    parser.add_argument("--chart", action="store_true",
+                        help="After simulation (or alone with --compare), "
+                             "render NAV time-series chart PNG with "
+                             "rejected-batch dates marked.")
     parser.add_argument("--compare-label", default="default",
                         help="Simulator label to compare against (for "
                              "multi-NAV runs you'd pass e.g. '1M')")
@@ -1046,6 +1252,13 @@ def main() -> int:
 
     if args.compare:
         compare_to_live_nav(args.compare_label)
+        if args.chart:
+            produce_nav_chart(args.compare_label)
+        return 0
+    if args.vs_metrics:
+        compare_to_metrics_history(args.compare_label)
+        if args.chart:
+            produce_nav_chart(args.compare_label)
         return 0
 
     if not args.start or not args.end:
@@ -1074,6 +1287,8 @@ def main() -> int:
             print(f"\n=== Multi-NAV run @ ${nav:,.0f} (label={label}) ===")
             state = load_seed(starting_cash_override=nav, label=label)
             state = run_single(start, end, rec_log, state, args.reset)
+            if args.chart:
+                produce_nav_chart(label)
             results.append((nav, state))
 
         # Summary table
@@ -1095,6 +1310,8 @@ def main() -> int:
     # Single-NAV mode
     state = load_seed(starting_cash_override=args.starting_cash, label="default")
     run_single(start, end, rec_log, state, args.reset)
+    if args.chart:
+        produce_nav_chart("default")
     return 0
 
 

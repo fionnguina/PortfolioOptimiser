@@ -302,10 +302,74 @@ if (Test-Path $LogPath) {
 }
 Write-Log "Verdict: $verdict (summed_|dw|=$summedDw, portfolio=$portfolioAud AUD, mode=$mode)"
 
+# --- Run paper simulator forward-walk (Phase 2d, 2026-06-28) ---
+# After the engine completes, replay the entire post-lockbox rec_log
+# through the simulator. This provides:
+#   1. A daily "what would have happened" trace
+#   2. Sanity-layer second opinion on every rec_log entry
+#   3. Visual chart for forensic review
+#   4. Toast warning if sanity layer rejected >0 batches
+# Failure here is non-fatal — the engine's verdict is what matters
+# for the daily ops decision; simulator is diagnostic.
+$simRejected = "?"
+$simFills = "?"
+$simChartPath = $null
+try {
+    $venvPython = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    if (Test-Path $venvPython) {
+        $simExe = $venvPython
+    } else {
+        $simExe = "python"
+    }
+    $simScript = Join-Path $ScriptDir "paper_simulator.py"
+    if (Test-Path $simScript) {
+        # Window: from lockbox date (2026-06-30) to today.
+        # If lockbox is in the future, use today minus 7 days as fallback.
+        $simEnd = (Get-Date).ToString("yyyy-MM-dd")
+        $simStart = "2026-06-30"
+        if ((Get-Date $simStart) -gt (Get-Date)) {
+            $simStart = (Get-Date).AddDays(-7).ToString("yyyy-MM-dd")
+        }
+        Write-Log "Simulator: replaying rec_log from $simStart to $simEnd."
+        $simOut = & $simExe $simScript `
+            --from $simStart --to $simEnd --reset --chart 2>&1
+        # Parse the simulator's terminal output for the summary line:
+        # "[sim:default] done — N fills, M batches rejected, ..."
+        $simOut | Where-Object { $_ -match "batches rejected" } | ForEach-Object {
+            if ($_ -match "(\d+) fills, (\d+) batches rejected") {
+                $simFills = $Matches[1]
+                $simRejected = $Matches[2]
+            }
+        }
+        $candidateChart = Join-Path $ScriptDir "simulator_nav_chart.png"
+        if (Test-Path $candidateChart) {
+            $simChartPath = $candidateChart
+        }
+        Write-Log "Simulator: $simFills fills, $simRejected batches rejected."
+        if ($simRejected -ne "?" -and [int]$simRejected -gt 0) {
+            Write-Log "Simulator FLAG: $simRejected batches were rejected by sanity layer."
+        }
+    } else {
+        Write-Log "Simulator: paper_simulator.py not found at $simScript."
+    }
+} catch {
+    Write-Log "Simulator step threw: $($_.Exception.Message)"
+}
+
 # --- Notification + optional PPT open ---
+# Build a simulator suffix that appears on every toast — if the
+# simulator's sanity layer rejected anything, the user needs to see
+# that before opening the PPT or executing trades.
+$simSuffix = ""
+if ($simRejected -ne "?" -and [int]$simRejected -gt 0) {
+    $simSuffix = "  ⚠ Simulator rejected $simRejected batches — review simulator_sanity.jsonl BEFORE executing."
+} elseif ($simFills -ne "?") {
+    $simSuffix = "  ✓ Simulator: $simFills fills, 0 rejected."
+}
+
 switch ($verdict) {
     "RUN" {
-        $body = "Rebalance ready. summed|Δw|=$summedDw (>= $('{0:F2}' -f (0.03))). Portfolio $portfolioAud AUD. Open PPT to review, then run ibkr_paper_exec.py --execute."
+        $body = "Rebalance ready. summed|Δw|=$summedDw (>= $('{0:F2}' -f (0.03))). Portfolio $portfolioAud AUD. Open PPT to review, then run ibkr_paper_exec.py --execute.$simSuffix"
         Show-Toast -Title "Portfolio Optimiser — REBALANCE READY" -Body $body -Verdict "RUN" | Out-Null
         if ($OpenPptOnRun -and (Test-Path $PptPath)) {
             Start-Process $PptPath
@@ -313,11 +377,11 @@ switch ($verdict) {
         }
     }
     "SKIP" {
-        $body = "No action needed. summed|Δw|=$summedDw (< 0.03 threshold). Portfolio $portfolioAud AUD."
+        $body = "No action needed. summed|Δw|=$summedDw (< 0.03 threshold). Portfolio $portfolioAud AUD.$simSuffix"
         Show-Toast -Title "Portfolio Optimiser — no action" -Body $body -Verdict "SKIP" | Out-Null
     }
     default {
-        $body = "Engine ran but verdict is $verdict. See dist\daily_auto.log + dist\run.log."
+        $body = "Engine ran but verdict is $verdict. See dist\daily_auto.log + dist\run.log.$simSuffix"
         Show-Toast -Title "Portfolio Optimiser — review log" -Body $body -Verdict "UNKNOWN" | Out-Null
     }
 }
