@@ -122,15 +122,35 @@ IBKR_US_RATE = 0.0002       # ~2 bps on ETFs
 # Spread assumption (user's choice 2026-06-27): 5 bps each way
 SPREAD_BPS = 5.0
 
-# Sanity thresholds — copied from main engine 2026-06-27 commit.
-# Loosened single-trade threshold to 80% because legitimate
-# rebalances from concentrated states can have one large trade
-# (HBRD-from-69% example from 2026-06-27). Position-absurd at 5×
-# stays tight because that's the corruption fingerprint.
+# Sanity thresholds — two-tier (% of NAV AND absolute AUD) so large
+# accounts aren't underprotected. The 2026-06-27 multi-NAV smoke test
+# revealed that percentage-only thresholds let bigger absolute-dollar
+# trades through at large NAVs — the same buggy rec_log window that
+# blocked 100% of trades at $100k NAV blocked only 41% at $1M because
+# $500k trades looked like 50% of $1M (within limit) vs 200% of $250k
+# (rejected). Absolute caps backstop this.
 SANITY_MAX_TURNOVER = 2.0
 SANITY_MAX_SINGLE_TRADE_PCT = 0.80
 SANITY_MAX_POSITION_MULTIPLE = 5.0
 SANITY_MAX_TOTAL_VOLUME_MULTIPLE = 3.0
+# Absolute AUD caps — calibrated so a $1M account legitimately
+# rebalancing 5% to one ticker ($50k) passes, while the $542k HBRD
+# trade that should have been blocked at $1M (54% of NAV, under the
+# 80% pct limit) actually trips. Configurable per CLI flag.
+SANITY_MAX_SINGLE_TRADE_AUD = 200_000.0
+SANITY_MAX_TOTAL_VOLUME_AUD = 600_000.0
+# AU CGT — long-term holding threshold for 50% discount eligibility
+CGT_LT_THRESHOLD_DAYS = 365
+CGT_LT_DISCOUNT = 0.50
+CGT_MTR = 0.30  # 30% marginal tax rate (user's bracket)
+# Australian financial year ends 30 June.
+def _fy_end_for(date: pd.Timestamp) -> pd.Timestamp:
+    """Return the 30 June that closes the FY containing `date`. e.g.
+    2026-08-15 → 2027-06-30, 2026-05-15 → 2026-06-30."""
+    d = pd.Timestamp(date)
+    if d.month >= 7:
+        return pd.Timestamp(year=d.year + 1, month=6, day=30)
+    return pd.Timestamp(year=d.year, month=6, day=30)
 
 
 # ============================================================================
@@ -270,7 +290,7 @@ def check_fill_batch_sanity(
                     f"turnover {sum_abs_dw*100:.0f}% of NAV in one batch"),
         })
 
-    # Check 2: single trade
+    # Check 2: single trade (% of NAV)
     if worst_trade_pct > SANITY_MAX_SINGLE_TRADE_PCT:
         violations.append({
             "check": "single_trade_too_big",
@@ -281,6 +301,17 @@ def check_fill_batch_sanity(
             "msg": (f"Trade in {worst_trade_ticker} = ${worst_trade_dv:,.0f} "
                     f"({worst_trade_pct*100:.1f}% of NAV) > "
                     f"{SANITY_MAX_SINGLE_TRADE_PCT*100:.0f}% limit"),
+        })
+
+    # Check 2b: single trade (absolute AUD) — backstop for large NAVs
+    if worst_trade_dv > SANITY_MAX_SINGLE_TRADE_AUD:
+        violations.append({
+            "check": "single_trade_abs_too_big",
+            "actual_aud": worst_trade_dv,
+            "limit_aud": SANITY_MAX_SINGLE_TRADE_AUD,
+            "ticker": worst_trade_ticker,
+            "msg": (f"Trade in {worst_trade_ticker} = ${worst_trade_dv:,.0f} "
+                    f"> ${SANITY_MAX_SINGLE_TRADE_AUD:,.0f} absolute cap"),
         })
 
     # Check 3: position absurd (post-fill check, requires lot book)
@@ -309,7 +340,7 @@ def check_fill_batch_sanity(
                     f"state corruption"),
         })
 
-    # Check 4: total volume
+    # Check 4: total volume (% of NAV)
     vol_limit = SANITY_MAX_TOTAL_VOLUME_MULTIPLE * pre_fill_nav_aud
     if total_volume > vol_limit:
         violations.append({
@@ -318,6 +349,16 @@ def check_fill_batch_sanity(
             "limit_aud": vol_limit,
             "msg": (f"Total trade volume ${total_volume:,.0f} > "
                     f"{SANITY_MAX_TOTAL_VOLUME_MULTIPLE}× NAV (${vol_limit:,.0f})"),
+        })
+
+    # Check 4b: total volume (absolute AUD) — backstop for large NAVs
+    if total_volume > SANITY_MAX_TOTAL_VOLUME_AUD:
+        violations.append({
+            "check": "total_volume_abs_too_high",
+            "actual_aud": total_volume,
+            "limit_aud": SANITY_MAX_TOTAL_VOLUME_AUD,
+            "msg": (f"Total trade volume ${total_volume:,.0f} > "
+                    f"${SANITY_MAX_TOTAL_VOLUME_AUD:,.0f} absolute cap"),
         })
 
     return violations
@@ -469,6 +510,21 @@ class SimulatorState:
     sanity_violations_count: int = 0
     batches_rejected: int = 0
     label: str = "default"   # used by multi-NAV mode to suffix audit files
+    tlh_swaps_applied: int = 0
+    tlh_loss_realised_aud: float = 0.0
+    # AU CGT financial-year buckets — accumulate gains/losses since the
+    # last FY-end settle. At each FY crossover we net st vs lt, apply
+    # the LT 50% discount, charge tax to cash, and carry forward any
+    # net loss to next FY (per AU CGT rules).
+    fy_buckets: dict[str, float] = field(default_factory=lambda: {
+        "st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0,
+    })
+    carried_losses: dict[str, float] = field(default_factory=lambda: {
+        "st_loss": 0.0, "lt_loss": 0.0,
+    })
+    current_fy_end: Optional[pd.Timestamp] = None
+    cgt_tax_paid_aud: float = 0.0
+    cgt_settles_count: int = 0
 
 
 def load_seed(seed_path: Path = SEED_PATH,
@@ -533,6 +589,85 @@ def load_rec_log_window(rec_log: Path, start: pd.Timestamp,
     return out
 
 
+def settle_fy_if_crossed(state: SimulatorState, fill_date: pd.Timestamp,
+                          paths: dict[str, Path]) -> None:
+    """If `fill_date` is in a different financial year than the FY we've
+    been accumulating buckets for, settle the prior FY's net taxable
+    position now: net st gains vs st losses, net lt vs lt, apply LT
+    discount, charge tax to cash, carry forward any net loss. Writes
+    an audit entry to the sanity log (overloaded for any forensic
+    event, not just sanity violations).
+
+    Standard AU CGT rules per ATO TR 95/35 + s102-5 ITAA 1997:
+      - Capital losses net first within ST and LT separately
+      - Net ST loss can offset against ST gains in current FY
+      - Net LT loss can offset against LT gains in current FY
+      - Excess loss carries forward to subsequent FY (no expiry)
+      - 50% LT discount applied AFTER net LT gain is calculated
+      - Tax = (net_st_gain + net_lt_gain × (1 - LT_DISCOUNT)) × MTR
+    """
+    new_fy_end = _fy_end_for(fill_date)
+    if state.current_fy_end is None:
+        state.current_fy_end = new_fy_end
+        return
+    if new_fy_end <= state.current_fy_end:
+        return
+
+    # New FY crossed — settle the prior one.
+    b = state.fy_buckets
+    # Apply carried-forward losses BEFORE netting current-year buckets,
+    # because carry-fwd losses can offset against this year's gains.
+    st_loss_available = b["st_loss"] + state.carried_losses["st_loss"]
+    lt_loss_available = b["lt_loss"] + state.carried_losses["lt_loss"]
+
+    net_st_gain = b["st_gain"] - st_loss_available
+    net_lt_gain = b["lt_gain"] - lt_loss_available
+
+    # Carry-forward calculation
+    new_carry_st = 0.0
+    new_carry_lt = 0.0
+    if net_st_gain < 0:
+        new_carry_st = -net_st_gain
+        net_st_gain = 0.0
+    if net_lt_gain < 0:
+        new_carry_lt = -net_lt_gain
+        net_lt_gain = 0.0
+
+    # LT discount applies to LT NET gain only
+    discounted_lt_gain = net_lt_gain * (1.0 - CGT_LT_DISCOUNT)
+    taxable_income = net_st_gain + discounted_lt_gain
+    tax_due = max(0.0, taxable_income * CGT_MTR)
+
+    state.cash_aud -= tax_due
+    state.cgt_tax_paid_aud += tax_due
+    state.cgt_settles_count += 1
+    state.carried_losses = {"st_loss": new_carry_st, "lt_loss": new_carry_lt}
+    state.fy_buckets = {"st_gain": 0.0, "lt_gain": 0.0,
+                         "st_loss": 0.0, "lt_loss": 0.0}
+
+    # Audit entry — FY settlement is the kind of thing you want a
+    # forensic trail of even when nothing went wrong.
+    settle_audit = {
+        "label": state.label,
+        "event": "fy_settle",
+        "fy_end": state.current_fy_end.isoformat(),
+        "net_st_gain_after_carry": net_st_gain,
+        "net_lt_gain_after_carry": net_lt_gain,
+        "discounted_lt_gain": discounted_lt_gain,
+        "taxable_income": taxable_income,
+        "tax_due_aud": tax_due,
+        "cash_aud_after": state.cash_aud,
+        "carry_fwd_st": new_carry_st,
+        "carry_fwd_lt": new_carry_lt,
+    }
+    with paths["sanity"].open("a", encoding="utf-8") as f:
+        f.write(json.dumps(settle_audit) + "\n")
+    print(f"[sim:{state.label}] FY-end {state.current_fy_end.date()} settled: "
+          f"tax=${tax_due:,.0f}, carry_fwd=${new_carry_st+new_carry_lt:,.0f}")
+
+    state.current_fy_end = new_fy_end
+
+
 def apply_recommendation(rec: dict, state: SimulatorState,
                           paths: dict[str, Path]) -> None:
     """Apply one rec_log entry's recommended_trades to state.
@@ -542,12 +677,18 @@ def apply_recommendation(rec: dict, state: SimulatorState,
     (Phase 2b)."""
     rec_date = pd.Timestamp(rec.get("run_at"))
     rec_trades = rec.get("recommended_trades", []) or []
-    if not rec_trades:
+    tlh_swaps = rec.get("tlh_swaps", []) or []
+    if not rec_trades and not tlh_swaps:
         return
+
+    # FY-end check BEFORE any new fills — if the new fill date falls in
+    # the next FY, we need to settle the prior FY first so this batch's
+    # gains don't leak across the boundary.
+    fill_date = rec_date + timedelta(days=1)
+    settle_fy_if_crossed(state, fill_date, paths)
 
     # Resolve fill prices for each trade at next-day open.
     fills: list[dict] = []
-    fill_date = rec_date + timedelta(days=1)
     for trade in rec_trades:
         ticker = str(trade.get("ticker", "")).strip()
         side = str(trade.get("side", "")).lower()
@@ -574,6 +715,59 @@ def apply_recommendation(rec: dict, state: SimulatorState,
             "trade_value_aud": trade_value,
             "brokerage_aud": brokerage,
             "fill_date": fill_date.isoformat(),
+            "kind": "rebalance",
+        })
+
+    # TLH swaps (engine emits these alongside rebalance trades — sell
+    # ticker_sold, buy ticker_bought at same dollar value to harvest
+    # the unrealised loss). We append them to the fill batch so the
+    # sanity layer sees the COMBINED set. TLH-only swaps net to zero
+    # in turnover, so they shouldn't trip Σ|Δw|.
+    for swap in tlh_swaps:
+        sold = str(swap.get("ticker_sold", "")).strip()
+        bought = str(swap.get("ticker_bought", "")).strip()
+        units_sold = int(swap.get("units_sold", 0) or 0)
+        units_bought = int(swap.get("units_bought", 0) or 0)
+        sale_price = float(swap.get("sale_price", 0) or 0)
+        buy_price = float(swap.get("buy_price", 0) or 0)
+        if not sold or not bought or units_sold <= 0 or units_bought <= 0:
+            continue
+
+        # Resolve actual fill prices via yfinance (engine's planned px
+        # is from earlier in the day; market may have moved). Fall back
+        # to engine's planned price.
+        sale_mid = get_open_price(sold, fill_date)
+        if sale_mid is None or sale_mid <= 0:
+            sale_mid = sale_price
+        buy_mid = get_open_price(bought, fill_date)
+        if buy_mid is None or buy_mid <= 0:
+            buy_mid = buy_price
+        sale_fill = apply_spread("sell", sale_mid) if sale_mid > 0 else sale_price
+        buy_fill = apply_spread("buy", buy_mid) if buy_mid > 0 else buy_price
+
+        fills.append({
+            "ticker": sold,
+            "side": "sell",
+            "qty": units_sold,
+            "price": sale_fill,
+            "mid_price": sale_mid,
+            "trade_value_aud": units_sold * sale_fill,
+            "brokerage_aud": estimate_brokerage_aud(sold, units_sold * sale_fill),
+            "fill_date": fill_date.isoformat(),
+            "kind": "tlh_sell",
+            "tlh_pair": bought,
+        })
+        fills.append({
+            "ticker": bought,
+            "side": "buy",
+            "qty": units_bought,
+            "price": buy_fill,
+            "mid_price": buy_mid,
+            "trade_value_aud": units_bought * buy_fill,
+            "brokerage_aud": estimate_brokerage_aud(bought, units_bought * buy_fill),
+            "fill_date": fill_date.isoformat(),
+            "kind": "tlh_buy",
+            "tlh_pair": sold,
         })
 
     # Sanity check on the batch BEFORE applying. Phase 2b: violations
@@ -603,7 +797,7 @@ def apply_recommendation(rec: dict, state: SimulatorState,
               f"{len(violations)} sanity violations — see {paths['sanity'].name}")
         return  # do not apply any of this batch's fills
 
-    # Apply fills to lot book + cash
+    # Apply fills to lot book + cash, and accumulate FY-bucket gains/losses
     for f in fills:
         ticker = f["ticker"]
         side = f["side"]
@@ -613,12 +807,26 @@ def apply_recommendation(rec: dict, state: SimulatorState,
             state.lot_book.buy(ticker, qty, fill_date, px)
             state.cash_aud -= qty * px + f["brokerage_aud"]
         elif side == "sell":
-            sale = state.lot_book.sell(ticker, qty, fill_date, px)
+            sale = state.lot_book.sell(ticker, qty, fill_date, px,
+                                        lt_threshold_days=CGT_LT_THRESHOLD_DAYS)
             state.cash_aud += qty * px - f["brokerage_aud"]
             f["realised_gain_aud"] = sum(
                 m["realised_gain"] for m in sale.get("matched_lots", [])
             )
             f["lots_matched"] = len(sale.get("matched_lots", []))
+            # Accumulate gain/loss components into FY buckets so the
+            # next FY-end settle can net + tax.
+            state.fy_buckets["st_gain"] += sale.get("st_gain", 0.0)
+            state.fy_buckets["lt_gain"] += sale.get("lt_gain", 0.0)
+            state.fy_buckets["st_loss"] += sale.get("st_loss", 0.0)
+            state.fy_buckets["lt_loss"] += sale.get("lt_loss", 0.0)
+            # TLH-specific accounting: if this was a tlh_sell fill,
+            # the loss it realised is engine-attributed TLH harvest.
+            if f.get("kind") == "tlh_sell":
+                _loss_aud = (sale.get("st_loss", 0.0)
+                             + sale.get("lt_loss", 0.0))
+                state.tlh_loss_realised_aud += _loss_aud
+                state.tlh_swaps_applied += 1
         state.fills_count += 1
 
         # Append audit entry per fill
@@ -689,6 +897,10 @@ def run_single(start: pd.Timestamp, end: pd.Timestamp, rec_log: Path,
     print(f"[sim:{state.label}] done — {state.fills_count} fills, "
           f"{state.batches_rejected} batches rejected, "
           f"{state.sanity_violations_count} violations, "
+          f"{state.tlh_swaps_applied} TLH swaps "
+          f"(${state.tlh_loss_realised_aud:,.0f} loss realised), "
+          f"{state.cgt_settles_count} FY settles "
+          f"(${state.cgt_tax_paid_aud:,.0f} tax paid), "
           f"final cash ${state.cash_aud:,.0f}")
     return state
 
@@ -771,6 +983,35 @@ def compare_to_live_nav(simulator_label: str = "default") -> None:
     print()
     print(joined.tail(10).to_string())
 
+    # Divergence alerts — if any day's |pct_diff| exceeds threshold,
+    # write an append-only alert file so a nightly cron / health
+    # check can detect quietly-growing divergence over time. Sim ≠
+    # live broker NAV is itself a bug signal — one of three things
+    # is wrong (engine logic, simulator logic, or the broker is doing
+    # something the engine didn't expect like rejected orders).
+    DIVERGENCE_THRESHOLD = 0.05  # 5%
+    bad_days = joined[joined["pct_diff"].abs() > DIVERGENCE_THRESHOLD]
+    if not bad_days.empty:
+        alert_path = APP_DIR / "simulator_divergence_alert.jsonl"
+        with alert_path.open("a", encoding="utf-8") as f:
+            for date, row in bad_days.iterrows():
+                f.write(json.dumps({
+                    "alert_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+                    "simulator_label": simulator_label,
+                    "date": str(date),
+                    "sim_nav_aud": float(row["sim"]),
+                    "live_nav_aud": float(row["live"]),
+                    "diff_aud": float(row["diff"]),
+                    "pct_diff": float(row["pct_diff"]),
+                    "threshold_pct": DIVERGENCE_THRESHOLD,
+                }) + "\n")
+        print()
+        print(f"[compare] DIVERGENCE ALERTS: {len(bad_days)} day(s) exceeded "
+              f"±{DIVERGENCE_THRESHOLD*100:.0f}% — see {alert_path.name}")
+    else:
+        print()
+        print(f"[compare] no day exceeded ±{DIVERGENCE_THRESHOLD*100:.0f}% threshold — clean")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -837,15 +1078,18 @@ def main() -> int:
 
         # Summary table
         print()
-        print("=" * 88)
+        print("=" * 110)
         print("Multi-NAV summary")
-        print("=" * 88)
-        print(f"{'NAV':>12}  {'Final Cash':>14}  {'Fills':>6}  {'Rejected':>9}  {'Violations':>11}")
+        print("=" * 110)
+        print(f"{'NAV':>12}  {'Final Cash':>14}  {'Fills':>6}  {'Rej':>4}  "
+              f"{'Viol':>5}  {'TLH':>4}  {'TLH Loss':>11}  {'FY':>3}  {'Tax':>10}")
         for nav, st in results:
             print(f"  ${nav:>10,.0f}  ${st.cash_aud:>13,.0f}  "
-                  f"{st.fills_count:>6}  {st.batches_rejected:>9}  "
-                  f"{st.sanity_violations_count:>11}")
-        print("=" * 88)
+                  f"{st.fills_count:>6}  {st.batches_rejected:>4}  "
+                  f"{st.sanity_violations_count:>5}  {st.tlh_swaps_applied:>4}  "
+                  f"${st.tlh_loss_realised_aud:>10,.0f}  "
+                  f"{st.cgt_settles_count:>3}  ${st.cgt_tax_paid_aud:>9,.0f}")
+        print("=" * 110)
         return 0
 
     # Single-NAV mode
