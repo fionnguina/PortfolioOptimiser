@@ -282,12 +282,35 @@ if ($sentinelHit -and $engineExit -ne $null) {
     Write-Log "Engine TIMEOUT after $($EngineDuration.TotalSeconds.ToString('F1'))s — proceeding with partial log."
 }
 
+# --- Check engine_done.flag for status (2026-06-28) ---
+# Main.py writes a status-aware sentinel. If the engine halted due to
+# a sanity violation, the flag content has status=halted_by_sanity_violation
+# and we surface that prominently instead of treating "UNKNOWN verdict"
+# as just a log-parse failure.
+$engineHalted = $false
+$haltReason = ""
+if (Test-Path $FlagPath) {
+    try {
+        $flagJson = Get-Content -Path $FlagPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($flagJson.status -eq "halted_by_sanity_violation") {
+            $engineHalted = $true
+            $haltReason = $flagJson.reason
+            Write-Log "Engine reported HALTED_BY_SANITY_VIOLATION: $haltReason"
+        }
+    } catch {
+        # Flag is non-JSON (older version) or partial — ignore, fall back
+        # to verdict parsing below.
+    }
+}
+
 # --- Parse [rebal-trigger] verdict from run.log ---
 $verdict = "UNKNOWN"
 $summedDw = "?"
 $portfolioAud = "?"
 $mode = "?"
-if (Test-Path $LogPath) {
+if ($engineHalted) {
+    $verdict = "HALTED"
+} elseif (Test-Path $LogPath) {
     $verdictLine = Select-String -Path $LogPath -Pattern "\[rebal-trigger\]" -ErrorAction SilentlyContinue |
         Select-Object -Last 1
     if ($verdictLine) {
@@ -314,6 +337,9 @@ Write-Log "Verdict: $verdict (summed_|dw|=$summedDw, portfolio=$portfolioAud AUD
 $simRejected = "?"
 $simFills = "?"
 $simChartPath = $null
+if ($engineHalted) {
+    Write-Log "Simulator: skipped (engine halted by sanity layer — no new rec_log entry to replay)."
+} else {
 try {
     $venvPython = Join-Path $ScriptDir ".venv\Scripts\python.exe"
     if (Test-Path $venvPython) {
@@ -355,6 +381,7 @@ try {
 } catch {
     Write-Log "Simulator step threw: $($_.Exception.Message)"
 }
+}  # end if -not $engineHalted
 
 # --- Notification + optional PPT open ---
 # Build a simulator suffix that appears on every toast — if the
@@ -379,6 +406,14 @@ switch ($verdict) {
     "SKIP" {
         $body = "No action needed. summed|Δw|=$summedDw (< 0.03 threshold). Portfolio $portfolioAud AUD.$simSuffix"
         Show-Toast -Title "Portfolio Optimiser — no action" -Body $body -Verdict "SKIP" | Out-Null
+    }
+    "HALTED" {
+        # Sanity layer fired — engine refused to ship a trade plan. The
+        # user MUST triage state before re-running. Likely cause: stale
+        # Holdings (run triage_reset_*.py), lot-book corruption, or a
+        # genuine engine bug. DO NOT execute any pending trade plan.
+        $body = "ENGINE HALTED BY SANITY LAYER. Reason: $haltReason. See sanity_alerts.jsonl. DO NOT execute trades — investigate state before re-running."
+        Show-Toast -Title "Portfolio Optimiser — ⚠ HALTED" -Body $body -Verdict "ERROR" | Out-Null
     }
     default {
         $body = "Engine ran but verdict is $verdict. See dist\daily_auto.log + dist\run.log.$simSuffix"

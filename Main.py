@@ -134,8 +134,47 @@ def main():
         spec = importlib.util.spec_from_file_location("__main__", script_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-    except Exception:
-        # Make sure the traceback lands in the log even if the GUI swallows it.
+    except Exception as _exc:
+        # SanityViolation is a deliberate halt by the safety layer; it
+        # should NOT surface as a PyInstaller "unhandled exception"
+        # dialog (blocks interactively, no clean exit, scheduled task
+        # has no way to recover). Detect by class name so we don't
+        # need to import SanityViolation here (the import that defines
+        # it just failed). On halt:
+        #   1. Log the violation summary to stdout (lands in run.log via tee)
+        #   2. Write engine_done.flag with status:halted_by_sanity_violation
+        #      so daily_auto.ps1 can detect and surface in the toast
+        #   3. exit(2) — NO re-raise, NO dialog
+        _exc_class_name = type(_exc).__name__
+        if _exc_class_name == "SanityViolation":
+            print()
+            print("=" * 88)
+            print("[Main] Engine halted by sanity layer — no side effects shipped")
+            print(f"[Main] Reason: {_exc}")
+            print("[Main] See sanity_alerts.jsonl for forensic detail")
+            print("[Main] Most likely cause: stale Holdings (run triage_reset),")
+            print("[Main] state corruption, or genuine engine bug.")
+            print("=" * 88)
+            # Drop a status-aware sentinel so the wrapper picks up the halt
+            try:
+                import json as _json_halt
+                from datetime import datetime as _dt_halt
+                base_dir = (os.path.dirname(sys.executable)
+                             if getattr(sys, "frozen", False)
+                             else os.path.dirname(os.path.abspath(__file__)))
+                _flag_path = os.path.join(base_dir, "engine_done.flag")
+                with open(_flag_path, "w", encoding="utf-8") as _fh:
+                    _json_halt.dump({
+                        "finished_at": _dt_halt.now().isoformat(timespec="seconds"),
+                        "status": "halted_by_sanity_violation",
+                        "reason": str(_exc),
+                    }, _fh)
+            except Exception:
+                pass
+            sys.exit(2)
+        # Any other exception — make sure the traceback lands in the log
+        # even if the GUI swallows it, then re-raise (PyInstaller dialog
+        # surfaces it for the user to triage).
         import traceback
         traceback.print_exc()
         raise
