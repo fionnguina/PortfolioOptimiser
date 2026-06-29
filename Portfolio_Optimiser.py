@@ -212,6 +212,14 @@ if _AUTO_PIPELINE_MODE:
 _TILTED_ENSEMBLE_TEST_MODE = "--tilted-ensemble-test" in sys.argv
 if _TILTED_ENSEMBLE_TEST_MODE:
     print("[tilted-ens] --tilted-ensemble-test detected; will skip dialog + live pipeline")
+# OOS kernel mode (Phase 3b, 2026-06-29) — workers spawned by the parallel
+# scale-sensitivity loop set OOS_KERNEL_MODE=1 so this re-exec only loads
+# imports + function defs, then sys.exits at the sentinel near the OOS
+# function. Folded into _SKIP_LIVE_PIPELINE so workers bypass the holdings
+# dialog (otherwise each worker pops its own Tk window before reaching the
+# sentinel — see screenshot from 2026-06-29). Full definition + comment
+# block lives below near line 2386.
+OOS_KERNEL_MODE = bool(os.environ.get("OOS_KERNEL_MODE", "").strip())
 # All diagnostic modes follow the same skip-everything-heavy path.
 _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
@@ -223,7 +231,8 @@ _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _SHOW_METRICS_HISTORY_MODE
                        or _FACTOR_RECS_MODE
                        or _TILTED_ENSEMBLE_TEST_MODE
-                       or _PREFLIGHT_MODE)
+                       or _PREFLIGHT_MODE
+                       or OOS_KERNEL_MODE)
 
 
 # =====================================================================
@@ -2376,6 +2385,17 @@ except Exception:
     SCALE_SENSITIVITY_NAVS = [100_000.0, 250_000.0, 500_000.0, 1_000_000.0]
 OPEN_AFTER_SAVE = CFG.get("open_after_save", True)
 USE_XLWINGS = CFG.get("use_xlwings", True)
+# OOS kernel mode (Phase 3b, 2026-06-29) — when subprocess workers want
+# to import the engine PURELY to grab run_oos_ensemble_walk_forward and
+# its dependencies, set OOS_KERNEL_MODE=1. The script will exec all
+# imports + config + function definitions, then sys.exit(0) right after
+# the OOS function is defined. Workers catch the SystemExit, get the
+# fully-built module namespace, and call the function. Avoids the
+# full pipeline (dialog, OOS execution, PPT/Excel write).
+# NOTE: the flag itself is read early (near _SKIP_LIVE_PIPELINE around
+# line 215) so workers bypass the holdings dialog. Re-reading here would
+# clobber the early read if env changed — left as a no-op assert instead.
+assert OOS_KERNEL_MODE == bool(os.environ.get("OOS_KERNEL_MODE", "").strip())
 
 # === STRICT DATA LOCKBOX (2026-06-27 — user directive) ====================
 # All decision-making data must end at DATA_LOCKBOX_DATE so the engine is
@@ -8916,6 +8936,22 @@ def run_oos_ensemble_walk_forward(
     }
 
 
+# --- OOS kernel mode early-exit (Phase 3b, 2026-06-29) ---
+# Subprocess workers spawned by the parallel scale-sensitivity loop set
+# OOS_KERNEL_MODE=1 before importing the engine. By the time execution
+# reaches here, all the heavy work needed by run_oos_ensemble_walk_forward
+# is in scope: imports, constants, helper functions (_run_tlh_pass,
+# LotBook, etc.), the OOS function itself, and the cache wrapper. The
+# parent process catches the SystemExit via importlib.exec_module and
+# inspects the partially-imported module namespace to grab the function.
+# Skips: dialog box, live OOS execution, PPT/Excel write — all the
+# "main pipeline" that workers don't need.
+if OOS_KERNEL_MODE:
+    print(f"[oos-kernel] OOS_KERNEL_MODE=1 detected; "
+          f"exiting after function defs to act as a library for worker subprocess")
+    sys.exit(0)
+
+
 # --- OOS metrics helpers (Phase 2) ---
 
 def _series_metrics(ret: pd.Series, rf_annual: float = 0.0) -> dict:
@@ -12396,12 +12432,32 @@ if bool(CFG.get("oos_validation", True)):
                 and abs(ROADSHOW_BASE_NAV - _oos_nav) > 1.0):
                 _existing[float(ROADSHOW_BASE_NAV)] = oos_returns_daily_roadshow
 
+            # Phase 3b parallelism: bucket the NAVs into reuses (instant)
+            # vs cache misses (compute-bound). Cache-miss NAVs are dispatched
+            # to a ProcessPoolExecutor when SCALE_PARALLEL is on (default
+            # on). Each worker subprocess imports the engine in
+            # OOS_KERNEL_MODE=1 (skips main pipeline), grabs the OOS
+            # function, runs it, returns the result via pickle.
+            #
+            # Why we still check cache: cache hits are ~50ms each, no
+            # point spawning a 30s subprocess for them. Only true cache
+            # misses get parallelised.
+            #
+            # Disable via SCALE_PARALLEL=0 (env var) if the worker
+            # subprocess path proves flaky in the frozen exe environment.
+            _scale_parallel = bool(int(os.environ.get(
+                "SCALE_PARALLEL", "1") or "0"))
+            _common_kwargs = dict(
+                train_window_months=24,
+                rebalance=REBALANCE_FREQ,
+                benchmark_ticker="SPY",
+                score_lookback_days=252,
+                lambda_temp=3.0,
+                slot_weights_override=PRODUCTION_SLOT_OVERRIDE,
+                crash_hedge=PRODUCTION_CRASH_HEDGE,
+            )
+            _navs_to_compute: list[float] = []
             for _nav in SCALE_SENSITIVITY_NAVS:
-                # Reuse if an existing backtest matches this NAV within
-                # ±1% (covers the common case where portfolio_state.json
-                # has $250,542 and the requested scale point is $250k —
-                # friction at those NAVs is indistinguishable, no point
-                # spending another ~100s on a duplicate backtest).
                 _tol = max(1.0, 0.01 * _nav)
                 _match = next((k for k in _existing
                                if abs(k - _nav) <= _tol), None)
@@ -12413,28 +12469,154 @@ if bool(CFG.get("oos_validation", True)):
                     }
                     print(f"[scale] @ ${_nav:,.0f}: reused existing backtest")
                     continue
+                _navs_to_compute.append(float(_nav))
+
+            if _navs_to_compute and _scale_parallel and len(_navs_to_compute) > 1:
+                # Parallel path via direct subprocess.Popen (NOT
+                # ProcessPoolExecutor — the latter auto-reimports the
+                # parent script in each worker, which then hits the
+                # OOS_KERNEL_MODE sys.exit and dies before the worker
+                # function can be called).
+                #
+                # Each worker is a standalone `python oos_worker.py
+                # in.pkl out.pkl` invocation. The worker imports
+                # Portfolio_Optimiser in kernel mode, gets the OOS
+                # function, runs it, writes the pickled result. Parent
+                # waits for all subprocesses and reads results.
                 try:
-                    print(f"[scale] running OOS at ${_nav:,.0f}...")
-                    _scale_out = run_oos_ensemble_walk_forward_cached(
-                        oos_prices_aud_long,
-                        train_window_months=24,
-                        rebalance=REBALANCE_FREQ,
-                        benchmark_ticker="SPY",
-                        score_lookback_days=252,
-                        lambda_temp=3.0,
-                        starting_nav_aud=float(_nav),
-                        slot_weights_override=PRODUCTION_SLOT_OVERRIDE,
-                        crash_hedge=PRODUCTION_CRASH_HEDGE,
-                    )
-                    oos_scale_results[float(_nav)] = {
-                        "returns": _scale_out["blended_returns"],
-                        "nav_aud": float(_nav),
-                        "reused": False,
-                    }
-                    print(f"[scale] @ ${_nav:,.0f}: complete, "
-                          f"{len(_scale_out['blended_returns'])} days")
-                except Exception as _e_scale:
-                    print(f"[scale] @ ${_nav:,.0f}: failed — {_e_scale}")
+                    import subprocess as _subp
+                    import pickle as _pickle
+
+                    _max_workers = min(len(_navs_to_compute), 4)
+                    print(f"[scale] dispatching {len(_navs_to_compute)} "
+                          f"OOS workers (subprocess pool, "
+                          f"{_max_workers} concurrent target)...")
+
+                    _stage_dir = APP_DIR / ".cache" / "scale_workers"
+                    _stage_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Build the env for workers — kernel mode on, bypass
+                    # the freshness check (workers don't trade), strip
+                    # SCALE_SENSITIVITY and ROADSHOW_DUAL_NAV so the
+                    # worker doesn't try to re-run those code paths.
+                    _worker_env = os.environ.copy()
+                    _worker_env["OOS_KERNEL_MODE"] = "1"
+                    _worker_env["HOLDINGS_FRESHNESS_BYPASS"] = "1"
+                    _worker_env.pop("SCALE_SENSITIVITY", None)
+                    _worker_env.pop("ROADSHOW_DUAL_NAV", None)
+
+                    _worker_script = str(APP_DIR / "oos_worker.py")
+                    _python_exe = sys.executable
+
+                    # Stage all inputs first
+                    _jobs = []   # (nav, in_path, out_path)
+                    for _nav in _navs_to_compute:
+                        _in_path = _stage_dir / f"in_{int(_nav)}.pkl"
+                        _out_path = _stage_dir / f"out_{int(_nav)}.pkl"
+                        _kw = dict(_common_kwargs)
+                        _kw["starting_nav_aud"] = float(_nav)
+                        with open(_in_path, "wb") as _fp:
+                            _pickle.dump((oos_prices_aud_long, _kw), _fp,
+                                         protocol=_pickle.HIGHEST_PROTOCOL)
+                        _jobs.append((_nav, _in_path, _out_path))
+
+                    # Spawn workers up to _max_workers concurrent. As
+                    # one finishes, start the next. Tracks via a list
+                    # of (Popen, nav, out_path).
+                    _active: list = []
+                    _pending = list(_jobs)
+                    _done = []  # list of (nav, out_path, returncode)
+                    while _pending or _active:
+                        # Fill up to _max_workers
+                        while _pending and len(_active) < _max_workers:
+                            _nav, _in_path, _out_path = _pending.pop(0)
+                            _proc = _subp.Popen(
+                                [_python_exe, _worker_script,
+                                 str(_in_path), str(_out_path)],
+                                env=_worker_env,
+                                stdout=_subp.PIPE,
+                                stderr=_subp.PIPE,
+                            )
+                            _active.append((_proc, _nav, _out_path))
+                        # Poll for finishes — small sleep prevents
+                        # tight loop CPU burn.
+                        import time as _time_pool
+                        _time_pool.sleep(0.5)
+                        _still_active = []
+                        for _proc, _nav, _out_path in _active:
+                            if _proc.poll() is None:
+                                _still_active.append((_proc, _nav, _out_path))
+                            else:
+                                _rc = _proc.returncode
+                                _stderr_out = _proc.stderr.read().decode(
+                                    "utf-8", errors="replace")[:500]
+                                _done.append((_nav, _out_path, _rc, _stderr_out))
+                        _active = _still_active
+
+                    for _nav, _out_path, _rc, _stderr in _done:
+                        if _rc != 0:
+                            print(f"[scale] @ ${_nav:,.0f}: worker exit {_rc}")
+                            if _stderr.strip():
+                                print(f"  stderr: {_stderr.strip()[:200]}")
+                            continue
+                        try:
+                            with open(_out_path, "rb") as _fp:
+                                _scale_out = _pickle.load(_fp)
+                            oos_scale_results[float(_nav)] = {
+                                "returns": _scale_out["blended_returns"],
+                                "nav_aud": float(_nav),
+                                "reused": False,
+                            }
+                            print(f"[scale] @ ${_nav:,.0f}: complete via worker, "
+                                  f"{len(_scale_out['blended_returns'])} days")
+                        except Exception as _e_load:
+                            print(f"[scale] @ ${_nav:,.0f}: result load failed — {_e_load}")
+
+                    for _p in _stage_dir.glob("*.pkl"):
+                        try: _p.unlink()
+                        except Exception: pass
+                except Exception as _e_pool:
+                    import traceback as _tb_pool
+                    print(f"[scale] subprocess pool failed — "
+                          f"falling back to sequential: {type(_e_pool).__name__}: {_e_pool}")
+                    print(_tb_pool.format_exc())
+                    _navs_to_compute_seq = list(_navs_to_compute)
+                    _navs_to_compute = []
+                    for _nav in _navs_to_compute_seq:
+                        try:
+                            print(f"[scale] running OOS at ${_nav:,.0f} (sequential)...")
+                            _scale_out = run_oos_ensemble_walk_forward_cached(
+                                oos_prices_aud_long,
+                                starting_nav_aud=float(_nav),
+                                **_common_kwargs,
+                            )
+                            oos_scale_results[float(_nav)] = {
+                                "returns": _scale_out["blended_returns"],
+                                "nav_aud": float(_nav),
+                                "reused": False,
+                            }
+                        except Exception as _e_seq:
+                            print(f"[scale] @ ${_nav:,.0f} (seq) failed: {_e_seq}")
+            elif _navs_to_compute:
+                # Sequential path: either parallel disabled, or only one
+                # NAV to compute (no point in pool overhead).
+                for _nav in _navs_to_compute:
+                    try:
+                        print(f"[scale] running OOS at ${_nav:,.0f} (sequential)...")
+                        _scale_out = run_oos_ensemble_walk_forward_cached(
+                            oos_prices_aud_long,
+                            starting_nav_aud=float(_nav),
+                            **_common_kwargs,
+                        )
+                        oos_scale_results[float(_nav)] = {
+                            "returns": _scale_out["blended_returns"],
+                            "nav_aud": float(_nav),
+                            "reused": False,
+                        }
+                        print(f"[scale] @ ${_nav:,.0f}: complete, "
+                              f"{len(_scale_out['blended_returns'])} days")
+                    except Exception as _e_scale:
+                        print(f"[scale] @ ${_nav:,.0f}: failed — {_e_scale}")
         globals()["oos_scale_results"] = oos_scale_results
         globals()["_scale_sensitivity_navs"] = list(SCALE_SENSITIVITY_NAVS)
         # Per-candidate returns + softmax history available for downstream
