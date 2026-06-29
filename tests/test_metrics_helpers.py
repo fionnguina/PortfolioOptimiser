@@ -10,18 +10,23 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from conftest import extract_funcs
+# Metrics helpers moved to metrics.py (Phase 4 split, 2026-06-29) — import
+# directly instead of AST-extract.
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+import metrics as _metrics_mod
 
 
 @pytest.fixture(scope="module")
 def metrics():
-    return extract_funcs(
-        "_annualized_sharpe",
-        "_ir_vs_bench",
-        "_series_metrics",
-        "_capm_alpha_beta",
-        extra_consts=("ANNUAL_TRADING_DAYS",),
-    )
+    return {
+        "_annualized_sharpe": _metrics_mod._annualized_sharpe,
+        "_ir_vs_bench":       _metrics_mod._ir_vs_bench,
+        "_series_metrics":    _metrics_mod._series_metrics,
+        "_capm_alpha_beta":   _metrics_mod._capm_alpha_beta,
+        "ANNUAL_TRADING_DAYS": _metrics_mod.ANNUAL_TRADING_DAYS,
+    }
 
 
 def _series(values, start="2020-01-01"):
