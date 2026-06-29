@@ -104,11 +104,6 @@ from cgt import (
     _effective_cgt_rate,
     compute_cgt_for_rebalance,
 )
-from ibkr import (
-    IBKR_DIVERGENCE_WARN_BPS,
-    _ibkr_pick_price,
-    apply_ibkr_price_override,
-)
 from drift import (
     DRIFT_MONTHLY_THRESH,
     DRIFT_CUMULATIVE_THRESH,
@@ -130,6 +125,9 @@ from brokerage import (
     _market_of,
     suppress_small_trades_by_value,
     compute_brokerage,
+    IBKR_DIVERGENCE_WARN_BPS,
+    _ibkr_pick_price,
+    apply_ibkr_price_override,
 )
 from tlh import (
     TLH_ENABLED,

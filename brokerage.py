@@ -1,19 +1,22 @@
-"""Broker fee profiles + transaction-cost computation.
+"""Broker integration: fee profiles, transaction-cost computation, live
+price-snapshot adapters.
 
-Extracted from Portfolio_Optimiser.py for testability + module-split prep.
-Pure functions taking trade_df + module-level constants for fee schedules.
+Single module for everything "broker" because all 5 supported profiles
+(IBKR, CMC, Saxo Classic/Platinum, Tiger) share the same fee-schedule
+shape, and the IBKR-specific live-price helpers belong alongside the
+IBKR fee profile rather than in a sibling file.
 
-Contains:
-  * BROKER_PROFILES — fee schedules for IBKR, CMC, Saxo (Classic/Platinum),
-    Tiger. Each profile has OOS backtest cost params (au/us flat fees +
-    spread bps) AND live trade-plan params (min_fee, rate, first-buy promo).
-  * ACTIVE_BROKER_PROFILE + BROKER_CONFIG — selected profile (canonical here;
-    engine + IBKR scripts import it back).
-  * BROKERAGE — derived dict the live `compute_brokerage` reads. Updates
-    automatically when ACTIVE_BROKER_PROFILE changes (because both are
-    module-level and re-evaluated at import).
-  * MIN_TRADE_VALUE — sub-AUD-11 trades suppressed (round-trip noise).
-  * _market_of, suppress_small_trades_by_value, compute_brokerage.
+Two layers, both testable:
+
+  Fee schedules + cost computation (broker-agnostic):
+    BROKER_PROFILES, ACTIVE_BROKER_PROFILE, BROKER_CONFIG, BROKERAGE
+    MIN_TRADE_VALUE
+    _market_of, suppress_small_trades_by_value, compute_brokerage
+
+  IBKR live integration (vendor-specific; future brokers will add their
+  own section here when their live API lands):
+    IBKR_DIVERGENCE_WARN_BPS
+    _ibkr_pick_price, apply_ibkr_price_override
 
 Cross-module dep: imports `_trade_delta_col`, `_security_from_row` from
 cgt.py (those are the canonical homes for trade-df column lookup).
@@ -21,9 +24,14 @@ cgt.py (those are the canonical homes for trade-df column lookup).
 Used by:
   Portfolio_Optimiser.make_trade_plan, evaluate_transaction_costs,
   Portfolio_Optimiser._log_config_snapshot,
-  ibkr_*.py scripts (read BROKER_CONFIG for the live fee schedule).
+  Portfolio_Optimiser.fetch_ibkr_live_prices_native,
+  ibkr_*.py scripts (read BROKER_CONFIG for the live fee schedule),
+  tests/test_ibkr_mapping.py (14 regression tests on the live helpers).
 """
 from __future__ import annotations
+
+import math
+from typing import Optional
 
 import pandas as pd
 
@@ -242,3 +250,64 @@ def compute_brokerage(trade_df: pd.DataFrame) -> tuple[float, pd.Series]:
         fees.loc[idx0] = 0.0
 
     return float(fees.sum()), fees
+
+
+# === IBKR live integration ===================================================
+# Canonical threshold for the engine + tests + any future IBKR tooling.
+# Warns when IBKR snapshot diverges from yfinance by more than this on a
+# given ticker (helps catch stale yfinance data + dividend-day mismatches).
+IBKR_DIVERGENCE_WARN_BPS = 100   # 100 bps = 1%
+
+
+def _ibkr_pick_price(tk) -> Optional[float]:
+    """Best available price from an ib_insync Ticker, or None.
+
+    Requires v > 0: IBKR uses -1.0 as a 'no data' sentinel that's still
+    finite, and accepting it would torch downstream cash-flow maths."""
+    def _ok(v):
+        return (v is not None and isinstance(v, (int, float))
+                and math.isfinite(v) and v > 0.0)
+    if _ok(tk.last):
+        return float(tk.last)
+    if _ok(tk.close):
+        return float(tk.close)
+    if _ok(tk.bid) and _ok(tk.ask):
+        return (float(tk.bid) + float(tk.ask)) / 2.0
+    return None
+
+
+def apply_ibkr_price_override(
+    last_px_hold: pd.Series,
+    ibkr_prices: dict[str, float],
+) -> tuple[pd.Series, dict]:
+    """Replace yfinance last-prices with IBKR's where available. Returns
+    (updated_series, diagnostics)."""
+    if not ibkr_prices:
+        return last_px_hold, {"n_overridden": 0, "n_warn": 0, "max_bps": 0.0}
+    updated = last_px_hold.copy()
+    n_over = 0
+    n_warn = 0
+    max_bps_abs = 0.0
+    max_bps_ticker = ""
+    for ticker, ibkr_px in ibkr_prices.items():
+        if ticker not in updated.index:
+            continue
+        # Defensive: reject non-positive IBKR prices (sentinel values like -1).
+        if not (isinstance(ibkr_px, (int, float)) and math.isfinite(ibkr_px) and ibkr_px > 0):
+            print(f"[ibkr-price][WARN] {ticker}: rejecting non-positive IBKR "
+                  f"price {ibkr_px} (keeping yfinance)")
+            continue
+        yf_px = pd.to_numeric(updated.get(ticker), errors="coerce")
+        if pd.notna(yf_px) and float(yf_px) > 0:
+            diff_bps = (ibkr_px - float(yf_px)) / float(yf_px) * 10_000
+            if abs(diff_bps) > max_bps_abs:
+                max_bps_abs = abs(diff_bps)
+                max_bps_ticker = ticker
+            if abs(diff_bps) > IBKR_DIVERGENCE_WARN_BPS:
+                print(f"[ibkr-price][WARN] {ticker}: IBKR {ibkr_px:.4f} vs "
+                      f"yfinance {float(yf_px):.4f} ({diff_bps:+.1f} bps)")
+                n_warn += 1
+        updated.loc[ticker] = ibkr_px
+        n_over += 1
+    return updated, {"n_overridden": n_over, "n_warn": n_warn,
+                     "max_bps": max_bps_abs, "max_bps_ticker": max_bps_ticker}

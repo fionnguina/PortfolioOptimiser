@@ -13,19 +13,20 @@ import pytest
 
 from conftest import extract_funcs  # noqa: F401
 
-# IBKR helpers moved to ibkr.py (Phase 4 split, 2026-06-29) — import directly.
+# IBKR live-pricing helpers now live in brokerage.py alongside the other
+# broker-integration code (Phase 4 consolidation, 2026-06-29).
 import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
-import ibkr as _ibkr_mod
+import brokerage as _brk_mod
 
 
 @pytest.fixture(scope="module")
 def ibkr():
     return {
-        "_ibkr_pick_price":          _ibkr_mod._ibkr_pick_price,
-        "apply_ibkr_price_override": _ibkr_mod.apply_ibkr_price_override,
-        "IBKR_DIVERGENCE_WARN_BPS":  _ibkr_mod.IBKR_DIVERGENCE_WARN_BPS,
+        "_ibkr_pick_price":          _brk_mod._ibkr_pick_price,
+        "apply_ibkr_price_override": _brk_mod.apply_ibkr_price_override,
+        "IBKR_DIVERGENCE_WARN_BPS":  _brk_mod.IBKR_DIVERGENCE_WARN_BPS,
     }
 
 
