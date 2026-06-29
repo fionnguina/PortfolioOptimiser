@@ -98,6 +98,11 @@ from cgt import (
     _allocate_sale_to_lots,
     compute_cgt_tax,
 )
+from ibkr import (
+    IBKR_DIVERGENCE_WARN_BPS,
+    _ibkr_pick_price,
+    apply_ibkr_price_override,
+)
 
 # Debug: Print Python executable path
 print(sys.executable)
@@ -609,7 +614,8 @@ IBKR_PORT              = 7497    # paper TWS (7496 = live; never use here)
 IBKR_CLIENT_ID         = 10      # distinct from helper scripts (7/8/9)
 IBKR_CONNECT_TIMEOUT   = 8
 IBKR_SNAPSHOT_WAIT_SEC = 6
-IBKR_DIVERGENCE_WARN_BPS = 100   # warn per-ticker if IBKR vs yfinance > this
+# IBKR_DIVERGENCE_WARN_BPS canonical definition moved to ibkr.py (Phase 4 split).
+# Imported at top of file.
 
 
 # ============================================================================
@@ -6113,21 +6119,7 @@ def _load_cash_ledger(ledger_path) -> pd.DataFrame:
 # requires TWS or IB Gateway running on PAPER (DUQ... account). Returns {}
 # on any failure so the engine falls back to yfinance cleanly.
 
-def _ibkr_pick_price(tk) -> float | None:
-    """Best available price from an ib_insync Ticker, or None.
-
-    Requires v > 0: IBKR uses -1.0 as a 'no data' sentinel that's still
-    finite, and accepting it would torch downstream cash-flow maths."""
-    def _ok(v):
-        return (v is not None and isinstance(v, (int, float))
-                and math.isfinite(v) and v > 0.0)
-    if _ok(tk.last):
-        return float(tk.last)
-    if _ok(tk.close):
-        return float(tk.close)
-    if _ok(tk.bid) and _ok(tk.ask):
-        return (float(tk.bid) + float(tk.ask)) / 2.0
-    return None
+# NOTE: _ibkr_pick_price moved to ibkr.py (Phase 4 split, 2026-06-29).
 
 
 def fetch_ibkr_live_prices_native(tickers: list[str]) -> dict[str, float]:
@@ -6195,41 +6187,7 @@ def fetch_ibkr_live_prices_native(tickers: list[str]) -> dict[str, float]:
             ib.disconnect()
 
 
-def apply_ibkr_price_override(
-    last_px_hold: pd.Series,
-    ibkr_prices: dict[str, float],
-) -> tuple[pd.Series, dict]:
-    """Replace yfinance last-prices with IBKR's where available. Returns
-    (updated_series, diagnostics)."""
-    if not ibkr_prices:
-        return last_px_hold, {"n_overridden": 0, "n_warn": 0, "max_bps": 0.0}
-    updated = last_px_hold.copy()
-    n_over = 0
-    n_warn = 0
-    max_bps_abs = 0.0
-    max_bps_ticker = ""
-    for ticker, ibkr_px in ibkr_prices.items():
-        if ticker not in updated.index:
-            continue
-        # Defensive: reject non-positive IBKR prices (sentinel values like -1).
-        if not (isinstance(ibkr_px, (int, float)) and math.isfinite(ibkr_px) and ibkr_px > 0):
-            print(f"[ibkr-price][WARN] {ticker}: rejecting non-positive IBKR "
-                  f"price {ibkr_px} (keeping yfinance)")
-            continue
-        yf_px = pd.to_numeric(updated.get(ticker), errors="coerce")
-        if pd.notna(yf_px) and float(yf_px) > 0:
-            diff_bps = (ibkr_px - float(yf_px)) / float(yf_px) * 10_000
-            if abs(diff_bps) > max_bps_abs:
-                max_bps_abs = abs(diff_bps)
-                max_bps_ticker = ticker
-            if abs(diff_bps) > IBKR_DIVERGENCE_WARN_BPS:
-                print(f"[ibkr-price][WARN] {ticker}: IBKR {ibkr_px:.4f} vs "
-                      f"yfinance {float(yf_px):.4f} ({diff_bps:+.1f} bps)")
-                n_warn += 1
-        updated.loc[ticker] = ibkr_px
-        n_over += 1
-    return updated, {"n_overridden": n_over, "n_warn": n_warn,
-                     "max_bps": max_bps_abs, "max_bps_ticker": max_bps_ticker}
+# NOTE: apply_ibkr_price_override moved to ibkr.py (Phase 4 split).
 
 
 def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame) -> None:

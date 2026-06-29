@@ -11,16 +11,22 @@ import math
 import pandas as pd
 import pytest
 
-from conftest import extract_funcs
+from conftest import extract_funcs  # noqa: F401
+
+# IBKR helpers moved to ibkr.py (Phase 4 split, 2026-06-29) — import directly.
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+import ibkr as _ibkr_mod
 
 
 @pytest.fixture(scope="module")
 def ibkr():
-    return extract_funcs(
-        "_ibkr_pick_price",
-        "apply_ibkr_price_override",
-        extra_consts=("IBKR_DIVERGENCE_WARN_BPS",),
-    )
+    return {
+        "_ibkr_pick_price":          _ibkr_mod._ibkr_pick_price,
+        "apply_ibkr_price_override": _ibkr_mod.apply_ibkr_price_override,
+        "IBKR_DIVERGENCE_WARN_BPS":  _ibkr_mod.IBKR_DIVERGENCE_WARN_BPS,
+    }
 
 
 # === _ibkr_pick_price =========================================================
