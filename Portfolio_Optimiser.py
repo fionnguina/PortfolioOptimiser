@@ -97,6 +97,12 @@ from cgt import (
     _is_long_term_au,
     _allocate_sale_to_lots,
     compute_cgt_tax,
+    CGT_PROFILES,
+    ACTIVE_CGT_PROFILE,
+    CGT_CONFIG,
+    LotBook,
+    _effective_cgt_rate,
+    compute_cgt_for_rebalance,
 )
 from ibkr import (
     IBKR_DIVERGENCE_WARN_BPS,
@@ -556,46 +562,8 @@ BROKER_CONFIG = BROKER_PROFILES[ACTIVE_BROKER_PROFILE].copy()
 # Future budget changes can be modelled by editing fields below (e.g. if the
 # 50% discount is reduced to 40%, set lt_discount_rate = 0.40).
 # ============================================================================
-CGT_PROFILES = {
-    "personal_30pc": {
-        "marginal_tax_rate":   0.30,
-        "medicare_levy":       0.02,
-        "include_medicare":    True,
-        "lt_discount_rate":    0.50,
-        "lt_holding_days":     365,
-        "description":         "Personal name, 30% MTR + 2% Medicare (user's current bracket)",
-    },
-    "personal_45pc": {
-        "marginal_tax_rate":   0.45,
-        "medicare_levy":       0.02,
-        "include_medicare":    True,
-        "lt_discount_rate":    0.50,
-        "lt_holding_days":     365,
-        "description":         "Personal name, top AU bracket + Medicare",
-    },
-    "trust_30pc": {
-        "marginal_tax_rate":   0.30,
-        "medicare_levy":       0.02,
-        "include_medicare":    True,
-        "lt_discount_rate":    0.50,
-        "lt_holding_days":     365,
-        "description":         "Family trust, distributed to single 30% bracket beneficiary",
-    },
-    "trust_split": {
-        # Assumes optimal distribution across multiple lower-bracket beneficiaries
-        # (e.g. spouse on 19%, kids on 0% up to threshold). Effective avg ~20%.
-        "marginal_tax_rate":   0.20,
-        "medicare_levy":       0.02,
-        "include_medicare":    True,
-        "lt_discount_rate":    0.50,
-        "lt_holding_days":     365,
-        "description":         "Family trust, optimally split across beneficiaries (~20% avg MTR)",
-    },
-}
-
-# Switch profile here. CGT_CONFIG follows automatically.
-ACTIVE_CGT_PROFILE = "personal_30pc"
-CGT_CONFIG = CGT_PROFILES[ACTIVE_CGT_PROFILE].copy()
+# CGT_PROFILES + ACTIVE_CGT_PROFILE + CGT_CONFIG canonical definitions moved
+# to cgt.py (Phase 4 split, 2026-06-29). Imported at top of file.
 
 
 # ============================================================================
@@ -1636,211 +1604,8 @@ def _append_metrics_snapshot(metrics_table, ensemble_mix_live, w_ensemble_live,
         print(f"[metrics] snapshot write failed: {e}")
 
 
-def _effective_cgt_rate(short_term: bool = True, cfg: dict | None = None) -> float:
-    """Effective tax rate on a $1 of capital gain.
-    Short-term: full MTR (+ medicare if enabled).
-    Long-term:  full rate × (1 - discount).
-    """
-    if cfg is None:
-        cfg = CGT_CONFIG
-    base = float(cfg["marginal_tax_rate"])
-    if cfg.get("include_medicare", True):
-        base += float(cfg["medicare_levy"])
-    if short_term:
-        return base
-    return base * (1.0 - float(cfg["lt_discount_rate"]))
-
-
-class LotBook:
-    """Tracks FIFO lots per ticker for CGT calculation.
-
-    Each lot stores: acquisition date, units, cost basis per unit.
-    On sell: matches oldest lots first (FIFO), classifies each parcel as
-    short-term (< 365 days) or long-term, and returns realised gains/losses
-    broken down by category. On buy: appends a new lot.
-    """
-    def __init__(self):
-        self.lots: dict[str, list[dict]] = {}
-
-    def buy(self, ticker: str, units: float, date, price: float) -> None:
-        if units <= 0 or not np.isfinite(units):
-            return
-        self.lots.setdefault(ticker, []).append({
-            "date": pd.Timestamp(date),
-            "units": float(units),
-            "cost_basis_per_unit": float(price),
-        })
-
-    def sell(self, ticker: str, units: float, date, price: float,
-             cfg: dict | None = None) -> dict:
-        """FIFO sale. Returns dict with ST/LT realised gain & loss components."""
-        if cfg is None:
-            cfg = CGT_CONFIG
-        lt_threshold = int(cfg["lt_holding_days"])
-        out = {"st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0}
-        if ticker not in self.lots or not self.lots[ticker] or units <= 0:
-            return out
-
-        sale_date = pd.Timestamp(date)
-        remaining = float(units)
-        new_lots = []
-        for lot in self.lots[ticker]:
-            if remaining <= 1e-9:
-                new_lots.append(lot)
-                continue
-            qty = min(lot["units"], remaining)
-            proceeds = qty * float(price)
-            cost_base = qty * lot["cost_basis_per_unit"]
-            gain = proceeds - cost_base
-            hold_days = (sale_date - lot["date"]).days
-            is_lt = hold_days >= lt_threshold
-
-            if gain >= 0:
-                if is_lt:
-                    out["lt_gain"] += gain
-                else:
-                    out["st_gain"] += gain
-            else:
-                if is_lt:
-                    out["lt_loss"] += -gain
-                else:
-                    out["st_loss"] += -gain
-
-            remaining -= qty
-            if qty < lot["units"]:
-                new_lots.append({
-                    "date": lot["date"],
-                    "units": lot["units"] - qty,
-                    "cost_basis_per_unit": lot["cost_basis_per_unit"],
-                })
-
-        self.lots[ticker] = new_lots
-        return out
-
-    def units(self, ticker: str) -> float:
-        """Current units held."""
-        return float(sum(lot["units"] for lot in self.lots.get(ticker, [])))
-
-    def unrealised_losses(self, price_snapshot, as_of,
-                          min_loss_pct: float = -0.05,
-                          min_loss_aud: float = 100.0) -> list[dict]:
-        """Return lot-level unrealised losses ≤ min_loss_pct AND ≤ -min_loss_aud.
-
-        Each entry: ticker, lot_idx (within-ticker), units, cost_basis_per_unit,
-        current_price, market_value_aud, loss_aud (positive number), loss_pct
-        (negative fraction), hold_days. Sorted by largest loss_aud first so the
-        TLH pass can prioritise high-value harvests.
-        """
-        out: list[dict] = []
-        ref_date = pd.Timestamp(as_of)
-        for tkr, lot_list in self.lots.items():
-            try:
-                if hasattr(price_snapshot, "get"):
-                    p = float(price_snapshot.get(tkr, np.nan))
-                else:
-                    p = float(price_snapshot[tkr]) if tkr in price_snapshot else float("nan")
-            except Exception:
-                continue
-            if not np.isfinite(p) or p <= 0:
-                continue
-            for idx, lot in enumerate(lot_list):
-                if lot["units"] <= 0:
-                    continue
-                cost = float(lot["cost_basis_per_unit"])
-                mkt = lot["units"] * p
-                loss = (cost - p) * lot["units"]  # positive = loss
-                if cost <= 0:
-                    continue
-                loss_pct = (p - cost) / cost     # negative for loss
-                if loss_pct > min_loss_pct:      # not loss enough
-                    continue
-                if loss < min_loss_aud:          # below absolute floor
-                    continue
-                out.append({
-                    "ticker": tkr,
-                    "lot_idx": idx,
-                    "units": float(lot["units"]),
-                    "cost_basis_per_unit": cost,
-                    "current_price": p,
-                    "market_value_aud": float(mkt),
-                    "loss_aud": float(loss),
-                    "loss_pct": float(loss_pct),
-                    "hold_days": int((ref_date - lot["date"]).days),
-                    "lot_date": lot["date"],
-                })
-        out.sort(key=lambda r: r["loss_aud"], reverse=True)
-        return out
-
-    def sell_lot(self, ticker: str, lot_idx: int, units: float, date,
-                 price: float, cfg: dict | None = None) -> dict:
-        """Sell up to `units` from a SPECIFIC lot (overrides FIFO). Used by the
-        TLH pass to target loss lots without disturbing the rest of the book.
-        Returns the same realised-bucket dict as `sell()` so callers can fold
-        the result straight into the FY accumulators.
-        """
-        if cfg is None:
-            cfg = CGT_CONFIG
-        out = {"st_gain": 0.0, "lt_gain": 0.0, "st_loss": 0.0, "lt_loss": 0.0}
-        if ticker not in self.lots or units <= 0:
-            return out
-        lot_list = self.lots[ticker]
-        if not (0 <= lot_idx < len(lot_list)):
-            return out
-        lot = lot_list[lot_idx]
-        qty = min(float(lot["units"]), float(units))
-        if qty <= 0:
-            return out
-        lt_threshold = int(cfg["lt_holding_days"])
-        proceeds = qty * float(price)
-        cost_base = qty * float(lot["cost_basis_per_unit"])
-        gain = proceeds - cost_base
-        is_lt = (pd.Timestamp(date) - lot["date"]).days >= lt_threshold
-        if gain >= 0:
-            out["lt_gain" if is_lt else "st_gain"] += gain
-        else:
-            out["lt_loss" if is_lt else "st_loss"] += -gain
-        if qty >= float(lot["units"]) - 1e-9:
-            # Removed entirely
-            del lot_list[lot_idx]
-        else:
-            lot["units"] = float(lot["units"]) - qty
-        return out
-
-
-def compute_cgt_for_rebalance(realised: dict, cfg: dict | None = None) -> float:
-    """Tax owed on a single rebalance's realised gains, with within-rebalance
-    loss offset. Long-term gains discounted before tax. Returns AUD tax.
-    """
-    if cfg is None:
-        cfg = CGT_CONFIG
-    st_gain = float(realised.get("st_gain", 0.0))
-    lt_gain = float(realised.get("lt_gain", 0.0))
-    st_loss = float(realised.get("st_loss", 0.0))
-    lt_loss = float(realised.get("lt_loss", 0.0))
-
-    # 1) Net within each category
-    st_net = st_gain - st_loss   # may be negative
-    lt_net = lt_gain - lt_loss
-
-    # 2) Cross-offset: if one side is negative (net loss), it can reduce the
-    #    other side's positive gain. This is the AU rule for the same FY.
-    if st_net < 0 and lt_net > 0:
-        offset = min(lt_net, -st_net)
-        lt_net -= offset
-        st_net += offset
-    if lt_net < 0 and st_net > 0:
-        offset = min(st_net, -lt_net)
-        st_net -= offset
-        lt_net += offset
-
-    # 3) Apply rates to remaining positive net gains
-    tax = 0.0
-    if st_net > 0:
-        tax += st_net * _effective_cgt_rate(short_term=True, cfg=cfg)
-    if lt_net > 0:
-        tax += lt_net * _effective_cgt_rate(short_term=False, cfg=cfg)
-    return float(tax)
-
+# NOTE: _effective_cgt_rate + LotBook + compute_cgt_for_rebalance moved to
+# cgt.py (Phase 4 split, 2026-06-29). Imported at top of file.
 
 def _run_tlh_pass(
     lot_book: "LotBook",
