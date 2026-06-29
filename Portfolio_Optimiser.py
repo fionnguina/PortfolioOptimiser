@@ -5516,9 +5516,11 @@ def _validate_trade_plan_sanity(
     portfolio_value_aud: float,
     *,
     max_turnover: float = 2.0,
-    max_single_trade_pct: float = 0.20,
+    max_single_trade_pct: float = 0.80,
     max_position_multiple: float = 5.0,
     max_total_volume_multiple: float = 3.0,
+    max_single_trade_aud: float = 200_000.0,
+    max_total_volume_aud: float = 600_000.0,
 ) -> None:
     """Halt the engine on structurally absurd trade plans.
 
@@ -5601,6 +5603,7 @@ def _validate_trade_plan_sanity(
 
     # Check 2: any single trade > max_single_trade_pct of NAV
     worst_trade_pct = float(_trade_pcts.max()) if not _trade_pcts.empty else 0.0
+    worst_trade_dv_global = float(_delta_value_aud.max()) if not _delta_value_aud.empty else 0.0
     if worst_trade_pct > max_single_trade_pct:
         _wt_idx = _trade_pcts.idxmax()
         worst_trade_ticker = _ticker_label(_wt_idx)
@@ -5613,6 +5616,23 @@ def _validate_trade_plan_sanity(
             "delta_value_aud": worst_trade_dv,
             "msg": (f"Trade in {worst_trade_ticker} = ${worst_trade_dv:,.0f} "
                     f"({worst_trade_pct*100:.1f}% of NAV) > {max_single_trade_pct*100:.0f}% limit")
+        })
+
+    # Check 2b: any single trade > max_single_trade_aud absolute cap.
+    # Backstop for large NAVs where pct check leaves too much headroom
+    # (was added 2026-06-28 after simulator Phase 2c proved $1M accounts
+    # were underprotected by % thresholds alone). Catches corruption at
+    # any NAV: SMH at $1.6B trips here regardless of NAV ratio.
+    if worst_trade_dv_global > max_single_trade_aud:
+        _wt_idx = _delta_value_aud.idxmax()
+        worst_trade_ticker = _ticker_label(_wt_idx)
+        violations.append({
+            "check": "single_trade_abs_too_big",
+            "actual_aud": worst_trade_dv_global,
+            "limit_aud": max_single_trade_aud,
+            "ticker": worst_trade_ticker,
+            "msg": (f"Trade in {worst_trade_ticker} = ${worst_trade_dv_global:,.0f} "
+                    f"> ${max_single_trade_aud:,.0f} absolute cap")
         })
 
     # Check 3: any current position quantity × price > max_position_multiple × NAV
@@ -5647,6 +5667,17 @@ def _validate_trade_plan_sanity(
             "limit_aud": total_volume_limit,
             "msg": (f"Total trade volume ${total_volume:,.0f} > "
                     f"{max_total_volume_multiple}× NAV (${total_volume_limit:,.0f})")
+        })
+
+    # Check 4b: total trade volume > max_total_volume_aud absolute cap.
+    # Same scale-protection rationale as Check 2b.
+    if total_volume > max_total_volume_aud:
+        violations.append({
+            "check": "total_volume_abs_too_high",
+            "actual_aud": total_volume,
+            "limit_aud": max_total_volume_aud,
+            "msg": (f"Total trade volume ${total_volume:,.0f} > "
+                    f"${max_total_volume_aud:,.0f} absolute cap")
         })
 
     if not violations:
