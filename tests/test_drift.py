@@ -10,19 +10,36 @@ import pytest
 
 from conftest import extract_funcs
 
+# JSONL log writers/readers moved to jsonl_logs.py (Phase 4 split, 2026-06-29).
+# Imported directly here; the remaining drift compute helpers still live in
+# Portfolio_Optimiser.py and need the AST-extract trick.
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from jsonl_logs import (
+    _load_recommendation_log as _ll_load_recs,
+    append_live_nav_history as _ll_append_nav,
+    _load_live_nav_series as _ll_load_nav,
+)
+
 
 @pytest.fixture(scope="module")
 def drift():
-    return extract_funcs(
+    ns = extract_funcs(
         "compute_fill_drift",
         "_match_fill_to_recommendation",
-        "_load_recommendation_log",
-        "append_live_nav_history",
-        "_load_live_nav_series",
         "compute_live_max_drawdown",
         "compute_monthly_nav_drift",
         extra_consts=("TARGET_PORTFOLIO_VALUE_AUD",),
     )
+    # Inject the moved-out functions so the existing test bodies keep using
+    # drift["name"](...) lookup unchanged.
+    ns["_load_recommendation_log"] = _ll_load_recs
+    ns["append_live_nav_history"] = _ll_append_nav
+    ns["_load_live_nav_series"] = _ll_load_nav
+    # compute_fill_drift internally calls _load_recommendation_log via its
+    # enclosing namespace ns — the extract_funcs exec_module puts it there.
+    return ns
 
 
 # === Fill matching ============================================================
