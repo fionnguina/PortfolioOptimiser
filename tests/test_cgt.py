@@ -9,19 +9,25 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from conftest import extract_funcs
+from conftest import extract_funcs  # noqa: F401 (kept for parity with other test files)
+
+# CGT helpers moved to cgt.py (Phase 4 split, 2026-06-29) — import directly.
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+import cgt as _cgt_mod
 
 
 @pytest.fixture(scope="module")
 def cgt():
-    return extract_funcs(
-        "compute_cgt_tax",
-        "_security_from_row",
-        "_trade_delta_col",
-        "_allocate_sale_to_lots",
-        "_is_long_term_au",
-        extra_consts=("TRADE_DELTA_CANDIDATES",),
-    )
+    return {
+        "compute_cgt_tax":        _cgt_mod.compute_cgt_tax,
+        "_security_from_row":     _cgt_mod._security_from_row,
+        "_trade_delta_col":       _cgt_mod._trade_delta_col,
+        "_allocate_sale_to_lots": _cgt_mod._allocate_sale_to_lots,
+        "_is_long_term_au":       _cgt_mod._is_long_term_au,
+        "TRADE_DELTA_CANDIDATES": _cgt_mod.TRADE_DELTA_CANDIDATES,
+    }
 
 
 def _trade(delta_units: int, ticker: str = "SMH", last_px: float = 100.0) -> pd.DataFrame:
