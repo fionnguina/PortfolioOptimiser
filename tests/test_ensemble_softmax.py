@@ -8,16 +8,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from conftest import extract_funcs
+# softmax_ensemble_weights moved to ensemble.py (Phase 4 split, 2026-06-29).
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from ensemble import softmax_ensemble_weights as _softmax_fn
 
 
 @pytest.fixture(scope="module")
 def softmax():
-    ns = extract_funcs(
-        "softmax_ensemble_weights",
-        extra_consts=("ANNUAL_TRADING_DAYS",),
-    )
-    return ns["softmax_ensemble_weights"]
+    return _softmax_fn
 
 
 def _synth_returns(n_days: int, candidate_specs: dict, seed: int = 42) -> pd.DataFrame:
