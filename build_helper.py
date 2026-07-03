@@ -1,5 +1,4 @@
 # build_helper.py
-import re
 import subprocess
 import sys
 import shutil
@@ -48,17 +47,21 @@ EXCLUDES = [
 
 def extract_top_level_imports(py_file: Path) -> list[str]:
     """
-    Extract top-level imported module names from a Python source file.
+    Extract imported module names from a Python source file via AST
+    (includes function-level lazy imports; ignores docstrings, where the
+    old regex once picked up a phantom module from prose like "from idx[0]").
     Returns unique, sorted list of module names (top-level only).
     """
+    import ast
     text = py_file.read_text(encoding="utf-8", errors="ignore")
-    pat = re.compile(r'^\s*(?:from|import)\s+([A-Za-z0-9_\.]+)', re.MULTILINE)
     mods = set()
-    for m in pat.findall(text):
-        top = m.split('.')[0]
-        if not top.startswith('_'):
-            mods.add(top)
-    return sorted(mods)
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                mods.add(alias.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            mods.add(node.module.split('.')[0])
+    return sorted(m for m in mods if not m.startswith('_'))
 
 def _write_version_file(root: Path) -> tuple[str, str]:
     """Write _version.py with git SHA + build timestamp. Returns (sha, ts)."""
