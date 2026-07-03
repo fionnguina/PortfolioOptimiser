@@ -1,8 +1,8 @@
 {
-  "_doc": "Tax-loss harvesting substitute pairs. Each key is a ticker; value is a substitute with near-identical exposure but distinct legal identity. Used by --tlh pass to swap losing positions for substitutes without changing economic exposure. AU has no formal wash-sale rule but TR 2008/1 anti-avoidance applies: the substitute must be a genuinely different security. Pairs here are conservative — same/near-same index, different issuer or domicile.",
+  "_doc": "Tax-loss harvesting substitute pairs. Each key is a ticker; value is a substitute with near-identical exposure but distinct legal identity. Used by --tlh pass to swap losing positions for substitutes without changing economic exposure. AU has no formal wash-sale rule but TR 2008/1 anti-avoidance applies: the substitute must be a genuinely different security. Pairs here are conservative — same/near-same index, different issuer or domicile. NOTE: keys must match the engine's ticker symbols exactly (AU listings carry the .AX suffix) — a bare 'IVV' key never matches the IVV.AX holding and silently dead-letters the pair. Substitutes must be present in the price universe (sheet tickers) to be buyable; PMGOLD.AX is held at cap 0 so the solver never allocates to it, TLH-swap only.",
   "pairs": {
-    "IVV": "SPY",
-    "SPY": "IVV",
+    "IVV.AX": "SPY",
+    "SPY": "IVV.AX",
     "QQQ": "NDQ.AX",
     "NDQ.AX": "QQQ",
     "VAS.AX": "A200.AX",
@@ -13,6 +13,14 @@
     "REIT.AX": "VAP.AX",
     "SMH": "SOXX",
     "SOXX": "SMH",
-    "SEMI.AX": "SMH"
+    "SEMI.AX": "SMH",
+    "VLUE.AX": "VVLU.AX",
+    "VVLU.AX": "VLUE.AX",
+    "QUAL.AX": "QLTY.AX",
+    "QLTY.AX": "QUAL.AX",
+    "SMLL.AX": "VSO.AX",
+    "VSO.AX": "SMLL.AX",
+    "GOLD.AX": "PMGOLD.AX",
+    "PMGOLD.AX": "GOLD.AX"
   }
 }

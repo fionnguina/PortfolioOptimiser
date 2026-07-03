@@ -103,6 +103,8 @@ from cgt import (
     LotBook,
     _effective_cgt_rate,
     compute_cgt_for_rebalance,
+    au_financial_year,
+    compute_fy_tax_ledger,
 )
 from drift import (
     DRIFT_MONTHLY_THRESH,
@@ -545,7 +547,146 @@ PER_ASSET_WEIGHT_CAPS: dict[str, float] = {
     "SVIX":  0.05,   # short-VIX 1x — looks high-μ in calm regimes, blows up in vol spikes
     "UVIX":  0.00,   # 2x leveraged long-VIX — structural ~-30%/yr decay, never useful long-only
     "VXX":   0.00,   # 1x long-VIX — structural decay, never useful long-only
+    # --- Thematic ETFs: REVERTED to solver-excluded 2026-07-02 ------------
+    # The expansion A/B/C (wf_cv_X_46t_equiv.log / walk_forward_cv_expanded
+    # .log / wf_cv_Z_pruned.log) measured it at best Sharpe-neutral with
+    # -1.3%/yr full-period return cost, and -0.07 Sharpe / -2.75% CAGR in
+    # the production frame. Mean-variance error-maximisation: more noisy-μ
+    # candidates → solver selects on estimation noise. Cap 0 = excluded
+    # from allocation but still priced, which keeps SOXX / SEMI.AX usable
+    # as TLH substitutes for SMH (tlh_pairs.json). Re-enable only if the
+    # alpha-shrinkage experiment (task #13) validates through the full
+    # gate (production frame, full-period, delta > 2×SE).
+    "BOTZ":     0.00,   # AI / robotics
+    "CIBR":     0.00,   # cybersecurity
+    "ITA":      0.00,   # aerospace & defense
+    "MAGS":     0.00,   # Magnificent-7 concentrated mega-cap
+    "PAVE.AX":  0.00,   # infrastructure build-out
+    "SEMI.AX":  0.00,   # semiconductors (AU-listed) — TLH sub for SMH
+    "SKYY":     0.00,   # cloud / SaaS
+    "SOXX":     0.00,   # semiconductors (US-listed) — TLH sub for SMH
+    "XBI":      0.00,   # biotech (equal-weighted)
+    # --- TLH-substitute-only tickers (cap 0 = solver never allocates) -----
+    # In the universe purely so the TLH pass can price and buy them as
+    # swap substitutes (see tlh_pairs.json). Not solver candidates.
+    "PMGOLD.AX": 0.00,  # Perth Mint gold — TLH substitute for GOLD.AX
 }
+
+
+# ============================================================================
+# SECTOR / THEME GROUP CAPS
+# ----------------------------------------------------------------------------
+# Per-asset caps don't stop the solver from stacking one bet across several
+# wrappers: SMH + SOXX + SEMI.AX + SOXL are ~95% correlated, so 4 × 8% caps
+# still allows a 32%+ semis cluster. Factor-implied Σ sees the correlation
+# but a spurious trailing α on any one wrapper drags the whole cluster in.
+#
+# Each group: summed weight of member tickers ≤ cap, applied in BOTH
+# solve_frontier_point_cvxpy and max_sharpe_long_only (mirrors the
+# per-asset cap plumbing). Tickers absent from the current universe are
+# ignored. Ungrouped tickers are unconstrained at group level.
+#
+# Groups deliberately cover only genuine same-bet clusters — XBI / ITA /
+# PAVE.AX etc. are diversifying themes and stay ungrouped (their 8%
+# per-asset caps are sufficient).
+# ============================================================================
+# EMPTY since the 2026-07-02 thematic revert. NOTE: do NOT re-add groups
+# containing SMH/SOXL while running the 46-ticker production config — the
+# group cap binds on members that remain in the universe, silently
+# re-introducing the semis haircut that cost -4.2%/yr of 3Y return.
+# Previous definitions (for the alpha-shrinkage re-test, task #13):
+#   semiconductors: cap 0.20, [SMH, SOXX, SEMI.AX, SOXL]
+#   tech_thematic:  cap 0.20, [SKYY, BOTZ, CIBR, MAGS]
+SECTOR_GROUP_CAPS: dict[str, dict] = {}
+
+# Sweep support: JSON env override for A/B cap experiments — lets a driver
+# run multiple cap configs through --walk-forward-cv without code edits
+# between runs (code edits would also confuse the git-sha cache key).
+#   PORTOPT_CAP_OVERRIDES='{"SOXX": 0.0, "MAGS": 0.0}'  → merged into
+#     PER_ASSET_WEIGHT_CAPS (cap 0 = solver exclusion, data still loaded).
+#   PORTOPT_SECTOR_CAPS_DISABLE=1  → empties SECTOR_GROUP_CAPS.
+_cap_env = os.environ.get("PORTOPT_CAP_OVERRIDES")
+if _cap_env:
+    try:
+        _cap_ov = {str(k): float(v) for k, v in json.loads(_cap_env).items()}
+        PER_ASSET_WEIGHT_CAPS.update(_cap_ov)
+        print(f"[config-override] PER_ASSET_WEIGHT_CAPS += {_cap_ov}")
+    except Exception as _e_cap_ov:
+        print(f"[config-override] bad PORTOPT_CAP_OVERRIDES ignored: {_e_cap_ov}")
+if os.environ.get("PORTOPT_SECTOR_CAPS_DISABLE") == "1":
+    SECTOR_GROUP_CAPS = {}
+    print("[config-override] SECTOR_GROUP_CAPS disabled via env")
+
+
+# ============================================================================
+# μ SHRINKAGE (James-Stein toward cross-sectional median)
+# ----------------------------------------------------------------------------
+# The candidate solvers consume trailing 24-month mean returns — the noisiest
+# estimator available. Mean-variance is an error maximiser: it allocates
+# hardest to the asset whose estimation NOISE is most positive, and the
+# expected magnitude of that selection error grows with universe size
+# (measured 2026-07-02: 9 extra free-to-ignore candidates cost -1.3%/yr —
+# see wf_cv_X_46t_equiv.log vs walk_forward_cv_expanded.log).
+#
+# Shrinking each asset's μ toward the cross-sectional MEDIAN pulls extreme
+# (mostly lucky) estimates in, making the solver skeptical-by-default.
+# Median not mean: the universe contains structurally-negative-μ
+# instruments (BEAR, BBUS, UVIX, VXX) that would drag a mean prior down.
+#
+#   μ_shrunk = (1 - λ)·μ + λ·median(μ)     λ=0 → off (production default)
+#
+# Applied identically in the OOS walk-forward (per training window) and the
+# live ensemble path so backtest and live use the same estimator.
+# Sweep via env: PORTOPT_MU_SHRINKAGE=0.5 (see task #13 experiment).
+# ============================================================================
+MU_SHRINKAGE_LAMBDA = 0.0
+
+_mu_shrink_env = os.environ.get("PORTOPT_MU_SHRINKAGE")
+if _mu_shrink_env:
+    try:
+        MU_SHRINKAGE_LAMBDA = max(0.0, min(1.0, float(_mu_shrink_env)))
+        print(f"[config-override] MU_SHRINKAGE_LAMBDA={MU_SHRINKAGE_LAMBDA} via env")
+    except Exception as _e_mu_env:
+        print(f"[config-override] bad PORTOPT_MU_SHRINKAGE ignored: {_e_mu_env}")
+
+
+def _apply_mu_shrinkage(mu: "pd.Series") -> "pd.Series":
+    """Shrink expected returns toward the cross-sectional median (see above)."""
+    lam = float(globals().get("MU_SHRINKAGE_LAMBDA", 0.0) or 0.0)
+    if lam <= 0.0 or mu is None or len(mu) == 0:
+        return mu
+    prior = float(pd.to_numeric(mu, errors="coerce").median())
+    return (1.0 - lam) * mu + lam * prior
+
+
+# ============================================================================
+# LT-DISCOUNT-AWARE SELL DEFERRAL (tax-code arbitrage, task 2026-07-02)
+# ----------------------------------------------------------------------------
+# At 6W rebalancing, most realised gains are SHORT-TERM (taxed at full MTR
+# ~32%). Held past 12 months, the same gain gets the 50% CGT discount
+# (~16%). The 12-month boundary is a tax-code fact, not an estimated edge:
+# deferring the sale of a gain lot that is within LT_DEFER_WINDOW_DAYS of
+# eligibility halves the tax on that gain, at the cost of holding the lot
+# (tracking drift) for up to that window.
+#
+# Modeled HONESTLY in the walk-forward: a deferred sell means the cash was
+# never raised, so the rebalance's BUYS are reduced by the deferred value
+# (pro-rata) — the return stream carries the drift cost, and the lot book
+# skips the shielded lots explicitly (LotBook.sell protect=). Loss lots are
+# never deferred (TLH wants them realised); already-LT lots sell freely.
+#
+# 0 = OFF (production default). Sweep via PORTOPT_LT_DEFER_DAYS; natural
+# scale is rebalance periods (42d = one 6W cycle).
+# ============================================================================
+LT_DEFER_WINDOW_DAYS = 0
+
+_lt_defer_env = os.environ.get("PORTOPT_LT_DEFER_DAYS")
+if _lt_defer_env:
+    try:
+        LT_DEFER_WINDOW_DAYS = max(0, int(float(_lt_defer_env)))
+        print(f"[config-override] LT_DEFER_WINDOW_DAYS={LT_DEFER_WINDOW_DAYS} via env")
+    except Exception as _e_defer_env:
+        print(f"[config-override] bad PORTOPT_LT_DEFER_DAYS ignored: {_e_defer_env}")
 
 
 # ============================================================================
@@ -793,6 +934,17 @@ def _log_config_snapshot() -> None:
     if PER_ASSET_WEIGHT_CAPS:
         _caps_str = ", ".join(f"{k}={v*100:.0f}%" for k, v in PER_ASSET_WEIGHT_CAPS.items())
         print(f"[config] WEIGHT CAPS           {_caps_str}")
+    if SECTOR_GROUP_CAPS:
+        _gcaps_str = ", ".join(
+            f"{k}≤{float(v.get('cap', 1.0))*100:.0f}% ({len(v.get('tickers', []))} tickers)"
+            for k, v in SECTOR_GROUP_CAPS.items()
+        )
+        print(f"[config] SECTOR CAPS           {_gcaps_str}")
+    if MU_SHRINKAGE_LAMBDA > 0:
+        print(f"[config] MU SHRINKAGE          λ={MU_SHRINKAGE_LAMBDA:.2f} toward cross-sectional median")
+    if LT_DEFER_WINDOW_DAYS > 0:
+        print(f"[config] LT-DEFER              gain lots within {LT_DEFER_WINDOW_DAYS}d of "
+              f"12mo discount are shielded from sells")
     print(f"[config] DRIFT                 LIVE_START={LIVE_TRADING_START_DATE or '(not set)'}  "
           f"monthly={DRIFT_MONTHLY_THRESH*100:.0f}%  cumulative={DRIFT_CUMULATIVE_THRESH*100:.0f}%  "
           f"DD={DRIFT_DD_ALERT_THRESH*100:+.0f}%  slip={DRIFT_SLIPPAGE_BPS_THRESH:.0f}bps")
@@ -4166,6 +4318,14 @@ def max_sharpe_long_only(mu, Sigma, rf: float = 0.0) -> pd.Series:
 
     # Per-asset weight caps: y[i] <= cap[i] * sum(y) → w[i] <= cap[i] post-norm.
     _caps = globals().get("PER_ASSET_WEIGHT_CAPS", {}) or {}
+    # Sector/theme group caps (same kappa-transform trick per group).
+    _gcaps = globals().get("SECTOR_GROUP_CAPS", {}) or {}
+    _group_idx = [
+        ([_i for _i, _t in enumerate(idx) if _t in set(_g.get("tickers", []))],
+         float(_g.get("cap", 1.0)))
+        for _g in _gcaps.values()
+    ]
+    _group_idx = [(gi, gc) for gi, gc in _group_idx if gi]
 
     w = None
     if np.any(excess > 0):
@@ -4174,6 +4334,10 @@ def max_sharpe_long_only(mu, Sigma, rf: float = 0.0) -> pd.Series:
         for _i, _ticker in enumerate(idx):
             if _ticker in _caps:
                 cons_tg.append(y[_i] <= float(_caps[_ticker]) * cp.sum(y))
+        for _gi, _gc in _group_idx:
+            cons_tg.append(
+                cp.sum(cp.hstack([y[_i] for _i in _gi])) <= _gc * cp.sum(y)
+            )
         try:
             prob = cp.Problem(cp.Minimize(cp.quad_form(y, S_v)), cons_tg)
             prob.solve(solver=cp.OSQP, verbose=False)
@@ -4191,6 +4355,8 @@ def max_sharpe_long_only(mu, Sigma, rf: float = 0.0) -> pd.Series:
         for _i, _ticker in enumerate(idx):
             if _ticker in _caps:
                 cons_mv.append(wv[_i] <= float(_caps[_ticker]))
+        for _gi, _gc in _group_idx:
+            cons_mv.append(cp.sum(cp.hstack([wv[_i] for _i in _gi])) <= _gc)
         try:
             cp.Problem(cp.Minimize(cp.quad_form(wv, S_v)), cons_mv).solve(solver=cp.OSQP, verbose=False)
             if wv.value is None:
@@ -4637,6 +4803,18 @@ def solve_frontier_point_cvxpy(
         for _i, _ticker in enumerate(mu_use.index):
             if _ticker in _caps:
                 constraints.append(w[_i] <= float(_caps[_ticker]))
+
+    # Sector/theme group caps: summed weight of each correlated cluster
+    # ≤ cap. Complements the per-asset caps above — see SECTOR_GROUP_CAPS.
+    _gcaps = globals().get("SECTOR_GROUP_CAPS", {}) or {}
+    for _gspec in _gcaps.values():
+        _gset = set(_gspec.get("tickers", []))
+        _gidx = [_i for _i, _t in enumerate(mu_use.index) if _t in _gset]
+        if _gidx:
+            constraints.append(
+                cp.sum(cp.hstack([w[_i] for _i in _gidx]))
+                <= float(_gspec.get("cap", 1.0))
+            )
 
     if use_inequality:
         constraints.append(mu_use.to_numpy(dtype=float) @ w >= float(target_return))
@@ -5869,6 +6047,108 @@ def _build_lots_from_holdings(
     return pd.DataFrame(rows, columns=base_cols)
 
 
+def compute_actual_nav_series(prices, fills_path, seed_path):
+    """Reconstruct daily NAV series from seed lots + executed fills.
+
+    Returns a pd.Series of portfolio market value indexed by date,
+    starting from the earliest seed/fill date. Dates before that are
+    excluded — the live account did not exist there.
+
+    Used by slide 3 to plot the real "Actual NAV" path of the user's
+    paper/live account. Previously slide 3 plotted a hypothetical
+    (no-tilts target × historical prices), which the ensemble line
+    already covered — and hid the fact that the held lots were
+    defensive while the chart pretended they were long-only equity.
+
+    Currency: matches `prices` (typically mixed USD/AUD per the engine's
+    convention). Return-based comparisons normalise out the unit, so
+    this is safe for chart display even with mixed-currency holdings.
+    """
+    events: list[tuple[pd.Timestamp, str, float]] = []
+
+    sp = (Path(seed_path) if seed_path and not hasattr(seed_path, "exists")
+          else seed_path)
+    if sp is not None and sp.exists():
+        try:
+            for item in json.loads(sp.read_text(encoding="utf-8")):
+                try:
+                    u = int(round(float(item.get("Units") or 0)))
+                    if u <= 0:
+                        continue
+                    events.append((
+                        pd.Timestamp(item.get("AcqDate")).normalize(),
+                        str(item.get("Security", "")).strip(),
+                        float(u),
+                    ))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    fp = (Path(fills_path) if fills_path and not hasattr(fills_path, "exists")
+          else fills_path)
+    if fp is not None and fp.exists():
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line.replace("NaN", "null"))
+                    except Exception:
+                        continue
+                    qf = float(r.get("qty_filled") or 0)
+                    if qf <= 0:
+                        continue
+                    side = str(r.get("side", "")).upper()
+                    delta = qf if side == "BUY" else -qf
+                    ticker = str(r.get("ticker", "")).strip()
+                    if not ticker:
+                        continue
+                    ts = r.get("exec_timestamp") or r.get("rec_log_run_at")
+                    try:
+                        d = pd.Timestamp(ts).normalize()
+                    except Exception:
+                        continue
+                    events.append((d, ticker, delta))
+        except Exception:
+            pass
+
+    if not events:
+        return pd.Series(dtype=float)
+
+    events.sort(key=lambda e: e[0])
+    first_date = events[0][0]
+
+    dates = prices.index[prices.index >= first_date]
+    if len(dates) == 0:
+        return pd.Series(dtype=float)
+
+    by_ticker: dict[str, list[tuple[pd.Timestamp, float]]] = {}
+    for d, tk, du in events:
+        by_ticker.setdefault(tk, []).append((d, du))
+
+    nav = pd.Series(0.0, index=dates)
+    for tk, evs in by_ticker.items():
+        if tk not in prices.columns:
+            continue
+        evs.sort(key=lambda e: e[0])
+        units_series = pd.Series(0.0, index=dates)
+        cum = 0.0
+        ei = 0
+        for d in dates:
+            while ei < len(evs) and evs[ei][0] <= d:
+                cum += evs[ei][1]
+                ei += 1
+            units_series.loc[d] = cum
+        px = pd.to_numeric(prices[tk].reindex(dates),
+                            errors="coerce").ffill().fillna(0.0)
+        nav = nav.add(units_series * px, fill_value=0.0)
+
+    return nav
+
+
 def _update_lots_after_trades(
     lots_df: pd.DataFrame,
     trade_df: pd.DataFrame,
@@ -6165,7 +6445,13 @@ def _write_holdings_sheet(wb, prices, units, include_flags,
     units_s = pd.Series(units)
     include_s = pd.Series(include_flags)
     for t in tickers_all:
-        inc = bool(include_s.get(t, False))
+        # Default True: tickers added to the universe but not yet in the
+        # Holdings dict should be tradable. False here previously silently
+        # froze every newly-added ticker — make_trade_plan would override
+        # tgt_units with cur_units (=0), producing 0 trades despite the
+        # ensemble recommending them. Aligns with make_trade_plan's own
+        # fillna(True) default for missing include_flags entries.
+        inc = bool(include_s.get(t, True))
         rows.append({
             "Security": t,
             "Units": float(units_s.get(t, 0.0)),
@@ -7016,6 +7302,24 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"git:{gsha}".encode())
     except Exception:
         pass
+    # Behavioral config that changes the backtest but is NOT passed as
+    # kwargs — read from globals/files at solve/TLH time. Without these,
+    # editing caps or tlh_pairs.json between runs on identical data
+    # silently returns stale results (nearly invalidated the 2026-07-02
+    # TLH-pairs A/B: lockboxed data → same key → HIT on the old config).
+    try:
+        h.update(f"caps:{json.dumps(globals().get('PER_ASSET_WEIGHT_CAPS', {}), sort_keys=True)}".encode())
+        h.update(f"gcaps:{json.dumps(globals().get('SECTOR_GROUP_CAPS', {}), sort_keys=True)}".encode())
+        h.update(f"mu_shrink:{float(globals().get('MU_SHRINKAGE_LAMBDA', 0.0) or 0.0)}".encode())
+        h.update(f"lt_defer:{int(globals().get('LT_DEFER_WINDOW_DAYS', 0) or 0)}".encode())
+    except Exception:
+        h.update(b"caps_hash_failed")
+    try:
+        _pairs_p = APP_DIR / "tlh_pairs.json"
+        if _pairs_p.exists():
+            h.update(b"tlh_pairs:" + _pairs_p.read_bytes())
+    except Exception:
+        h.update(b"tlh_pairs_hash_failed")
     return h.hexdigest()[:16]
 
 
@@ -7206,6 +7510,9 @@ def run_oos_ensemble_walk_forward(
     rebalance_costs: dict[pd.Timestamp, float] = {}
     rebalance_taxes: dict[pd.Timestamp, float] = {}
     _prev_blend_w = pd.Series(dtype=float)
+    # LT-deferral diagnostics (0 when LT_DEFER_WINDOW_DAYS=0).
+    _defer_events = 0
+    _defer_value_total = 0.0
     _running_nav = float(starting_nav_aud)  # AUD; flat-fee impact scales with NAV
     # Conditional rebalancing diagnostics
     n_skipped = 0
@@ -7281,6 +7588,7 @@ def run_oos_ensemble_walk_forward(
 
         log_ret = np.log1p(train_rets)
         mu = pd.Series(np.expm1(log_ret.mean() * 252.0), index=train_rets.columns)
+        mu = _apply_mu_shrinkage(mu)
         Sigma = train_rets.cov()
         spy_mu = float(mu[benchmark_ticker]) if benchmark_ticker in mu.index else None
 
@@ -7455,6 +7763,65 @@ def run_oos_ensemble_walk_forward(
             n_skipped += 1
         else:
             n_executed += 1
+
+        # Resolve price snapshot once — needed by LT-deferral below and by
+        # the lot update + TLH pass further down.
+        try:
+            px_at_t = px.loc[:t].iloc[-1]
+        except Exception:
+            px_at_t = None
+
+        # --- LT-discount-aware sell deferral -----------------------------
+        # Shield gain lots within LT_DEFER_WINDOW_DAYS of 12mo eligibility:
+        # keep their weight (delta added back to the seller), and fund that
+        # by shrinking this rebalance's BUYS pro-rata — the cash for those
+        # buys was never raised. Return stream + brokerage + lot book all
+        # see the adjusted weights, so the drift cost is fully modeled.
+        _lt_defer_days = int(globals().get("LT_DEFER_WINDOW_DAYS", 0) or 0)
+        if (_lt_defer_days > 0 and not skip_rebal and px_at_t is not None
+                and not _prev_blend_w.empty and _running_nav > 0):
+            try:
+                _union = sorted(set(_prev_blend_w.index).union(w_blend.index))
+                _w_new_u = w_blend.reindex(_union).fillna(0.0)
+                _w_old_u = _prev_blend_w.reindex(_union).fillna(0.0)
+                _defer_extra: dict[str, float] = {}
+                for tkr in _union:
+                    p = float(px_at_t.get(tkr, np.nan))
+                    if not np.isfinite(p) or p <= 0:
+                        continue
+                    cur_u = _lot_book.units(tkr)
+                    tgt_u = (float(_w_new_u.get(tkr, 0.0)) * _running_nav) / p
+                    sell_qty = cur_u - tgt_u
+                    if sell_qty <= 1e-9:
+                        continue
+                    prot = _lot_book.near_lt_gain_units(tkr, p, t, _lt_defer_days)
+                    if prot <= 0:
+                        continue
+                    free = max(0.0, cur_u - prot)
+                    deferred_u = sell_qty - min(sell_qty, free)
+                    if deferred_u > 1e-9:
+                        _defer_extra[tkr] = deferred_u * p / _running_nav
+                _D = float(sum(_defer_extra.values()))
+                if 0.0 < _D < 0.5:
+                    _delta_u = _w_new_u - _w_old_u
+                    _buys = _delta_u[_delta_u > 1e-12]
+                    _total_buys = float(_buys.sum())
+                    if _total_buys > 1e-9:
+                        w_eff = _w_new_u.copy()
+                        for tkr, extra in _defer_extra.items():
+                            w_eff[tkr] = float(w_eff.get(tkr, 0.0)) + extra
+                        _reduce = min(_D, _total_buys)
+                        for tkr, bamt in _buys.items():
+                            w_eff[tkr] -= _reduce * (float(bamt) / _total_buys)
+                        w_eff = w_eff.clip(lower=0.0)
+                        _s = float(w_eff.sum())
+                        if _s > 0:
+                            w_blend = w_eff / _s
+                        _defer_events += len(_defer_extra)
+                        _defer_value_total += _D * _running_nav
+            except Exception:
+                pass
+
         blended_weights[t] = w_blend
 
         # Blended realised return segment (gross, before transaction costs)
@@ -7482,15 +7849,24 @@ def run_oos_ensemble_walk_forward(
         # rebalance — that overestimates because it ignores intra-FY loss
         # offsetting. Tax is applied at FY-end (below) on net taxable.
         # Skipped rebalances do NOT update the lot book (no trades occurred).
-        # Resolve price snapshot once: needed below by both the rebalance lot
-        # update and the TLH pass.
-        try:
-            px_at_t = px.loc[:t].iloc[-1]
-        except Exception:
-            px_at_t = None
-
+        # (px_at_t resolved above, before the LT-deferral adjustment.)
         if not skip_rebal and px_at_t is not None:
             try:
+                # Protect predicate for LT-deferral: skip near-LT gain lots
+                # during FIFO allocation. Mirrors near_lt_gain_units exactly
+                # so the weight adjustment above and the lot allocation here
+                # shield the same lots.
+                _protect_fn = None
+                if _lt_defer_days > 0:
+                    _lt_thresh_days = int(CGT_CONFIG["lt_holding_days"])
+                    def _make_protect(price_now):
+                        def _protect(lot, hold_days):
+                            return (price_now > float(lot["cost_basis_per_unit"])
+                                    and (_lt_thresh_days - _lt_defer_days)
+                                        <= hold_days < _lt_thresh_days)
+                        return _protect
+                    _protect_fn = _make_protect
+
                 tickers_traded = sorted(set(_prev_blend_w.index).union(w_blend.index))
                 for tkr in tickers_traded:
                     p = float(px_at_t.get(tkr, np.nan))
@@ -7503,7 +7879,10 @@ def run_oos_ensemble_walk_forward(
                     if delta_units > 1e-9:
                         _lot_book.buy(tkr, delta_units, t, p)
                     elif delta_units < -1e-9:
-                        out = _lot_book.sell(tkr, -delta_units, t, p)
+                        out = _lot_book.sell(
+                            tkr, -delta_units, t, p,
+                            protect=(_protect_fn(p) if _protect_fn else None),
+                        )
                         for k in _fy_buckets:
                             _fy_buckets[k] += out[k]
             except Exception:
@@ -7579,6 +7958,10 @@ def run_oos_ensemble_walk_forward(
 
     rebalance_costs_ser = pd.Series(rebalance_costs).sort_index() if rebalance_costs else pd.Series(dtype=float)
     rebalance_taxes_ser = pd.Series(rebalance_taxes).sort_index() if rebalance_taxes else pd.Series(dtype=float)
+    if _defer_events > 0:
+        print(f"[lt-defer] {_defer_events} lot-shield event(s) over window, "
+              f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
+              f"discount boundary (window={int(globals().get('LT_DEFER_WINDOW_DAYS', 0))}d)")
     return {
         "blended_returns": blended_returns,
         "per_candidate_returns": per_cand_rets_df,
@@ -9224,6 +9607,34 @@ def _run_walk_forward_cv() -> int:
           f"(worst single year: {dd_arr.min()*100:+.2f}%)")
     print(f"  Years with α > 0: {n_positive_alpha}/{len(folds)}")
 
+    # === Full-period metrics (NOT fold-mean) ===
+    # Fold-mean MaxDD structurally understates multi-year drawdowns: a
+    # drawdown spanning a year boundary is split across two folds and
+    # each fold only sees its own segment. The 2026-06-19 Stretch+hedge
+    # revert happened because fold stats looked fine while the full-period
+    # peak-to-trough was materially worse. Production go/no-go decisions
+    # must use THESE numbers for MaxDD, not the fold aggregate above.
+    strat_modern = strat_rets.loc[strat_rets.index.year >= MIN_OOS_YEAR]
+    full_nav = (1.0 + strat_modern).cumprod()
+    full_dd = float((full_nav / full_nav.cummax() - 1.0).min())
+    _fp_years = max(len(strat_modern) / ANNUAL_TRADING_DAYS, 1e-6)
+    full_ann = float(full_nav.iloc[-1] ** (1.0 / _fp_years) - 1.0)
+    full_vol = float(strat_modern.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+    full_sharpe = full_ann / full_vol if full_vol > 0 else 0.0
+    _spy_modern = spy_ret_full.reindex(strat_modern.index).fillna(0.0)
+    _spy_fp_nav = (1.0 + _spy_modern).cumprod()
+    _spy_fp_ann = float(_spy_fp_nav.iloc[-1] ** (1.0 / _fp_years) - 1.0)
+    _spy_fp_dd = float((_spy_fp_nav / _spy_fp_nav.cummax() - 1.0).min())
+    print("\n" + "=" * 88)
+    print(f"FULL-PERIOD ({strat_modern.index.min().date()} → "
+          f"{strat_modern.index.max().date()}, peak-to-trough across folds)")
+    print("=" * 88)
+    print(f"  Ann return:    {full_ann*100:+.2f}%   (SPY {_spy_fp_ann*100:+.2f}%, "
+          f"α {(full_ann-_spy_fp_ann)*100:+.2f}%)")
+    print(f"  Sharpe:        {full_sharpe:+.2f}")
+    print(f"  MaxDD:         {full_dd*100:+.2f}%   (SPY {_spy_fp_dd*100:+.2f}%)  "
+          f"← gate on THIS, not fold-mean")
+
     # === Verdict ===
     print("\n" + "=" * 88)
     print("VERDICT")
@@ -9264,6 +9675,16 @@ def _run_walk_forward_cv() -> int:
                 "mean_max_drawdown": round(float(dd_arr.mean()), 6),
                 "worst_max_drawdown": round(float(dd_arr.min()), 6),
                 "n_positive_alpha_folds": n_positive_alpha,
+            },
+            "full_period": {
+                "start": str(strat_modern.index.min().date()),
+                "end": str(strat_modern.index.max().date()),
+                "ann_return": round(full_ann, 6),
+                "sharpe": round(full_sharpe, 3),
+                "max_drawdown": round(full_dd, 6),
+                "spy_ann_return": round(_spy_fp_ann, 6),
+                "spy_max_drawdown": round(_spy_fp_dd, 6),
+                "alpha_vs_spy": round(full_ann - _spy_fp_ann, 6),
             },
         }
         json_path = APP_DIR / "walk_forward_cv_summary.json"
@@ -11250,7 +11671,11 @@ if bool(CFG.get("oos_validation", True)):
             _eff_st = _effective_cgt_rate(short_term=True)
             _eff_lt = _effective_cgt_rate(short_term=False)
             _tlh_tax_est = _tlh_loss * (_eff_st + _eff_lt) / 2.0
-            _tlh_bps = _tlh_tax_est / 1_000_000.0 / _years * 10_000
+            # bps vs the ACTUAL backtest starting NAV — a hardcoded $1M
+            # denominator understated TLH's real scale ~4x at a $251k NAV,
+            # which mis-sized the 2026-07-02 pairs-expansion decision.
+            _tlh_nav_denom = float(globals().get("_oos_starting_nav_aud") or 1_000_000.0)
+            _tlh_bps = _tlh_tax_est / _tlh_nav_denom / _years * 10_000
             print(f"[tlh] {len(_tlh_events_live)} events over window, "
                   f"${_tlh_loss:,.0f} loss realised, "
                   f"~${_tlh_tax_est:,.0f} gross tax saved est "
@@ -11302,7 +11727,7 @@ globals()["oos_prices_aud_long"] = oos_prices_aud_long
 w_ensemble_live = pd.Series(dtype=float)
 ensemble_mix_live = pd.Series(dtype=float)
 try:
-    _mu_live = pd.Series(mu_ann_geo).astype(float).dropna()
+    _mu_live = _apply_mu_shrinkage(pd.Series(mu_ann_geo).astype(float).dropna())
     _Sigma_live = Sigma_daily.copy()
     _spy_mu_live = float(_mu_live["SPY"]) if "SPY" in _mu_live.index else None
     _cand_live = solve_candidate_portfolios(_mu_live, _Sigma_live, _spy_mu_live)
@@ -13047,7 +13472,9 @@ if USE_XLWINGS:
                     _tax_saved_est = _tlh_loss_total * (_eff_st + _eff_lt) / 2.0
                     _years_tlh = max(len(oos_returns_daily) / ANNUAL_TRADING_DAYS, 1e-6) \
                                  if isinstance(oos_returns_daily, pd.Series) else 1.0
-                    _bps_yr = _tax_saved_est / 1_000_000.0 / _years_tlh * 10_000
+                    _bps_yr = (_tax_saved_est
+                               / float(globals().get("_oos_starting_nav_aud") or 1_000_000.0)
+                               / _years_tlh * 10_000)
                     # Header summary rows
                     _tlh_sht.range("A1").value = "Tax-Loss Harvesting — backtest engine activity"
                     _tlh_sht.range("A2").value = "TLH events"
@@ -13078,6 +13505,43 @@ if USE_XLWINGS:
                     print(f"[excel] TLH_Log: 0 events (TLH_ENABLED={TLH_ENABLED})")
             except Exception as _e_tlh:
                 print(f"[excel] TLH_Log write skipped: {_e_tlh}")
+
+            # ---- FY Tax Ledger sheet (ACTUAL fills, per financial year) ----
+            # Reconciles live NAV against the backtest's assumption that CGT
+            # is paid (and TLH savings reinvested) INSIDE the portfolio. In
+            # reality tax settles at lodgement in the user's bank account.
+            # This ledger shows, per AU FY: realised ST/LT gains, losses,
+            # carry-forward chain, and the estimated CGT at lodgement — so
+            # the user knows what to contribute back (refund) or expect to
+            # owe, keeping live NAV comparable to the simulation. Derived
+            # fresh from ibkr_fills_log.jsonl + lots_seed.json every run.
+            try:
+                _fy_ledger_df = compute_fy_tax_ledger(
+                    APP_DIR / "ibkr_fills_log.jsonl",
+                    seed_path=APP_DIR / "lots_seed.json",
+                    fx_map=fx_map_all,
+                    lot_match_method=LOT_MATCH_METHOD,
+                )
+                globals()["FY_TAX_LEDGER_DF"] = _fy_ledger_df
+                _tax_sht = get_or_clear_sheet(wb, 'Tax_Ledger')
+                _tax_sht.range("A1").value = ("FY Tax Ledger — ACTUAL fills (broker truth), "
+                                              f"profile={ACTIVE_CGT_PROFILE}")
+                _tax_sht.range("A2").value = ("At lodgement: contribute any refund back into the "
+                                              "portfolio (or fund the bill externally) so live NAV "
+                                              "stays comparable to the backtest, which models tax "
+                                              "flows inside the portfolio.")
+                if not _fy_ledger_df.empty:
+                    _tax_sht.range("A4").options(pd.DataFrame, index=False, header=True).value = _fy_ledger_df
+                    print(f"[excel] Tax_Ledger: {len(_fy_ledger_df)} FY row(s) written "
+                          f"(current: {_fy_ledger_df.iloc[-1]['FY']}, "
+                          f"CGT ${float(_fy_ledger_df.iloc[-1]['CGT at Lodgement (AUD)']):,.0f}, "
+                          f"c/f ${float(_fy_ledger_df.iloc[-1]['Carry-Fwd Out']):,.0f})")
+                else:
+                    _tax_sht.range("A4").value = "No sell fills recorded yet — ledger starts with the first executed sell."
+                    print("[excel] Tax_Ledger: no sell fills yet (sheet stubbed)")
+                _tax_sht.autofit()
+            except Exception as _e_taxled:
+                print(f"[excel] Tax_Ledger write skipped: {_e_taxled}")
 
             # ---- IBKR Actual Fills sheet (from ibkr_fills_log.jsonl) ----
             # Surfaces the Phase 3 paper-execution log inside the workbook so
@@ -13636,13 +14100,22 @@ if bool(globals().get("OPEN_AFTER_SAVE", True)) and OPEN_EXCEL_AFTER_SAVE:
 # PPTX helpers (module level so they're not redefined per export call)
 # -----------------------------------------------------------------
 def _nearest_on_or_before(idx, dt):
-    """Return the largest value in `idx` that is <= dt (best-effort)."""
+    """Return the largest value in `idx` that is <= dt, or None if no such value exists.
+
+    Previously returned `idx[0]` when dt fell before the series start, which
+    violated the contract and caused _period_total_return to compute returns
+    from idx[0] instead of returning NaN. Symptom: a 1-week-old Actual NAV
+    row showed identical -0.83% for 3M, 6M, 12M, 3Y (all four lookups
+    silently fell back to idx[0]). Both callers (_period_total_return and
+    _window_compound_total) already guard `if start_dt is None: return NaN`,
+    so returning None here makes those guards live again.
+    """
     if len(idx) == 0:
         return None
     dt = pd.to_datetime(dt)
     pos = idx.searchsorted(dt, side="right") - 1
     if pos < 0:
-        return idx[0]
+        return None
     return idx[min(pos, len(idx) - 1)]
 
 
@@ -14015,7 +14488,9 @@ def export_to_ppt(results, trades, charts=None):
                 _tax_est = _tlh_loss * (_eff_st + _eff_lt) / 2.0
                 _oos_rets = globals().get("oos_returns_daily", pd.Series(dtype=float))
                 _yrs = max(len(_oos_rets) / ANNUAL_TRADING_DAYS, 1e-6) if isinstance(_oos_rets, pd.Series) else 1.0
-                _bps = _tax_est / 1_000_000.0 / _yrs * 10_000
+                _bps = (_tax_est
+                        / float(globals().get("_oos_starting_nav_aud") or 1_000_000.0)
+                        / _yrs * 10_000)
                 _tlh_text = (f"Tax-loss harvesting: {len(_tlh_events_ppt)} events over backtest  ·  "
                              f"${_tlh_loss:,.0f} loss realised  ·  "
                              f"~${_tax_est:,.0f} gross tax-saved est ({_bps:.0f} bps/yr drag offset; "
@@ -14322,8 +14797,42 @@ def export_to_ppt(results, trades, charts=None):
         # Chart uses the 3M slice of the unified download
         bench = bench_long.reindex(pval.index).ffill().bfill()
 
-        # Returns from start of window (decimal)
-        portfolio_returns = (pval / pval.iloc[0]) - 1.0
+        # --- Portfolio line: ACTUAL NAV from lots seed + fills log --------
+        # Previously this was (pval / pval.iloc[0]) - 1.0 where pval came
+        # from tgt_units_full × prices — a hypothetical of the no-tilts
+        # target portfolio. That duplicated the Strategy (Ensemble) line's
+        # purpose and hid the fact that the held lots (BEAR / BBUS / HBRD)
+        # were actually defensive while the chart pretended they tracked
+        # NASDAQ. Now reconstructs real NAV; line stubs in at LIVE_START.
+        _actual_nav_series_local = pd.Series(dtype=float)
+        try:
+            _actual_nav_series_local = compute_actual_nav_series(
+                prices,
+                APP_DIR / "ibkr_fills_log.jsonl",
+                APP_DIR / "lots_seed.json",
+            )
+        except Exception as _e_nav:
+            print(f"[chart] Actual NAV computation failed: {_e_nav}")
+        # Stash for the table section below so we don't compute twice.
+        actual_nav_for_table = _actual_nav_series_local
+        _nav_in_window = _actual_nav_series_local.reindex(pval.index)
+        _first_valid_nav = _nav_in_window.first_valid_index()
+        if _first_valid_nav is not None:
+            _base = float(_nav_in_window.loc[_first_valid_nav])
+            if _base > 0:
+                portfolio_returns = (_nav_in_window / _base) - 1.0
+                portfolio_legend_label = (
+                    f"Actual NAV (since {_first_valid_nav.strftime('%d %b')})"
+                )
+            else:
+                portfolio_returns = (pval / pval.iloc[0]) - 1.0
+                portfolio_legend_label = "Portfolio (Hypothetical)"
+        else:
+            # No live NAV history yet — fall back to hypothetical so the
+            # slide still renders during dev runs / before seed.
+            portfolio_returns = (pval / pval.iloc[0]) - 1.0
+            portfolio_legend_label = "Portfolio (Hypothetical)"
+            print("[chart] no actual NAV data — falling back to hypothetical")
         benchmark_returns = bench.div(bench.iloc[0]).subtract(1.0)
                 
         # --- Strategy line: synthetic projection of the AUTO-SELECTED plan ---
@@ -14373,7 +14882,7 @@ def export_to_ppt(results, trades, charts=None):
         })
         
         # --- Combine into one DataFrame ---
-        series_list = [portfolio_returns.rename("Portfolio")]
+        series_list = [portfolio_returns.rename(portfolio_legend_label)]
         
         # Add Strategy line (auto-selected plan) if we successfully built it
         if "tilted_returns" in locals() and tilted_returns is not None:
@@ -14402,6 +14911,118 @@ def export_to_ppt(results, trades, charts=None):
         # first/last trading day rendered. This is what the user sees on the
         # x-axis, so the callout cannot disagree with the chart.
         _add_date_callout(slide3, perf_df.index.min(), perf_df.index.max(), prefix="Data")
+
+        # --- Live performance callout (real returns across rebalances) ----
+        # Single-line summary of the actual NAV's since-inception return,
+        # alongside SPY and ASX over the same window, plus rebalance count.
+        # Shows the user the real performance figure they care about, so they
+        # don't have to read it off the stub line on the chart.
+        try:
+            _live_nav_clean = (actual_nav_for_table.dropna()
+                                if isinstance(actual_nav_for_table, pd.Series)
+                                else pd.Series(dtype=float))
+            if not _live_nav_clean.empty:
+                _v0 = float(_live_nav_clean.iloc[0])
+                _v1 = float(_live_nav_clean.iloc[-1])
+                if _v0 > 0:
+                    _live_ret = (_v1 / _v0) - 1.0
+                    _live_start = _live_nav_clean.index[0]
+                    _live_end = _live_nav_clean.index[-1]
+                    _bench_parts = []
+                    for _col, _lbl in [("^GSPC", "SPY"), ("^AORD", "ASX")]:
+                        if _col in bench_long.columns:
+                            _s = pd.to_numeric(bench_long[_col],
+                                                 errors="coerce").dropna()
+                            if not _s.empty:
+                                _b0_dt = _nearest_on_or_before(_s.index, _live_start)
+                                _b1_dt = _nearest_on_or_before(_s.index, _live_end)
+                                if _b0_dt is not None and _b1_dt is not None:
+                                    _b0 = float(_s.loc[_b0_dt])
+                                    _b1 = float(_s.loc[_b1_dt])
+                                    if _b0 > 0:
+                                        _bench_parts.append(
+                                            f"vs {_lbl}: {(_b1/_b0-1.0)*100:+.2f}%"
+                                        )
+                    _n_rebal = 0
+                    try:
+                        _fp = APP_DIR / "ibkr_fills_log.jsonl"
+                        if _fp.exists():
+                            _rebal_dates = set()
+                            with open(_fp, "r", encoding="utf-8") as _fh:
+                                for _line in _fh:
+                                    _line = _line.strip()
+                                    if not _line:
+                                        continue
+                                    try:
+                                        _r = json.loads(_line.replace("NaN", "null"))
+                                    except Exception:
+                                        continue
+                                    if float(_r.get("qty_filled") or 0) <= 0:
+                                        continue
+                                    _ts = (_r.get("exec_timestamp")
+                                            or _r.get("rec_log_run_at"))
+                                    if _ts:
+                                        try:
+                                            _rebal_dates.add(
+                                                pd.Timestamp(_ts).normalize()
+                                            )
+                                        except Exception:
+                                            pass
+                            _n_rebal = len(_rebal_dates)
+                    except Exception:
+                        pass
+
+                    _abs_pnl = _v1 - _v0
+                    _first_part = (
+                        f"Live since {_live_start.strftime('%d %b')}: "
+                        f"{_live_ret*100:+.2f}%  (${_abs_pnl:+,.0f})"
+                    )
+                    if _n_rebal:
+                        _first_part += (
+                            f"  ·  {_n_rebal} rebal"
+                            f"{'s' if _n_rebal != 1 else ''}"
+                        )
+                    _parts = [_first_part] + _bench_parts
+                    # Current-FY tax accrual from the ACTUAL-fills ledger, so
+                    # the user sees what will settle at lodgement (and should
+                    # be contributed back / funded externally to keep live
+                    # NAV comparable to the tax-inside-portfolio backtest).
+                    try:
+                        _fy_led = globals().get("FY_TAX_LEDGER_DF")
+                        if isinstance(_fy_led, pd.DataFrame) and not _fy_led.empty:
+                            _cur_fy = _fy_led.iloc[-1]
+                            _cgt_acc = float(_cur_fy["CGT at Lodgement (AUD)"])
+                            _cf_out = float(_cur_fy["Carry-Fwd Out"])
+                            if _cgt_acc > 0:
+                                _parts.append(
+                                    f"{_cur_fy['FY']} CGT accrued: ${_cgt_acc:,.0f}"
+                                )
+                            elif _cf_out > 0:
+                                _parts.append(
+                                    f"{_cur_fy['FY']} loss c/f: ${_cf_out:,.0f} "
+                                    f"(~${_cf_out * _effective_cgt_rate(short_term=True):,.0f} future tax shield)"
+                                )
+                    except Exception:
+                        pass
+                    _live_text = "    ".join(_parts)
+
+                    _live_tb = slide3.shapes.add_textbox(
+                        Cm(2.032), Cm(2.55), Cm(21.5), Cm(0.55)
+                    )
+                    _live_tf = _live_tb.text_frame
+                    _live_tf.clear()
+                    _live_tf.word_wrap = False
+                    _live_tf.margin_left = 0
+                    _live_tf.margin_top = 0
+                    _live_p = _live_tf.paragraphs[0]
+                    _live_p.text = _live_text
+                    _live_p.font.size = Pt(11)
+                    _live_p.font.bold = True
+                    _live_p.font.color.rgb = RGBColor(255, 255, 255)
+                    _live_p.alignment = PP_ALIGN.LEFT
+                    print(f"[pptx] Slide 3 live perf callout: {_live_text}")
+        except Exception as _e_live:
+            print(f"[pptx] Slide 3 live perf callout skipped: {_e_live}")
 
         # --- Plot ---
         # Use matplotlib directly (not pandas .plot) so the x-axis is a real
@@ -14485,9 +15106,38 @@ def export_to_ppt(results, trades, charts=None):
         
             metrics = ["3M", "6M", "12M", "3Y"]
             rows = {}
-        
-            if port_px is not None:
-                rows["Portfolio"] = [
+
+            # Portfolio row: actual NAV from lots seed + fills, computed in
+            # the chart section above and stashed in actual_nav_for_table.
+            # port_px (the hypothetical) stays in scope below as the date
+            # anchor for the Strategy synth row — that line is meant to
+            # span the full 3M window, while Actual NAV stubs in at
+            # LIVE_START. Periods predating LIVE_START → NaN via
+            # _period_total_return → empty cells in the table.
+            _table_actual_nav = locals().get("actual_nav_for_table", None)
+            if (_table_actual_nav is not None
+                    and isinstance(_table_actual_nav, pd.Series)
+                    and not _table_actual_nav.dropna().empty):
+                _nav_clean = _table_actual_nav.dropna()
+                _first_valid = (
+                    _nav_clean.iloc[0] if not _nav_clean.empty else None
+                )
+                if _first_valid is not None and float(_first_valid) > 0:
+                    _live_label = (
+                        f"Actual NAV (since {_nav_clean.index[0].strftime('%d %b')})"
+                    )
+                else:
+                    _live_label = "Actual NAV"
+                rows[_live_label] = [
+                    _period_total_return(_table_actual_nav, end_dt, months=3),
+                    _period_total_return(_table_actual_nav, end_dt, months=6),
+                    _period_total_return(_table_actual_nav, end_dt, months=12),
+                    _period_total_return(_table_actual_nav, end_dt, years=3),
+                ]
+            elif port_px is not None:
+                # No live NAV history yet — fall back to hypothetical so the
+                # table still has a portfolio row (dev runs / pre-seed).
+                rows["Portfolio (Hypothetical)"] = [
                     _period_total_return(port_px, end_dt, months=3),
                     _period_total_return(port_px, end_dt, months=6),
                     _period_total_return(port_px, end_dt, months=12),
@@ -14771,6 +15421,15 @@ def export_to_ppt(results, trades, charts=None):
             # Portfolio 3M against 3.09% Mkt-RF 3M because they covered different
             # 90-day windows). Slide 3 still reports live-end performance.
             end_dt_tbl = tbl_df.index.max()
+            # Factor and Strategy rows query the FULL upstream series (ffd
+            # spans 1963→present; _strat_returns_full spans the 10Y OOS
+            # window) rather than the inner-joined tbl_df, which is capped
+            # at Portfolio's ~2Y price window. Without this, 3Y / 12M cells
+            # would be NaN for factor rows even though Ken French data goes
+            # back decades. Portfolio row stays on port_px (so 3Y is NaN
+            # while the live price window is <3Y — honest, populates as
+            # history accrues).
+            _strat_full_local = locals().get("_strat_returns_full", None)
             rows = {}
             for name in tbl_df.columns:
                 if name == "Portfolio":
@@ -14780,8 +15439,18 @@ def export_to_ppt(results, trades, charts=None):
                         _period_total_return(port_px, end_dt_tbl, months=12),
                         _period_total_return(port_px, end_dt_tbl, years=3),
                     ]
+                elif (name == strategy_label_ff
+                        and isinstance(_strat_full_local, pd.Series)
+                        and not _strat_full_local.empty):
+                    rr = _strat_full_local
+                    rows[name] = [
+                        _window_compound_total(rr, end_dt_tbl, months=3),
+                        _window_compound_total(rr, end_dt_tbl, months=6),
+                        _window_compound_total(rr, end_dt_tbl, months=12),
+                        _window_compound_total(rr, end_dt_tbl, years=3),
+                    ]
                 else:
-                    rr = tbl_df[name]
+                    rr = ffd[name] if name in ffd.columns else tbl_df[name]
                     rows[name] = [
                         _window_compound_total(rr, end_dt_tbl, months=3),
                         _window_compound_total(rr, end_dt_tbl, months=6),

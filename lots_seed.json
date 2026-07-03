@@ -3,18 +3,18 @@
     "Security": "BBUS.AX",
     "AcqDate": "2026-06-26T00:00:00",
     "Units": 531,
-    "CostBaseAUD": 23.43000030517578
+    "CostBaseAUD": 24.809999465942383
   },
   {
     "Security": "BEAR.AX",
     "AcqDate": "2026-06-26T00:00:00",
     "Units": 21590,
-    "CostBaseAUD": 7.349999904632568
+    "CostBaseAUD": 7.400000095367432
   },
   {
     "Security": "HBRD.AX",
     "AcqDate": "2026-06-26T00:00:00",
     "Units": 2034,
-    "CostBaseAUD": 10.07999992370605
+    "CostBaseAUD": 10.100000381469727
   }
 ]

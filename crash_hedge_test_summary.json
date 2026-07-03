@@ -1,5 +1,5 @@
 {
-  "run_at": "2026-06-19T13:17:58",
+  "run_at": "2026-06-19T13:27:18",
   "config": {
     "dd_trigger": -0.15,
     "dd_release": -0.05,
@@ -11,256 +11,286 @@
   },
   "baseline": {
     "info": {
-      "elapsed_sec": 77.94490979996044,
-      "n_executed": 280,
-      "n_skipped": 79,
+      "elapsed_sec": 93.02247850003187,
+      "n_executed": 324,
+      "n_skipped": 108,
       "hedge_active_rebals": 0,
       "hedge_n_triggers": 0,
       "hedge_events": [],
-      "cgt_bps_per_year": 159.7584400171571
+      "cgt_bps_per_year": 137.8248807675798
     },
     "folds": [
       {
         "year": 2016,
-        "ann_return": 0.020695070413357497,
-        "sharpe": 0.1897435317718504,
-        "max_drawdown": -0.07885632124046804,
-        "spy_ann_return": 0.12458169144797027,
-        "alpha_vs_spy": -0.10388662103461277
+        "ann_return": 0.049504037859732675,
+        "sharpe": 0.38539824430412783,
+        "max_drawdown": -0.0792392888117619,
+        "spy_ann_return": 0.12458186558903517,
+        "alpha_vs_spy": -0.0750778277293025
       },
       {
         "year": 2017,
-        "ann_return": 0.13348577896080482,
-        "sharpe": 1.2654654980401554,
-        "max_drawdown": -0.08355544949187144,
-        "spy_ann_return": 0.1270205609083399,
-        "alpha_vs_spy": 0.006465218052464916
+        "ann_return": 0.12170405895425906,
+        "sharpe": 1.132016714190283,
+        "max_drawdown": -0.09721232662164536,
+        "spy_ann_return": 0.12702016978209896,
+        "alpha_vs_spy": -0.005316110827839893
       },
       {
         "year": 2018,
-        "ann_return": -0.06268135823095844,
-        "sharpe": -0.4231063876845673,
-        "max_drawdown": -0.20436836204341224,
-        "spy_ann_return": 0.05451460435849609,
-        "alpha_vs_spy": -0.11719596258945453
+        "ann_return": -0.06586282266372678,
+        "sharpe": -0.44143484221601514,
+        "max_drawdown": -0.20606033308722682,
+        "spy_ann_return": 0.05451501650186619,
+        "alpha_vs_spy": -0.12037783916559297
       },
       {
         "year": 2019,
-        "ann_return": 0.2597728195700617,
-        "sharpe": 2.0965674410441895,
-        "max_drawdown": -0.12676331443480326,
-        "spy_ann_return": 0.3118554952630679,
-        "alpha_vs_spy": -0.052082675693006175
+        "ann_return": 0.3786137951682895,
+        "sharpe": 3.19887444237282,
+        "max_drawdown": -0.08930853895063151,
+        "spy_ann_return": 0.31185496633720233,
+        "alpha_vs_spy": 0.06675882883108719
       },
       {
         "year": 2020,
-        "ann_return": 0.15056697579228606,
-        "sharpe": 0.9571776224467013,
-        "max_drawdown": -0.12469722837726749,
-        "spy_ann_return": 0.07528529343648804,
-        "alpha_vs_spy": 0.07528168235579802
+        "ann_return": 0.012123563994979714,
+        "sharpe": 0.07349318933657709,
+        "max_drawdown": -0.22955705482139033,
+        "spy_ann_return": 0.07528532715526293,
+        "alpha_vs_spy": -0.06316176316028321
       },
       {
         "year": 2021,
-        "ann_return": 0.25825645667574615,
-        "sharpe": 1.5305189132674675,
-        "max_drawdown": -0.1016887251162718,
-        "spy_ann_return": 0.35388155810376465,
-        "alpha_vs_spy": -0.0956251014280185
+        "ann_return": 0.21188621101764937,
+        "sharpe": 1.374159911277044,
+        "max_drawdown": -0.10068894230013836,
+        "spy_ann_return": 0.3538817896980395,
+        "alpha_vs_spy": -0.14199557868039014
       },
       {
         "year": 2022,
-        "ann_return": -0.1495361303462751,
-        "sharpe": -1.0334292699217578,
-        "max_drawdown": -0.1967642782534177,
-        "spy_ann_return": -0.12055940451007507,
-        "alpha_vs_spy": -0.028976725836200035
+        "ann_return": -0.13964255351592336,
+        "sharpe": -0.968059411423902,
+        "max_drawdown": -0.1852941500774632,
+        "spy_ann_return": -0.12055918944724164,
+        "alpha_vs_spy": -0.01908336406868172
       },
       {
         "year": 2023,
-        "ann_return": 0.08631177716302885,
-        "sharpe": 0.7360991415892154,
-        "max_drawdown": -0.07202770667980585,
-        "spy_ann_return": 0.2451826885258117,
-        "alpha_vs_spy": -0.15887091136278286
+        "ann_return": 0.041589315282475114,
+        "sharpe": 0.39780893778254606,
+        "max_drawdown": -0.07075350677255221,
+        "spy_ann_return": 0.24518238283780258,
+        "alpha_vs_spy": -0.20359306755532747
       },
       {
         "year": 2024,
-        "ann_return": 0.2961595303325095,
-        "sharpe": 1.7502316051928883,
-        "max_drawdown": -0.159490921446386,
-        "spy_ann_return": 0.3589710645242923,
-        "alpha_vs_spy": -0.06281153419178276
+        "ann_return": 0.25419199997138975,
+        "sharpe": 1.5156788851411702,
+        "max_drawdown": -0.16220117138806922,
+        "spy_ann_return": 0.35897106452429317,
+        "alpha_vs_spy": -0.10477906455290342
       },
       {
         "year": 2025,
-        "ann_return": 0.2904373351978906,
-        "sharpe": 1.8469579510817218,
-        "max_drawdown": -0.14375701531619967,
-        "spy_ann_return": 0.09091834121430176,
-        "alpha_vs_spy": 0.19951899398358885
+        "ann_return": 0.32237738283539463,
+        "sharpe": 2.0528179122754904,
+        "max_drawdown": -0.1446275540634322,
+        "spy_ann_return": 0.09091834121430287,
+        "alpha_vs_spy": 0.23145904162109177
       }
     ],
     "aggregate": {
-      "mean_sharpe": 0.892,
-      "std_sharpe": 1.033,
-      "mean_alpha": -0.033818,
-      "mean_max_drawdown": -0.129197
+      "mean_sharpe": 0.872,
+      "std_sharpe": 1.236,
+      "mean_alpha": -0.043517,
+      "mean_max_drawdown": -0.136494
     }
   },
   "hedge": {
     "info": {
-      "elapsed_sec": 77.51982429996133,
-      "n_executed": 223,
-      "n_skipped": 136,
-      "hedge_active_rebals": 80,
-      "hedge_n_triggers": 5,
-      "cgt_bps_per_year": 172.95697218560525
+      "elapsed_sec": 98.13784099998884,
+      "n_executed": 263,
+      "n_skipped": 184,
+      "hedge_active_rebals": 96,
+      "hedge_n_triggers": 8,
+      "cgt_bps_per_year": 142.5279600445959
     },
     "events": [
       {
-        "date": "1998-09-03",
+        "date": "1998-08-31",
         "transition": "ON",
-        "spy_dd": -0.1687
+        "spy_dd": -0.1903
       },
       {
-        "date": "1998-11-16",
+        "date": "1998-11-04",
         "transition": "OFF",
-        "spy_dd": -0.0346
+        "spy_dd": -0.0499
       },
       {
-        "date": "2000-12-21",
+        "date": "2000-12-20",
         "transition": "ON",
-        "spy_dd": -0.1656
+        "spy_dd": -0.1713
       },
       {
-        "date": "2003-06-23",
+        "date": "2003-06-04",
         "transition": "OFF",
-        "spy_dd": -0.0284
+        "spy_dd": -0.0393
       },
       {
-        "date": "2008-01-28",
+        "date": "2008-01-16",
         "transition": "ON",
-        "spy_dd": -0.172
+        "spy_dd": -0.1523
       },
       {
-        "date": "2010-01-11",
+        "date": "2009-12-15",
         "transition": "OFF",
-        "spy_dd": -0.0389
+        "spy_dd": -0.0481
       },
       {
-        "date": "2011-08-22",
+        "date": "2011-08-04",
         "transition": "ON",
-        "spy_dd": -0.1837
+        "spy_dd": -0.1595
       },
       {
-        "date": "2012-02-06",
+        "date": "2011-12-20",
         "transition": "OFF",
-        "spy_dd": -0.0487
+        "spy_dd": -0.0494
       },
       {
-        "date": "2022-06-13",
+        "date": "2018-12-21",
         "transition": "ON",
-        "spy_dd": -0.1921
+        "spy_dd": -0.1663
       },
       {
-        "date": "2023-02-20",
+        "date": "2019-02-12",
         "transition": "OFF",
-        "spy_dd": -0.0314
+        "spy_dd": -0.0435
+      },
+      {
+        "date": "2020-03-09",
+        "transition": "ON",
+        "spy_dd": -0.1794
+      },
+      {
+        "date": "2020-08-24",
+        "transition": "OFF",
+        "spy_dd": -0.0426
+      },
+      {
+        "date": "2022-05-18",
+        "transition": "ON",
+        "spy_dd": -0.1576
+      },
+      {
+        "date": "2023-02-06",
+        "transition": "OFF",
+        "spy_dd": -0.0379
+      },
+      {
+        "date": "2025-04-04",
+        "transition": "ON",
+        "spy_dd": -0.1762
+      },
+      {
+        "date": "2025-05-16",
+        "transition": "OFF",
+        "spy_dd": -0.0437
       }
     ],
     "folds": [
       {
         "year": 2016,
-        "ann_return": 0.020827976626628386,
-        "sharpe": 0.18974226036074412,
-        "max_drawdown": -0.08724349085027894,
-        "spy_ann_return": 0.12458169144797027,
-        "alpha_vs_spy": -0.10375371482134188
+        "ann_return": -0.039727884405843183,
+        "sharpe": -0.33103633424995227,
+        "max_drawdown": -0.10053655218817792,
+        "spy_ann_return": 0.12458186558903517,
+        "alpha_vs_spy": -0.16430974999487835
       },
       {
         "year": 2017,
-        "ann_return": 0.1437520333145228,
-        "sharpe": 1.3654334346590185,
-        "max_drawdown": -0.08171532949671556,
-        "spy_ann_return": 0.1270205609083399,
-        "alpha_vs_spy": 0.01673147240618289
+        "ann_return": 0.1324875939806336,
+        "sharpe": 1.3590651463137642,
+        "max_drawdown": -0.06902579094416517,
+        "spy_ann_return": 0.12702016978209896,
+        "alpha_vs_spy": 0.005467424198534632
       },
       {
         "year": 2018,
-        "ann_return": -0.07017429524852026,
-        "sharpe": -0.4739845610046145,
-        "max_drawdown": -0.20450511894776435,
-        "spy_ann_return": 0.05451460435849609,
-        "alpha_vs_spy": -0.12468889960701635
+        "ann_return": -0.087182725042106,
+        "sharpe": -0.598041052037154,
+        "max_drawdown": -0.19294077830282708,
+        "spy_ann_return": 0.05451501650186619,
+        "alpha_vs_spy": -0.1416977415439722
       },
       {
         "year": 2019,
-        "ann_return": 0.2597129468371524,
-        "sharpe": 2.0959296460870256,
-        "max_drawdown": -0.12676496511143087,
-        "spy_ann_return": 0.3118554952630679,
-        "alpha_vs_spy": -0.05214254842591548
+        "ann_return": 0.30210729354299026,
+        "sharpe": 2.6504184360818352,
+        "max_drawdown": -0.08944535466708592,
+        "spy_ann_return": 0.31185496633720233,
+        "alpha_vs_spy": -0.00974767279421207
       },
       {
         "year": 2020,
-        "ann_return": 0.15055520852208693,
-        "sharpe": 0.9570997616203591,
-        "max_drawdown": -0.12469863022907168,
-        "spy_ann_return": 0.07528529343648804,
-        "alpha_vs_spy": 0.07526991508559888
+        "ann_return": 0.01624433128651881,
+        "sharpe": 0.10845490770555492,
+        "max_drawdown": -0.2273074819632982,
+        "spy_ann_return": 0.07528532715526293,
+        "alpha_vs_spy": -0.05904099586874412
       },
       {
         "year": 2021,
-        "ann_return": 0.2582486843144105,
-        "sharpe": 1.5304711274315541,
-        "max_drawdown": -0.10168906756067841,
-        "spy_ann_return": 0.35388155810376465,
-        "alpha_vs_spy": -0.09563287378935414
+        "ann_return": 0.2198266898979231,
+        "sharpe": 1.4365872956071497,
+        "max_drawdown": -0.10070120223107026,
+        "spy_ann_return": 0.3538817896980395,
+        "alpha_vs_spy": -0.13405509980011643
       },
       {
         "year": 2022,
-        "ann_return": -0.08983434648290478,
-        "sharpe": -0.7669845443936752,
-        "max_drawdown": -0.16324513869845714,
-        "spy_ann_return": -0.12055940451007507,
-        "alpha_vs_spy": 0.030725058027170293
+        "ann_return": -0.09444602336143515,
+        "sharpe": -0.8012087252907236,
+        "max_drawdown": -0.1603259101743939,
+        "spy_ann_return": -0.12055918944724164,
+        "alpha_vs_spy": 0.026113166085806494
       },
       {
         "year": 2023,
-        "ann_return": 0.07589869774196667,
-        "sharpe": 0.6558910607797478,
-        "max_drawdown": -0.07202770667980585,
-        "spy_ann_return": 0.2451826885258117,
-        "alpha_vs_spy": -0.16928399078384504
+        "ann_return": 0.03934676335085019,
+        "sharpe": 0.37887861128287725,
+        "max_drawdown": -0.07113493793018233,
+        "spy_ann_return": 0.24518238283780258,
+        "alpha_vs_spy": -0.2058356194869524
       },
       {
         "year": 2024,
-        "ann_return": 0.2944292019296908,
-        "sharpe": 1.7363111595376604,
-        "max_drawdown": -0.16064561324169968,
-        "spy_ann_return": 0.3589710645242923,
-        "alpha_vs_spy": -0.06454186259460148
+        "ann_return": 0.2557885700764928,
+        "sharpe": 1.5069398865163797,
+        "max_drawdown": -0.16331890260168969,
+        "spy_ann_return": 0.35897106452429317,
+        "alpha_vs_spy": -0.10318249444780037
       },
       {
         "year": 2025,
-        "ann_return": 0.29044586610906986,
-        "sharpe": 1.8470279671041099,
-        "max_drawdown": -0.14375652802978822,
-        "spy_ann_return": 0.09091834121430176,
-        "alpha_vs_spy": 0.1995275248947681
+        "ann_return": 0.20963284363025392,
+        "sharpe": 1.374309762310895,
+        "max_drawdown": -0.1564431382259902,
+        "spy_ann_return": 0.09091834121430287,
+        "alpha_vs_spy": 0.11871450241595105
       }
     ],
     "aggregate": {
-      "mean_sharpe": 0.914,
-      "std_sharpe": 0.993,
-      "mean_alpha": -0.028779,
-      "mean_max_drawdown": -0.126629
+      "mean_sharpe": 0.708,
+      "std_sharpe": 1.123,
+      "mean_alpha": -0.066757,
+      "mean_max_drawdown": -0.133118
     }
   },
   "uplift": {
-    "sharpe": 0.022,
-    "alpha": 0.005039,
-    "max_drawdown": 0.002568
+    "sharpe": -0.164,
+    "alpha": -0.023241,
+    "max_drawdown": 0.003376
   }
 }
