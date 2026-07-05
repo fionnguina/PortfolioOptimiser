@@ -63,6 +63,37 @@ def extract_top_level_imports(py_file: Path) -> list[str]:
             mods.add(node.module.split('.')[0])
     return sorted(m for m in mods if not m.startswith('_'))
 
+def _free_dist_exe(root: Path) -> None:
+    """Fail-fast guard for the recurring dist-lock gotcha: hung --noconsole
+    launches keep the old exe locked, the artefact cleanup below swallows the
+    rmtree failure silently, and PyInstaller then dies ~4 minutes later at its
+    final os.remove. Detect the lock up front and kill the orphaned instances
+    (a locked target exe means the requested build cannot succeed anyway)."""
+    import os
+    import time
+    exe = root / "dist" / f"{PROJECT_NAME}.exe"
+    if not exe.exists():
+        return
+    try:
+        with open(exe, "ab"):
+            return  # writable → not locked
+    except PermissionError:
+        pass
+    print(f"[build] dist exe is LOCKED (hung instances?) — running taskkill...")
+    subprocess.run(["taskkill", "/F", "/IM", f"{PROJECT_NAME}.exe"],
+                   capture_output=True)
+    time.sleep(2)
+    try:
+        with open(exe, "ab"):
+            pass
+        print("[build] lock released; continuing.")
+    except PermissionError:
+        raise SystemExit(
+            f"[build] ABORT: {exe} is still locked after taskkill. "
+            f"Close whatever holds it (Task Manager → {PROJECT_NAME}) and re-run."
+        )
+
+
 def _write_version_file(root: Path) -> tuple[str, str]:
     """Write _version.py with git SHA + build timestamp. Returns (sha, ts)."""
     import datetime
@@ -105,6 +136,8 @@ def build():
     # generated _version.py is bundled into the .exe and logged on startup.
     sha, ts = _write_version_file(root)
     print(f"[build] version stamp: GIT_SHA={sha}, BUILD_TIME={ts}")
+
+    _free_dist_exe(root)
 
     # Clean old artefacts
     for p in [root / "build", root / "dist", root / f"{PROJECT_NAME}.spec"]:
