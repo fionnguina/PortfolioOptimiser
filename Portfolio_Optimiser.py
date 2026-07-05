@@ -688,6 +688,36 @@ if _lt_defer_env:
     except Exception as _e_defer_env:
         print(f"[config-override] bad PORTOPT_LT_DEFER_DAYS ignored: {_e_defer_env}")
 
+# DD-conditional variant (parked 2026-07-02, formulated after the unconditional
+# shield failed dev/validation): the shield's measured failure mode is slowing
+# de-risking at violent turns — shielded lots are recent winners, so protecting
+# them fights the solver exactly when the engine earns its edge (COVID/2022).
+# When True, the shield is RELEASED (sells run unshielded) at early-triggered
+# rebalances — the SPY DD-deepen insertions — keeping the tax deferral only on
+# calm scheduled rebalances. No effect unless LT_DEFER_WINDOW_DAYS > 0.
+LT_DEFER_DD_CONDITIONAL = False
+
+_lt_defer_cond_env = os.environ.get("PORTOPT_LT_DEFER_DD_COND")
+if _lt_defer_cond_env is not None:
+    LT_DEFER_DD_CONDITIONAL = _lt_defer_cond_env.strip() not in ("", "0", "false", "False")
+    print(f"[config-override] LT_DEFER_DD_CONDITIONAL={LT_DEFER_DD_CONDITIONAL} via env")
+
+# Sharper release condition (variant B, 2026-07-03): instead of releasing at
+# early-triggered rebalances (which fire in ~30% of ALL 6W gaps — ordinary
+# chop, not stress), release when the benchmark's trailing-252d drawdown at
+# the rebalance date is at or below this threshold (e.g. -0.10). Targets true
+# bear states (COVID, 2022, late-2018) and keeps the deferral running through
+# noise. 0.0 = off. When set, this REPLACES the early-trigger release rule.
+LT_DEFER_RELEASE_DD = 0.0
+
+_lt_defer_reldd_env = os.environ.get("PORTOPT_LT_DEFER_RELEASE_DD")
+if _lt_defer_reldd_env:
+    try:
+        LT_DEFER_RELEASE_DD = min(0.0, float(_lt_defer_reldd_env))
+        print(f"[config-override] LT_DEFER_RELEASE_DD={LT_DEFER_RELEASE_DD} via env")
+    except Exception as _e_reldd_env:
+        print(f"[config-override] bad PORTOPT_LT_DEFER_RELEASE_DD ignored: {_e_reldd_env}")
+
 
 # ============================================================================
 # CONDITIONAL REBALANCING (Q2)
@@ -943,8 +973,14 @@ def _log_config_snapshot() -> None:
     if MU_SHRINKAGE_LAMBDA > 0:
         print(f"[config] MU SHRINKAGE          λ={MU_SHRINKAGE_LAMBDA:.2f} toward cross-sectional median")
     if LT_DEFER_WINDOW_DAYS > 0:
+        if LT_DEFER_RELEASE_DD < 0:
+            _cond_str = f"released when SPY 252d DD ≤ {LT_DEFER_RELEASE_DD*100:.0f}%"
+        elif LT_DEFER_DD_CONDITIONAL:
+            _cond_str = "released at early-triggered rebals"
+        else:
+            _cond_str = "unconditional"
         print(f"[config] LT-DEFER              gain lots within {LT_DEFER_WINDOW_DAYS}d of "
-              f"12mo discount are shielded from sells")
+              f"12mo discount are shielded from sells ({_cond_str})")
     print(f"[config] DRIFT                 LIVE_START={LIVE_TRADING_START_DATE or '(not set)'}  "
           f"monthly={DRIFT_MONTHLY_THRESH*100:.0f}%  cumulative={DRIFT_CUMULATIVE_THRESH*100:.0f}%  "
           f"DD={DRIFT_DD_ALERT_THRESH*100:+.0f}%  slip={DRIFT_SLIPPAGE_BPS_THRESH:.0f}bps")
@@ -1236,7 +1272,9 @@ def _run_factor_recs() -> int:
     print(f"  Region: US (most relevant given universe concentration)")
     print()
     try:
-        ff = get_ff5_mom_daily(region="US")
+        # Lockboxed: tilt recommendations must not read post-lockbox factor
+        # returns (moot while Ken French publishes ~2mo behind, but principled).
+        ff = _apply_data_lockbox(get_ff5_mom_daily(region="US"))
     except Exception as e:
         print(f"[factor-recs] failed to load FF5+MOM data: {e}")
         return 1
@@ -6922,6 +6960,8 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"gcaps:{json.dumps(globals().get('SECTOR_GROUP_CAPS', {}), sort_keys=True)}".encode())
         h.update(f"mu_shrink:{float(globals().get('MU_SHRINKAGE_LAMBDA', 0.0) or 0.0)}".encode())
         h.update(f"lt_defer:{int(globals().get('LT_DEFER_WINDOW_DAYS', 0) or 0)}".encode())
+        h.update(f"lt_defer_cond:{int(bool(globals().get('LT_DEFER_DD_CONDITIONAL', False)))}".encode())
+        h.update(f"lt_defer_reldd:{float(globals().get('LT_DEFER_RELEASE_DD', 0.0) or 0.0)}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -7049,6 +7089,9 @@ def run_oos_ensemble_walk_forward(
     # since the prior scheduled rebal. Catches fast regime shifts at 6W cadence.
     augmented_dates = list(scheduled_dates)
     n_early_triggered = 0
+    # Kept as a set so the LT-deferral shield can be released on exactly these
+    # stress-inserted dates (LT_DEFER_DD_CONDITIONAL).
+    _early_trigger_dates: set = set()
     if (benchmark_ticker in px.columns
             and EARLY_TRIGGER_DD_DEEPEN > 0
             and len(scheduled_dates) > 1):
@@ -7067,6 +7110,7 @@ def run_oos_ensemble_walk_forward(
             trigger_dates = window.index[trigger_mask]
             if len(trigger_dates) > 0:
                 augmented_dates.append(trigger_dates[0])
+                _early_trigger_dates.add(trigger_dates[0])
                 n_early_triggered += 1
 
     # --- Crash-hedge forced rebals: pre-scan daily SPY drawdown to find
@@ -7123,6 +7167,16 @@ def run_oos_ensemble_walk_forward(
     # LT-deferral diagnostics (0 when LT_DEFER_WINDOW_DAYS=0).
     _defer_events = 0
     _defer_value_total = 0.0
+    _defer_released_rebals = 0
+    # Trailing benchmark drawdown for the LT_DEFER_RELEASE_DD rule (same
+    # 252d-rolling-peak measure as the crash hedge).
+    _lt_defer_reldd = float(globals().get("LT_DEFER_RELEASE_DD", 0.0) or 0.0)
+    _spy_dd_for_defer = None
+    if _lt_defer_reldd < 0 and benchmark_ticker in px.columns:
+        _spy_ser_defer = px[benchmark_ticker].sort_index()
+        _spy_dd_for_defer = (_spy_ser_defer
+                             / _spy_ser_defer.rolling(window=252, min_periods=1).max()
+                             - 1.0)
     _running_nav = float(starting_nav_aud)  # AUD; flat-fee impact scales with NAV
     # Conditional rebalancing diagnostics
     n_skipped = 0
@@ -7388,7 +7442,24 @@ def run_oos_ensemble_walk_forward(
         # buys was never raised. Return stream + brokerage + lot book all
         # see the adjusted weights, so the drift cost is fully modeled.
         _lt_defer_days = int(globals().get("LT_DEFER_WINDOW_DAYS", 0) or 0)
-        if (_lt_defer_days > 0 and not skip_rebal and px_at_t is not None
+        # DD-conditional release: the shield stands down entirely so de-risking
+        # sells run unshielded. Two rules (release-DD replaces early-trigger):
+        #   LT_DEFER_RELEASE_DD < 0  → release when benchmark trailing-252d DD
+        #                              at t is at/below the threshold (bear state).
+        #   LT_DEFER_DD_CONDITIONAL  → release at early-triggered rebal dates.
+        if _lt_defer_reldd < 0 and _spy_dd_for_defer is not None:
+            try:
+                _dd_now = float(_spy_dd_for_defer.asof(t))
+            except Exception:
+                _dd_now = 0.0
+            _lt_shield_released = bool(np.isfinite(_dd_now) and _dd_now <= _lt_defer_reldd)
+        else:
+            _lt_shield_released = (bool(globals().get("LT_DEFER_DD_CONDITIONAL", False))
+                                   and t in _early_trigger_dates)
+        if _lt_defer_days > 0 and _lt_shield_released:
+            _defer_released_rebals += 1
+        if (_lt_defer_days > 0 and not _lt_shield_released
+                and not skip_rebal and px_at_t is not None
                 and not _prev_blend_w.empty and _running_nav > 0):
             try:
                 _union = sorted(set(_prev_blend_w.index).union(w_blend.index))
@@ -7467,7 +7538,7 @@ def run_oos_ensemble_walk_forward(
                 # so the weight adjustment above and the lot allocation here
                 # shield the same lots.
                 _protect_fn = None
-                if _lt_defer_days > 0:
+                if _lt_defer_days > 0 and not _lt_shield_released:
                     _lt_thresh_days = int(CGT_CONFIG["lt_holding_days"])
                     def _make_protect(price_now):
                         def _protect(lot, hold_days):
@@ -7568,10 +7639,11 @@ def run_oos_ensemble_walk_forward(
 
     rebalance_costs_ser = pd.Series(rebalance_costs).sort_index() if rebalance_costs else pd.Series(dtype=float)
     rebalance_taxes_ser = pd.Series(rebalance_taxes).sort_index() if rebalance_taxes else pd.Series(dtype=float)
-    if _defer_events > 0:
+    if _defer_events > 0 or _defer_released_rebals > 0:
         print(f"[lt-defer] {_defer_events} lot-shield event(s) over window, "
               f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
-              f"discount boundary (window={int(globals().get('LT_DEFER_WINDOW_DAYS', 0))}d)")
+              f"discount boundary (window={int(globals().get('LT_DEFER_WINDOW_DAYS', 0))}d); "
+              f"shield released at {_defer_released_rebals} rebal(s)")
     return {
         "blended_returns": blended_returns,
         "per_candidate_returns": per_cand_rets_df,
@@ -10711,7 +10783,7 @@ def _run_tilted_ensemble_test() -> int:
     # FF5+MOM factor data (US region — most relevant given universe).
     print(f"[tilted-ens] loading FF5+MOM factor data...")
     try:
-        ff = get_ff5_mom_daily(region="US")
+        ff = _apply_data_lockbox(get_ff5_mom_daily(region="US"))
         ff.index = pd.to_datetime(ff.index).tz_localize(None)
     except Exception as e:
         print(f"[tilted-ens] failed to load FF5+MOM data: {e}")

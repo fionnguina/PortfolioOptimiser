@@ -12,18 +12,31 @@ for the original framework + first results.
 
 ---
 
-## Current state — as of 2026-06-22
+## Current state — as of 2026-07-03 (REFRESH #1 executed)
 
 | Item | Value |
 |---|---|
-| Dev window | 2015-2020 |
-| Validation window | 2020-2026 |
-| Peek budget | 7 |
-| Peeks used | 5 |
-| Peeks remaining | 2 |
-| Last peek | TLH validation pass (2026-06-18) |
+| Dev window | 2015 → 2026-06-30 (= data lockbox date) |
+| Buffer | July 2026 |
+| Validation window | 2026-08-01 → 2028-08-01 (**forward — live evidence only**) |
+| Peek budget | 7 (reset at refresh) |
+| Peeks used | 0 |
+| Last refresh | 2026-07-03 — trigger: peek budget exhausted (7/7) |
+| Prior window record | [LOCKBOX_HISTORY.md](LOCKBOX_HISTORY.md) |
 | Live trading start | **2026-06-22 (paper)** |
 | Real-money start | TBC, blocked on AFSL |
+
+**The new validation window has no backtest.** Every val "peek" is now a
+read of accumulated live/paper evidence, not a backtest run. Shipping
+decisions must be justified purely from dev-window (2015→2026-06)
+evidence: full-window CV + full-period MaxDD + the regime-split harness.
+
+**`--dev-validation` harness reinterpretation:** its two windows
+(2015→Feb 2020 / Feb 2020→now) are BOTH inside the new dev window. It is
+no longer a validation peek — it is an in-sample **regime-robustness
+split** (bull vs post-COVID), and remains the strongest in-sample gate we
+have. Use it freely; it costs no budget. But it can no longer catch
+overfitting to 2020-2026 — only forward live evidence can.
 
 ### What "peek" means here
 
@@ -31,15 +44,14 @@ A peek is **any time we look at validation-window results and use that
 information to decide whether to ship something.** It does not count if
 we look at validation purely for monitoring without taking action — but
 in practice it is hard to look without acting, so we count generously.
+Under the forward window this means: any ship/no-ship decision that
+cites live-window performance.
 
-### Peek history (rough)
+### Peek history (current window)
 
-1. Initial validation pass on the 5-slot ensemble baseline (2026-06-18).
-2. TLH layer validation (2026-06-18) — uplift confirmed ~0.
-3. Cost-aware solver validation (2026-06-18) — dead-end.
-4. SKIP_REBAL_DELTA tuning validation — dead-end.
-5. Stretch+hedge validation (2026-06-19) — shipped, reverted same day
-   after full-period MaxDD revealed the fold-mean lie.
+_None yet. Window opened 2026-08-01; evidence accumulates from paper
+trading. See [LOCKBOX_HISTORY.md](LOCKBOX_HISTORY.md) for the 7 peeks
+spent on the retired 2020-2026 window._
 
 ---
 
@@ -76,16 +88,22 @@ decision** triggers a refresh.
 5. **Log the refresh** to [memory reference_pending_work](memory/reference_pending_work.md)
    and update this file's "Current state" table.
 
-This means after the first refresh:
-- Dev: 2015 → 2026-07
-- Val: 2026-08 → 2028-08
-- Peeks: 7
+**Refresh #1 executed 2026-07-03** (trigger: peek budget exhausted 7/7):
+- Dev: 2015 → 2026-06-30 (aligned to DATA_LOCKBOX_DATE)
+- Buffer: July 2026
+- Val: 2026-08-01 → 2028-08-01
+- Peeks: reset to 7
+- Old-window snapshot: [LOCKBOX_HISTORY.md](LOCKBOX_HISTORY.md)
 
 Caveat: the new val window does not have observed data yet — every
 peek is **waiting for live evidence to accumulate** rather than running
 a backtest. This is by design. The discipline shifts from "don't peek
 at backtest" to "don't make engine changes that you cannot justify
 purely from dev/in-sample evidence."
+
+The DATA_LOCKBOX_DATE stays at 2026-06-30 for all backtest work. When the
+val window matures (2028-08) or a refresh trigger fires, the next refresh
+moves the lockbox forward in the same step — never in between.
 
 ---
 
