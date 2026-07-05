@@ -55,7 +55,9 @@ $PptPath = Join-Path $ScriptDir "dist\Reports\Portfolio_Report.pptx"
 if (-not $LogPath) {
     $LogPath = Join-Path $ScriptDir "dist\run.log"
 }
-$DailyLogPath = Join-Path $ScriptDir "dist\daily_auto.log"
+# Repo root, NOT dist\ — build_helper wipes dist on every rebuild, which was
+# silently destroying the wrapper's evidence trail (discovered 2026-07-06).
+$DailyLogPath = Join-Path $ScriptDir "daily_auto.log"
 $FlagPath = Join-Path $ScriptDir "dist\engine_done.flag"
 $EngineTimeoutSec = 600
 
@@ -279,7 +281,17 @@ if ($sentinelHit -and $engineExit -ne $null) {
 } elseif ($engineExit -ne $null) {
     Write-Log "Engine exited (code=$engineExit) after $($EngineDuration.TotalSeconds.ToString('F1'))s (no sentinel — engine may have crashed before completing health summary)."
 } else {
-    Write-Log "Engine TIMEOUT after $($EngineDuration.TotalSeconds.ToString('F1'))s — proceeding with partial log."
+    # Kill the whole process tree (/T catches multiprocessing workers, which
+    # under a frozen exe are additional "Portfolio Optimiser.exe" processes).
+    # Leaving them alive is the orphan factory that locked dist/ against
+    # rebuilds on 2026-07-03 and 2026-07-06.
+    Write-Log "Engine TIMEOUT after $($EngineDuration.TotalSeconds.ToString('F1'))s — killing engine process tree (PID=$($engineProc.Id)) and proceeding with partial log."
+    try {
+        & taskkill /PID $engineProc.Id /T /F 2>$null | Out-Null
+        Write-Log "Engine process tree killed."
+    } catch {
+        Write-Log "taskkill failed: $($_.Exception.Message) — orphans may hold the dist lock (build_helper now clears them pre-build)."
+    }
 }
 
 # --- Check engine_done.flag for status (2026-06-28) ---
