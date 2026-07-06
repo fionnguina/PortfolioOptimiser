@@ -89,17 +89,25 @@ def _cache_path(url: str) -> Path:
     return _CACHE_DIR / f"{key}.csv"
 
 def _cached_read(url: str, build_df_fn, ttl_days: int = 7) -> pd.DataFrame:
-    """Load from cache if recent, else build and cache."""
+    """Load from cache if recent, else build and cache.
+
+    Empty frames are never cached and a cached empty file is treated as a
+    miss — a transient empty download once got cached as a 10-byte header
+    and poisoned every run for the TTL window (2026-07-06, US MOM)."""
     p = _cache_path(url)
     try:
         if p.exists() and (time.time() - p.stat().st_mtime) <= ttl_days * 86400:
             df = pd.read_csv(p, index_col=0, parse_dates=[0])
-            df.index = pd.to_datetime(df.index)
-            return df.sort_index()
+            if not df.empty:
+                df.index = pd.to_datetime(df.index)
+                return df.sort_index()
+            print(f"[cache] cached file for {url[-40:]} is EMPTY — treating as miss")
     except Exception as e:
         print(f"[cache] Read miss: {e}")
 
     df = build_df_fn()
+    if df is None or df.empty:
+        raise ValueError(f"factor download returned no data rows: {url}")
     try:
         df.to_csv(p)
     except Exception as e:
@@ -287,7 +295,11 @@ def _download_mom_csv(url: str) -> pd.DataFrame:
     num_rx = re.compile(r"^\s*\d{6,8}\s*[,\s]")
     first = next(i for i, ln in enumerate(raw) if num_rx.match(ln))
     header = "Date,MOM"
-    data = [header] + [ln.strip() for ln in raw[first:] if num_rx.match(ln)]
+    # Keep exactly (date, mom): the 202605 regeneration of the US file added
+    # a trailing comma per row, which shifted fields against our 2-col header
+    # and silently emptied the frame (2026-07-06).
+    data = [header] + [",".join(ln.strip().split(",")[:2])
+                       for ln in raw[first:] if num_rx.match(ln)]
     df = pd.read_csv(io.StringIO("\n".join(data)), sep=r"\s*,\s*", engine="python")
     df["Date"] = pd.to_datetime(df["Date"], format="%Y%m%d", errors="coerce")
     df = df.dropna(subset=["Date"]).set_index("Date").sort_index()

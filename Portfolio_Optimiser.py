@@ -2367,6 +2367,16 @@ def _safe_load_region(region: str) -> pd.DataFrame:
         return _apply_data_lockbox(df)
 
 ff5_raw = _safe_load_region("US")
+if ff5_raw.empty:
+    # Empty US factors cascade into an empty optimiser universe and crash
+    # ~9k lines later at the cov build with an opaque pandas error
+    # (2026-07-06: poisoned empty MOM cache). Say it HERE, loudly.
+    print("=" * 72)
+    print("[ff5][WARN] US factor frame is EMPTY — reference factor set missing.")
+    print("[ff5][WARN] Live pipeline WILL fail downstream. Likely a failed Ken")
+    print("[ff5][WARN] French download; re-run shortly. Cache no longer stores")
+    print("[ff5][WARN] empty results, so the next run self-heals.")
+    print("=" * 72)
 ff5_win_for_betas = ff5_raw.tail(FF5_BETA_WINDOW_DAYS)
 
 # Conditional download: only fetch regions actually used by the current ticker
