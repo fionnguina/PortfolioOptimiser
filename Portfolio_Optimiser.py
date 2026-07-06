@@ -4839,6 +4839,22 @@ def make_trade_plan(
         inc = pd.Series(include_flags).reindex(tickers).fillna(True).astype(bool)
         tgt_units.loc[~inc] = cur_units.loc[~inc]
 
+    # ASX minimum marketable parcel: a BUY that would ESTABLISH a position
+    # under ~$500 AUD is rejected at the exchange (adds to existing holdings
+    # are exempt) — IBKR cancelled a 4-unit VAE.AX buy for this (2026-07-06).
+    # This is THE live plan builder (all three trade-plan modes), so the rule
+    # lives here; compute_target_units_for_holdings carries it too.
+    for _t in tickers:
+        _cu = int(cur_units.get(_t, 0))
+        _tu = int(tgt_units.get(_t, 0))
+        _pv = _tu * float(px_aud.get(_t, 0.0))
+        if (str(_t).upper().endswith(".AX") and _cu == 0 and _tu > 0
+                and _pv < ASX_MIN_MARKETABLE_PARCEL_AUD):
+            print(f"[trade-plan] {_t}: new-position target {_tu}u ≈ ${_pv:,.0f} AUD "
+                  f"< ${ASX_MIN_MARKETABLE_PARCEL_AUD:,.0f} ASX min marketable parcel — "
+                  f"dropped (accumulates at a future rebalance)")
+            tgt_units.loc[_t] = 0
+
     delta = (tgt_units - cur_units).astype(int)
     cash_flow = (-delta * px_aud).astype(float)
 
