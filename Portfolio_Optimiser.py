@@ -15057,7 +15057,12 @@ def export_to_ppt(results, trades, charts=None):
             # Use OUTER join so Portfolio rows past common_end survive (FF
             # cells will be NaN there). Cumret is computed per-column below
             # so NaN propagates correctly — FF lines stop, Portfolio continues.
-            chart_df = pd.DataFrame({"Portfolio": port_r_chart})
+            # Label says pro-forma: this series backcasts the CURRENT/target
+            # book's holdings over the window — it is NOT the fund's live
+            # NAV history (that's slide 2's "Actual NAV" line). User flagged
+            # the bare "Portfolio" label as misleading 2026-07-06.
+            _port_label_ff = "Current Book (pro-forma)"
+            chart_df = pd.DataFrame({_port_label_ff: port_r_chart})
             if not strat_r_chart.empty:
                 # Extend strategy too so its line matches Portfolio length
                 strat_full = globals().get("returns_wide_df", None)
@@ -15077,7 +15082,7 @@ def export_to_ppt(results, trades, charts=None):
                     chart_df[strategy_label_ff] = strat_r_chart
             chart_df = chart_df.join(ffd_chart[series_to_show], how="outer")
             chart_df = chart_df.loc[window_start_chart:live_end]
-            tbl_df = pd.DataFrame({"Portfolio": port_r_tbl})
+            tbl_df = pd.DataFrame({_port_label_ff: port_r_tbl})
             if not strat_r_tbl.empty:
                 tbl_df[strategy_label_ff] = strat_r_tbl
             tbl_df = tbl_df.join(ffd_tbl[series_to_show], how="inner")
@@ -15185,7 +15190,7 @@ def export_to_ppt(results, trades, charts=None):
             _strat_full_local = locals().get("_strat_returns_full", None)
             rows = {}
             for name in tbl_df.columns:
-                if name == "Portfolio":
+                if name == _port_label_ff:
                     rows[name] = [
                         _period_total_return(port_px, end_dt_tbl, months=3),
                         _period_total_return(port_px, end_dt_tbl, months=6),

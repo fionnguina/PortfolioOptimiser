@@ -548,6 +548,156 @@ def _run_check_fills_mode() -> int:
     return 0
 
 
+def _run_sync_holdings_mode(workbook: str, execute: bool) -> int:
+    """--sync-holdings: pull broker-truth positions from paper TWS and write
+    them into the Holdings sheet's Units column (typed-YES gated).
+
+    Exists because manual TWS trades bypass ibkr_fills_log.jsonl entirely —
+    without this, the engine plans against a book you no longer hold
+    (2026-07-06: user part-executed a plan manually in TWS; the sheet still
+    carried the pre-execution book). Read-only unless --execute AND typed YES.
+    The engine itself never writes Units; this tool is the one deliberate,
+    user-invoked exception.
+    """
+    try:
+        from ib_insync import IB
+    except ImportError:
+        print("[sync] ib_insync not installed. Run: pip install ib_insync")
+        return 1
+
+    print(f"[sync] connecting to PAPER IBKR at {HOST}:{PORT} (clientId={CLIENT_ID})...")
+    ib = IB()
+    try:
+        ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[sync][ERR] connect failed ({type(e).__name__}): {e}")
+        print(f"[sync] make sure TWS / IB Gateway is running on port {PORT} (paper).")
+        return 2
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed:
+            print("[sync][SAFETY] managedAccounts() returned nothing. Aborting.")
+            return 3
+        _refuse_if_live(managed[0])
+
+        # Broker truth. ASX contracts come back as bare symbols in AUD;
+        # map them back to the engine's .AX convention (inverse of
+        # _ticker_to_contract).
+        broker: dict[str, float] = {}
+        for pos in ib.positions():
+            c = pos.contract
+            if str(getattr(c, "secType", "STK")).upper() != "STK":
+                print(f"[sync] skipping non-stock position {c.symbol} ({c.secType})")
+                continue
+            sym = str(c.symbol).strip().upper()
+            if (str(getattr(c, "currency", "")).upper() == "AUD"
+                    or str(getattr(c, "primaryExchange", "")).upper() == "ASX"):
+                sym = f"{sym}.AX"
+            broker[sym] = broker.get(sym, 0.0) + float(pos.position)
+        cash_rows = [v for v in ib.accountSummary()
+                     if v.tag == "TotalCashValue" and v.currency == "AUD"]
+        cash_aud = float(cash_rows[0].value) if cash_rows else float("nan")
+    finally:
+        ib.disconnect()
+
+    import pandas as pd
+    try:
+        df = pd.read_excel(workbook, sheet_name="Holdings")
+    except Exception as e:
+        print(f"[sync][ERR] cannot read {workbook} Holdings sheet: {e}")
+        return 4
+    df.columns = [str(c).strip() for c in df.columns]
+    if "Security" not in df.columns or "Units" not in df.columns:
+        print(f"[sync][ERR] Holdings sheet needs Security + Units columns; "
+              f"found {list(df.columns)}")
+        return 4
+    sheet_units = {
+        str(s).strip().upper(): float(u)
+        for s, u in zip(df["Security"],
+                        pd.to_numeric(df["Units"], errors="coerce").fillna(0.0))
+        if str(s).strip()
+    }
+
+    all_syms = sorted(set(sheet_units) | set(broker))
+    changes = []       # (sym, sheet_units, broker_units)
+    missing_rows = []  # broker positions with no sheet row
+    print()
+    print("=" * 78)
+    print(f"HOLDINGS SYNC PREVIEW — broker truth vs {workbook}")
+    print("=" * 78)
+    print(f"  {'Security':<12} {'Sheet':>12} {'Broker':>12} {'Delta':>12}")
+    for sym in all_syms:
+        su = sheet_units.get(sym)
+        bu = broker.get(sym, 0.0)
+        if su is None:
+            missing_rows.append(sym)
+            print(f"  {sym:<12} {'(no row)':>12} {bu:>12,.0f}"
+                  f"  <- NOT IN SHEET - add via dialog first")
+            continue
+        differs = abs(su - bu) > 1e-9
+        if differs:
+            changes.append((sym, su, bu))
+        print(f"  {sym:<12} {su:>12,.0f} {bu:>12,.0f} {bu - su:>+12,.0f}"
+              f"{'  <- UPDATE' if differs else ''}")
+    print(f"  AUD cash at broker: ${cash_aud:,.2f} (info only — not written)")
+    print("=" * 78)
+
+    if not changes:
+        print("[sync] sheet already matches broker. Nothing to write.")
+        return 0
+    if not execute:
+        print(f"[sync] PREVIEW ONLY — {len(changes)} row(s) would change. "
+              f"Re-run with --sync-holdings --execute to write.")
+        return 0
+
+    prompt = (f"\n[sync][CONFIRM] About to write {len(changes)} Units value(s) into "
+              f"the Holdings sheet of {workbook}.\n"
+              f"           Type YES (uppercase) to proceed: ")
+    try:
+        reply = input(prompt)
+    except EOFError:
+        reply = ""
+    if reply != "YES":
+        print(f"[sync][SAFETY] confirmation was '{reply}', expected 'YES'. Aborting.")
+        return 5
+
+    # Write via xlwings so an already-open workbook + macros are respected.
+    import xlwings as xw
+    app_created = False
+    book = None
+    try:
+        try:
+            book = xw.Book(workbook)  # attaches to an open instance
+        except Exception:
+            app = xw.App(visible=False)
+            app_created = True
+            book = app.books.open(str(Path(workbook).resolve()))
+        sht = book.sheets["Holdings"]
+        hdr = [str(v).strip() if v is not None else ""
+               for v in sht.range("A1").expand("right").value]
+        sec_col = hdr.index("Security") + 1
+        units_col = hdr.index("Units") + 1
+        n_rows = sht.range((2, sec_col)).expand("down").last_cell.row
+        want = {s: b for s, _old, b in changes}
+        wrote = 0
+        for r in range(2, n_rows + 1):
+            sec = str(sht.range((r, sec_col)).value or "").strip().upper()
+            if sec in want:
+                sht.range((r, units_col)).value = want[sec]
+                wrote += 1
+        book.save()
+        print(f"[sync] wrote {wrote} Units value(s); workbook saved.")
+    finally:
+        if app_created and book is not None:
+            book.app.quit()
+    if missing_rows:
+        print(f"[sync][WARN] broker positions with NO sheet row (not written): "
+              f"{missing_rows}")
+        print("[sync][WARN] add these tickers via the Holdings dialog so the "
+              "universe includes them.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="IBKR Phase 3 — paper-account execution with safety gates."
@@ -571,6 +721,15 @@ def main() -> int:
                              "exited (e.g. US orders waiting for overnight US open) "
                              "or to diagnose Cancelled-with-permId=0 rows. Read-only "
                              "— never calls placeOrder.")
+    parser.add_argument("--sync-holdings", action="store_true",
+                        help="Query ib.positions() from paper TWS and reconcile the "
+                             "Holdings sheet Units column to broker truth. Catches "
+                             "manual TWS trades that never touch the fills log. "
+                             "Preview by default; add --execute (+ typed YES) to "
+                             "write the sheet.")
+    parser.add_argument("--workbook", type=str, default="Stock Analysis.xlsm",
+                        help="Workbook path for --sync-holdings "
+                             "(default: Stock Analysis.xlsm)")
     parser.add_argument("--only-tickers", type=str, default="",
                         help="Comma-separated list of tickers to keep from the "
                              "latest rec log. Use to retry specific orders after "
@@ -585,6 +744,10 @@ def main() -> int:
     # No rec log needed, no orders placed. Returns 0 on success.
     if args.check_fills:
         return _run_check_fills_mode()
+
+    # === --sync-holdings mode: broker-truth Units reconciliation ===
+    if args.sync_holdings:
+        return _run_sync_holdings_mode(args.workbook, execute=args.execute)
 
     rec_entry = _load_latest_run(Path(args.rec_log))
     trades_recs = rec_entry.get("recommended_trades", [])
