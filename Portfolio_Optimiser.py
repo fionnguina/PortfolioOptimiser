@@ -2102,18 +2102,41 @@ assert OOS_KERNEL_MODE == bool(os.environ.get("OOS_KERNEL_MODE", "").strip())
 # applies the engine's frozen logic to post-lockbox market data WITHOUT
 # the engine itself seeing it.
 #
-# User can override via env var DATA_LOCKBOX_DATE=YYYY-MM-DD if a future
-# session re-extends the validation window. Set DATA_LOCKBOX_DATE="" (empty)
-# to fully disable — DON'T DO THIS without a deliberate methodology
-# justification. Default is the user's directed lockbox.
+# SCOPE (2026-07-06, user directive after lockbox refresh #1): the lockbox
+# governs RESEARCH honesty — backtests used to select parameters must not
+# see post-boundary data. It does NOT freeze the live engine: once today
+# moved past the boundary, lockboxed live runs were trading week-old
+# regimes (Stretch 68% solved pre-semis-selloff). Doctrine now:
+#   research CLI modes  → truncated at the boundary (default below)
+#   live pipeline / --auto-pipeline / diagnostics → full current data
+# The forward validation window stays honest through the PEEK BUDGET
+# (don't select knobs on post-boundary backtests), not by blinding the
+# live engine. See LOCKBOX.md.
+#
+# User can override via env var DATA_LOCKBOX_DATE=YYYY-MM-DD (applies to
+# any mode). Set DATA_LOCKBOX_DATE="" (empty) to fully disable — DON'T DO
+# THIS for research without a deliberate methodology justification.
 #
 # Implementation: monkey-patch yfinance + wrap FF5 loader. Any DataFrame
 # or Series with a DatetimeIndex returned by yf.download gets truncated.
 # Verification check at engine startup raises if any data source returns
 # rows past the lockbox — defends against bypass.
+_DATA_LOCKBOX_RESEARCH_MODE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
+                               or _DEV_VALIDATION_MODE or _REBAL_SKIP_SWEEP_MODE
+                               or _TURNOVER_SWEEP_MODE or _WALK_FORWARD_CV_MODE
+                               or _ATTRIBUTION_MODE or _CRASH_HEDGE_TEST_MODE
+                               or _CRASH_HEDGE_RELEASE_SWEEP_MODE
+                               or _STRETCH_ONLY_TEST_MODE
+                               or _STRETCH_HEDGE_SWEEP_MODE
+                               or _TILTED_ENSEMBLE_TEST_MODE)
 _lockbox_env = os.environ.get("DATA_LOCKBOX_DATE")
 if _lockbox_env is None:
-    DATA_LOCKBOX_DATE = pd.Timestamp("2026-06-30")
+    if _DATA_LOCKBOX_RESEARCH_MODE:
+        DATA_LOCKBOX_DATE = pd.Timestamp("2026-06-30")
+    else:
+        DATA_LOCKBOX_DATE = None
+        print("[lockbox] live/diagnostic run — full current data "
+              "(lockbox scoped to research modes; directive 2026-07-06)")
 elif _lockbox_env.strip() == "":
     DATA_LOCKBOX_DATE = None
     print("[lockbox] DISABLED (DATA_LOCKBOX_DATE='') — engine sees all available data")
@@ -2124,6 +2147,12 @@ else:
         print(f"[lockbox] env var DATA_LOCKBOX_DATE={_lockbox_env!r} unparseable; "
               f"falling back to 2026-06-30")
         DATA_LOCKBOX_DATE = pd.Timestamp("2026-06-30")
+
+# Propagate the RESOLVED state to child processes: scale-sensitivity kernel
+# workers re-exec this script and must inherit the parent's lockbox view,
+# not re-decide from their own CLI flags (which say kernel, not research).
+os.environ["DATA_LOCKBOX_DATE"] = ("" if DATA_LOCKBOX_DATE is None
+                                   else DATA_LOCKBOX_DATE.date().isoformat())
 
 if DATA_LOCKBOX_DATE is not None:
     _orig_yf_download = yf.download

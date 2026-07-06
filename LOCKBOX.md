@@ -105,6 +105,26 @@ The DATA_LOCKBOX_DATE stays at 2026-06-30 for all backtest work. When the
 val window matures (2028-08) or a refresh trigger fires, the next refresh
 moves the lockbox forward in the same step — never in between.
 
+### Lockbox scope (2026-07-06 directive)
+
+The lockbox governs **research honesty, not live operations**. Once today
+moved past the boundary, a globally-applied lockbox had the live engine
+trading week-old regimes (Stretch 68% solved before a semis selloff).
+Scope as implemented:
+
+- **Research CLI modes** (`--walk-forward-cv`, `--dev-validation`, sweeps,
+  stress/attribution/tilt tests) → data truncated at 2026-06-30.
+- **Live pipeline, `--auto-pipeline`, diagnostics** (preflight,
+  factor-recs, metrics-history) → full current data.
+- Kernel workers inherit the parent's resolved state via env, never
+  re-decide from their own flags.
+- `DATA_LOCKBOX_DATE` env var still overrides in any mode (manual
+  research extensions or deliberate freezes).
+
+What keeps the forward val window honest is the **peek budget** — no
+parameter may be selected off a backtest that saw post-boundary data —
+not blinding the engine that generates the live evidence.
+
 ---
 
 ## Live evidence accumulation cadence
