@@ -123,6 +123,7 @@ from brokerage import (
     ACTIVE_BROKER_PROFILE,
     BROKER_CONFIG,
     BROKERAGE,
+    ASX_MIN_MARKETABLE_PARCEL_AUD,
     MIN_TRADE_VALUE,
     _market_of,
     suppress_small_trades_by_value,
@@ -5403,6 +5404,21 @@ def compute_target_units_for_holdings(
     tgt_val = pd.Series(w_target).reindex(tickers).fillna(0.0) * cur_val
     tgt_units_float = (tgt_val / lp_aud).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     tgt_units_int = tgt_units_float.round().astype(int)
+    # ASX minimum marketable parcel: a BUY that would ESTABLISH a position
+    # under ~$500 AUD gets rejected at the exchange (adds to existing
+    # holdings are exempt). Drop those targets so the plan never emits an
+    # unexecutable order (IBKR cancelled a 4-unit VAE.AX buy, 2026-07-06).
+    for t in tickers:
+        _tu = int(tgt_units_int.get(t, 0))
+        _pv = _tu * float(lp_aud.get(t, 0.0))
+        if (str(t).upper().endswith(".AX")
+                and float(cur_units.get(t, 0.0)) == 0.0
+                and _tu > 0
+                and _pv < ASX_MIN_MARKETABLE_PARCEL_AUD):
+            print(f"[trade-plan] {t}: new-position target {_tu}u ≈ ${_pv:,.0f} AUD "
+                  f"< ${ASX_MIN_MARKETABLE_PARCEL_AUD:,.0f} ASX min marketable parcel — dropped "
+                  f"(will accumulate at a future rebalance)")
+            tgt_units_int[t] = 0
     return tgt_units_int.reindex(w_target.index).fillna(0).astype(int)
 
 

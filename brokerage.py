@@ -150,6 +150,11 @@ ACTIVE_BROKER_PROFILE = "ibkr_pro_au"
 BROKER_CONFIG = BROKER_PROFILES[ACTIVE_BROKER_PROFILE].copy()
 
 
+# ASX minimum marketable parcel: exchanges/brokers reject BUY orders that
+# would ESTABLISH a position below this value (adds to existing holdings are
+# exempt). IBKR cancelled a 4-unit VAE.AX buy for exactly this on 2026-07-06.
+ASX_MIN_MARKETABLE_PARCEL_AUD = 500.0
+
 # === Live trade-plan brokerage structure (derived from BROKER_CONFIG) ========
 BROKERAGE = {
     "ASX": {
@@ -232,7 +237,11 @@ def compute_brokerage(trade_df: pd.DataFrame) -> tuple[float, pd.Series]:
         trade_val = abs(units) * px
 
         if mkt == "US":
-            fee = 0.0
+            # Was hardcoded 0.0 — a fossil from the $0-US-brokerage Stake
+            # profile. IBKR charges a real US commission; use the profile
+            # schedule like the ASX branch does (fixed 2026-07-06 after the
+            # live plan showed $0.00 on a $57k SMH buy).
+            fee = max(BROKERAGE["US"]["min_fee"], BROKERAGE["US"]["rate"] * trade_val)
         elif mkt == "ASX":
             fee = max(BROKERAGE["ASX"]["min_fee"], BROKERAGE["ASX"]["rate"] * trade_val)
             if units > 0 and trade_val <= BROKERAGE["ASX"]["first_buy_free_threshold"] + 1e-9:
