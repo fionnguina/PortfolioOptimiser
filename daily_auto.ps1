@@ -142,16 +142,63 @@ function Test-IbkrPort {
     }
 }
 
+function Test-IbkrApiAlive {
+    # "Port open" is NOT "API alive" (2026-07-06: TWS accepted sockets while
+    # every data request timed out). probe_ibkr_api.py does a full ib_insync
+    # handshake with a 10s timeout — exit 0 = genuinely usable API.
+    $probe = Join-Path $ScriptDir "probe_ibkr_api.py"
+    $py = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    if (-not (Test-Path $probe) -or -not (Test-Path $py)) { return $false }
+    & $py $probe *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
 function Start-TwsIfNeeded {
-    if (Test-IbkrPort -Port $IbkrPort) {
-        Write-Log "TWS already listening on 127.0.0.1:$IbkrPort."
+    # Tier 2 automation (2026-07-06): prefer IBC-driven IB Gateway with
+    # automated login. Falls back to the legacy bare-TWS launch (login
+    # screen and all) until Gateway + credentials are set up — see
+    # setup_ibc_gateway.ps1.
+    if (Test-IbkrApiAlive) {
+        Write-Log "IBKR API alive on 127.0.0.1:$IbkrPort."
         return $true
     }
-    if (-not $TwsPath -or -not (Test-Path $TwsPath)) {
-        Write-Log "TWS not running and tws.exe not found (looked in `$env:IBKR_TWS_PATH and standard install paths). Engine will fall back to yfinance prices."
+    if (Test-IbkrPort -Port $IbkrPort) {
+        Write-Log "WARN: port $IbkrPort is open but the API is NOT responding (wedged session or modal dialog). Not launching a second instance - engine will fall back to yfinance. Restart TWS/Gateway manually."
         return $false
     }
-    Write-Log "TWS not listening; launching $TwsPath..."
+
+    $ibcStart = "C:\IBC\StartGateway.bat"
+    $ibcIni = "C:\IBC\config.ini"
+    $ibcReady = (Test-Path $ibcStart) -and (Test-Path $ibcIni) -and
+                -not (Select-String -Path $ibcIni -Pattern "YOUR_PAPER_USERNAME_HERE" -Quiet)
+    if ($ibcReady) {
+        Write-Log "API down; launching IB Gateway via IBC ($ibcStart)..."
+        try {
+            Start-Process "cmd.exe" -ArgumentList "/c", "`"$ibcStart`"" -WindowStyle Minimized | Out-Null
+        } catch {
+            Write-Log "IBC launch failed: $($_.Exception.Message). Engine will fall back to yfinance."
+            return $false
+        }
+        # Gateway boot + IBC auto-login takes ~30-90s; poll the REAL probe.
+        $deadline = (Get-Date).AddSeconds(150)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            if (Test-IbkrApiAlive) {
+                Write-Log "IB Gateway API alive (IBC auto-login OK)."
+                return $true
+            }
+        }
+        Write-Log "IBC/Gateway did not become API-alive within 150s - check C:\IBC logs. Engine will fall back to yfinance."
+        return $false
+    }
+
+    # Legacy fallback: bare TWS launch (will sit at the login screen when
+    # unattended - kept only until IBC + Gateway setup is completed).
+    if (-not $TwsPath -or -not (Test-Path $TwsPath)) {
+        Write-Log "IBC not configured and tws.exe not found. Engine will fall back to yfinance prices."
+        return $false
+    }
+    Write-Log "IBC not configured; legacy TWS launch of $TwsPath (may sit at login screen)..."
     try {
         Start-Process -FilePath $TwsPath -WindowStyle Minimized | Out-Null
     } catch {
@@ -160,13 +207,13 @@ function Start-TwsIfNeeded {
     }
     $deadline = (Get-Date).AddSeconds($TwsReadyTimeoutSec)
     while ((Get-Date) -lt $deadline) {
-        if (Test-IbkrPort -Port $IbkrPort) {
-            Write-Log "TWS port ${IbkrPort} ready."
+        if (Test-IbkrApiAlive) {
+            Write-Log "TWS API alive."
             return $true
         }
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 5
     }
-    Write-Log "TWS launch timed out after ${TwsReadyTimeoutSec}s waiting for port ${IbkrPort}. May still be on the login screen — engine will fall back to yfinance."
+    Write-Log "TWS launch timed out after ${TwsReadyTimeoutSec}s without a live API (probably the login screen). Engine will fall back to yfinance."
     return $false
 }
 
