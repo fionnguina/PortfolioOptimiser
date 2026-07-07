@@ -698,6 +698,20 @@ def _run_sync_holdings_mode(workbook: str, execute: bool) -> int:
     return 0
 
 
+def _available_funds_aud(ib) -> "float | None":
+    """Current AvailableFunds in base currency (AUD on this account).
+    Returns None if the query fails — callers treat None as 'unknown,
+    fall back to legacy submit-everything behaviour' rather than
+    spuriously deferring the whole batch."""
+    try:
+        for v in ib.accountSummary():
+            if v.tag == "AvailableFunds" and str(v.currency).upper() in ("AUD", "BASE"):
+                return float(v.value)
+    except Exception as e:
+        print(f"[exec][WARN] AvailableFunds query failed: {e}")
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="IBKR Phase 3 — paper-account execution with safety gates."
@@ -721,6 +735,13 @@ def main() -> int:
                              "exited (e.g. US orders waiting for overnight US open) "
                              "or to diagnose Cancelled-with-permId=0 rows. Read-only "
                              "— never calls placeOrder.")
+    parser.add_argument("--wait-for-funds", type=int, default=0, metavar="SECONDS",
+                        help="After submitting sells and whatever buys fit current "
+                             "AvailableFunds, poll every 60s for sell proceeds and "
+                             "submit the deferred buys as cash arrives, up to this "
+                             "many seconds. Use when submitting outside market hours "
+                             "(sells can't fill until the open). 0 = don't wait; "
+                             "deferred buys are listed with a re-run command.")
     parser.add_argument("--sync-holdings", action="store_true",
                         help="Query ib.positions() from paper TWS and reconcile the "
                              "Holdings sheet Units column to broker truth. Catches "
@@ -874,12 +895,73 @@ def main() -> int:
         if not _confirm_typed_yes(len(plan)):
             return 4
 
-        # === Submit orders ===
+        # === Submit orders — funds-aware two phases (2026-07-08) ===
+        # IBKR margin-checks each BUY against CURRENT available funds; queued
+        # sells contribute nothing until they FILL, which outside market hours
+        # is hours away. Submitting everything at once bounced a $71k SMH buy
+        # with Error 201 against $13k cash. Sells go first, then only the
+        # buys that fit AvailableFunds; the rest defer (optionally polled in
+        # via --wait-for-funds).
         print()
         print("=" * 96)
         print(f"EXECUTING {len(plan)} ORDERS — PAPER ACCOUNT {managed[0]}")
         print("=" * 96)
-        trades = _submit_orders(ib, plan, wait=(not args.no_wait))
+        sells = [(r, c, o) for (r, c, o) in plan if o.action == "SELL"]
+        buys = sorted(((r, c, o) for (r, c, o) in plan if o.action == "BUY"),
+                      key=lambda x: abs(float(x[0]["delta_value_aud"])))
+        trades = []
+        if sells:
+            print(f"[exec] phase 1 — {len(sells)} SELL order(s):")
+            trades += _submit_orders(ib, sells, wait=(not args.no_wait))
+
+        funds = _available_funds_aud(ib)
+        deferred = []
+        if funds is None:
+            print("[exec][WARN] available funds unknown — submitting all buys (legacy behaviour)")
+            if buys:
+                trades += _submit_orders(ib, buys, wait=(not args.no_wait))
+            buys = []
+        else:
+            print(f"[exec] available funds: ${funds:,.2f} AUD")
+            fits = []
+            for r, c, o in buys:
+                need = abs(float(r["delta_value_aud"])) * 1.01  # +1% price/fee buffer
+                if need <= funds:
+                    fits.append((r, c, o))
+                    funds -= need
+                else:
+                    deferred.append((r, c, o))
+            if fits:
+                print(f"[exec] phase 2 — {len(fits)} BUY order(s) within available funds:")
+                trades += _submit_orders(ib, fits, wait=(not args.no_wait))
+
+        if deferred and int(args.wait_for_funds or 0) > 0:
+            _deadline = time.time() + int(args.wait_for_funds)
+            print(f"[exec] --wait-for-funds: polling up to {int(args.wait_for_funds)}s "
+                  f"for sell proceeds to cover {len(deferred)} deferred buy(s)...")
+            while deferred and time.time() < _deadline:
+                time.sleep(60)
+                funds = _available_funds_aud(ib)
+                if funds is None:
+                    continue
+                still = []
+                for r, c, o in deferred:
+                    need = abs(float(r["delta_value_aud"])) * 1.01
+                    if need <= funds:
+                        print(f"[exec] funds ${funds:,.2f} — submitting deferred "
+                              f"{r['ticker']} ({o.action} {o.totalQuantity})")
+                        trades += _submit_orders(ib, [(r, c, o)], wait=(not args.no_wait))
+                        funds -= need
+                    else:
+                        still.append((r, c, o))
+                deferred = still
+
+        if deferred:
+            _names = ",".join(r["ticker"] for r, _c, _o in deferred)
+            print(f"[exec][WARN] {len(deferred)} BUY(s) DEFERRED — insufficient funds "
+                  f"until sells settle: {_names}")
+            print(f"[exec]        after the sells fill, re-run:")
+            print(f"[exec]        ibkr_paper_exec.py --execute --only-tickers {_names}")
 
         # === Reconcile + log ===
         _print_reconciliation(trades)
