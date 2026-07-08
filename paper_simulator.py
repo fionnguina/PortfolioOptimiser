@@ -570,10 +570,18 @@ def load_seed(seed_path: Path = SEED_PATH,
 def load_rec_log_window(rec_log: Path, start: pd.Timestamp,
                         end: pd.Timestamp) -> list[dict]:
     """Read trade_recommendation_log.jsonl, return entries with
-    `run_at` between start and end inclusive."""
-    out: list[dict] = []
+    `run_at` between start and end inclusive — deduped to the LAST
+    entry per calendar day.
+
+    Every live-pipeline invocation appends a rec entry, so engineering
+    sessions leave several same-day full-rebalance batches (2026-06-30
+    had three inside 45 minutes). Replaying them all back-to-back
+    compounds turnover into Σ|Δw|>2 nonsense and got every batch
+    sanity-rejected on 2026-07-08. Only the day's final entry reflects
+    the decision that day's operator actually had."""
+    raw: list[dict] = []
     if not rec_log.exists():
-        return out
+        return raw
     with rec_log.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -583,9 +591,19 @@ def load_rec_log_window(rec_log: Path, start: pd.Timestamp,
                 rec = json.loads(line)
                 ts = pd.Timestamp(rec.get("run_at"))
                 if start <= ts <= end:
-                    out.append(rec)
+                    raw.append(rec)
             except Exception:
                 continue
+    last_per_day: dict = {}
+    for rec in raw:
+        day = pd.Timestamp(rec.get("run_at")).date()
+        prev = last_per_day.get(day)
+        if prev is None or pd.Timestamp(rec["run_at"]) > pd.Timestamp(prev["run_at"]):
+            last_per_day[day] = rec
+    out = [last_per_day[d] for d in sorted(last_per_day)]
+    if len(out) < len(raw):
+        print(f"[sim] rec-log dedupe: {len(raw)} entries -> {len(out)} "
+              f"(last per calendar day)")
     return out
 
 
@@ -778,6 +796,16 @@ def apply_recommendation(rec: dict, state: SimulatorState,
     # batches WOULD have been blocked over a window).
     prices_now = {f["ticker"]: f["mid_price"] for f in fills}
     pre_fill_nav = state.cash_aud + state.lot_book.total_units_at(prices_now)
+    # Baseline-coherence check: the rec's trades were sized against the
+    # ENGINE's NAV at run time. If the sim book has drifted >10% from that
+    # baseline (stale lots_seed — the sim doesn't yet replay the fills log
+    # on top of the seed), every downstream sanity number is distorted;
+    # say so ONCE per batch instead of letting rejections cascade silently.
+    _rec_nav = float(rec.get("portfolio_value_aud", rec.get("portfolio_aud", 0)) or 0)
+    if _rec_nav > 0 and pre_fill_nav > 0 and abs(pre_fill_nav - _rec_nav) / _rec_nav > 0.10:
+        print(f"[sim:{state.label}][WARN] sim NAV ${pre_fill_nav:,.0f} vs rec baseline "
+              f"${_rec_nav:,.0f} ({(pre_fill_nav/_rec_nav-1)*100:+.0f}%) — seed is stale; "
+              f"sanity verdicts unreliable until lots_seed/fills replay is fixed")
     violations = check_fill_batch_sanity(fills, pre_fill_nav,
                                           state.lot_book, prices_now)
     if violations:
