@@ -442,6 +442,22 @@ try {
 }
 }  # end if -not $engineHalted
 
+# --- Broker-truth NAV snapshot (2026-07-08, user directive) ---
+# Read-only: appends NetLiquidation/cash/marks to ibkr_nav_log.jsonl so the
+# fund's performance record is the BROKER's number, not a yfinance
+# reconstruction. Never builds a plan or touches orders — the engine's
+# [rebal-trigger] flags remain the only rebalance driver.
+try {
+    $navPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $navScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
+    if ((Test-Path $navPy) -and (Test-Path $navScript)) {
+        $navOut = & $navPy $navScript --snapshot-nav 2>&1 | Select-Object -Last 1
+        Write-Log "NAV snapshot: $navOut"
+    }
+} catch {
+    Write-Log "NAV snapshot failed (non-fatal): $($_.Exception.Message)"
+}
+
 # --- Notification + optional PPT open ---
 # Build a simulator suffix that appears on every toast — if the
 # simulator's sanity layer rejected anything, the user needs to see

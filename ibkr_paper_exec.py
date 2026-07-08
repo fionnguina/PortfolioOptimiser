@@ -548,6 +548,75 @@ def _run_check_fills_mode() -> int:
     return 0
 
 
+def _run_snapshot_nav_mode() -> int:
+    """--snapshot-nav: append one broker-truth NAV row to ibkr_nav_log.jsonl.
+
+    READ-ONLY by construction: queries account summary + portfolio marks,
+    writes a log line, never builds a plan or touches an order. The broker's
+    NetLiquidation is the fund's real performance record (user directive
+    2026-07-08: performance from IBKR, not yfinance reconstructions —
+    but broker reads must never trigger rebalances; the engine's flags
+    remain the only rebalance driver).
+    """
+    try:
+        from ib_insync import IB
+    except ImportError:
+        print("[nav] ib_insync not installed. Run: pip install ib_insync")
+        return 1
+    print(f"[nav] connecting to PAPER IBKR at {HOST}:{PORT} (clientId={CLIENT_ID})...")
+    ib = IB()
+    try:
+        ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[nav][ERR] connect failed ({type(e).__name__}): {e}")
+        return 2
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed:
+            print("[nav][SAFETY] managedAccounts() returned nothing. Aborting.")
+            return 3
+        _refuse_if_live(managed[0])
+        tags = {}
+        for v in ib.accountSummary():
+            if str(v.currency).upper() in ("AUD", "BASE") and v.tag in (
+                    "NetLiquidation", "TotalCashValue", "GrossPositionValue",
+                    "UnrealizedPnL", "RealizedPnL", "AvailableFunds"):
+                tags[v.tag] = float(v.value)
+        positions = []
+        for p in ib.portfolio():
+            c = p.contract
+            sym = str(c.symbol).strip().upper()
+            if (str(getattr(c, "currency", "")).upper() == "AUD"
+                    or str(getattr(c, "primaryExchange", "")).upper() == "ASX"):
+                sym = f"{sym}.AX"
+            positions.append({
+                "ticker": sym, "units": float(p.position),
+                "mark_local": float(p.marketPrice),
+                "mkt_value_base": float(p.marketValue),
+                "unrealized_pnl": float(p.unrealizedPNL),
+            })
+    finally:
+        ib.disconnect()
+
+    row = {
+        "ts": datetime.now().astimezone().isoformat(),
+        "account": managed[0],
+        "net_liquidation_aud": tags.get("NetLiquidation"),
+        "cash_aud": tags.get("TotalCashValue"),
+        "gross_positions_aud": tags.get("GrossPositionValue"),
+        "unrealized_pnl_aud": tags.get("UnrealizedPnL"),
+        "realized_pnl_aud": tags.get("RealizedPnL"),
+        "n_positions": len(positions),
+        "positions": positions,
+    }
+    with Path("ibkr_nav_log.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+    print(f"[nav] snapshot: NetLiq ${row['net_liquidation_aud']:,.2f} AUD "
+          f"(cash ${row['cash_aud']:,.2f}, {len(positions)} positions) "
+          f"-> ibkr_nav_log.jsonl")
+    return 0
+
+
 def _run_sync_holdings_mode(workbook: str, execute: bool) -> int:
     """--sync-holdings: pull broker-truth positions from paper TWS and write
     them into the Holdings sheet's Units column (typed-YES gated).
@@ -751,6 +820,11 @@ def main() -> int:
                              "many seconds. Use when submitting outside market hours "
                              "(sells can't fill until the open). 0 = don't wait; "
                              "deferred buys are listed with a re-run command.")
+    parser.add_argument("--snapshot-nav", action="store_true",
+                        help="Append one broker-truth NAV row (NetLiquidation, cash, "
+                             "per-position marks) to ibkr_nav_log.jsonl. Read-only; "
+                             "never builds a plan or touches orders. Run daily for a "
+                             "real performance record.")
     parser.add_argument("--sync-holdings", action="store_true",
                         help="Query ib.positions() from paper TWS and reconcile the "
                              "Holdings sheet Units column to broker truth. Catches "
@@ -774,6 +848,10 @@ def main() -> int:
     # No rec log needed, no orders placed. Returns 0 on success.
     if args.check_fills:
         return _run_check_fills_mode()
+
+    # === --snapshot-nav mode: read-only broker NAV logging ===
+    if args.snapshot_nav:
+        return _run_snapshot_nav_mode()
 
     # === --sync-holdings mode: broker-truth Units reconciliation ===
     if args.sync_holdings:
