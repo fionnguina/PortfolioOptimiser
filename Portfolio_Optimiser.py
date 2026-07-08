@@ -741,6 +741,23 @@ if _lt_defer_reldd_env:
 #                             noise-driven trigger stacking.
 # ============================================================================
 SKIP_REBAL_DELTA          = 0.03   # 3% summed |Δw|
+
+# Calm-conditional skip threshold — PRE-REGISTERED experiment 2026-07-08
+# (memory: reference-asym-rebal-experiment; run exactly as written there).
+# On CALM scheduled rebalances (NOT an early-trigger insertion AND benchmark
+# trailing-252d DD > -5%) the skip threshold widens to this value, letting
+# winners drift instead of realising ST gains on no-conviction re-trims.
+# Stress rebalances keep SKIP_REBAL_DELTA; early-trigger machinery untouched.
+# 0 = OFF (production default). Sweep via PORTOPT_SKIP_DELTA_CALM.
+SKIP_REBAL_DELTA_CALM     = 0.0
+
+_skip_calm_env = os.environ.get("PORTOPT_SKIP_DELTA_CALM")
+if _skip_calm_env:
+    try:
+        SKIP_REBAL_DELTA_CALM = max(0.0, float(_skip_calm_env))
+        print(f"[config-override] SKIP_REBAL_DELTA_CALM={SKIP_REBAL_DELTA_CALM} via env")
+    except Exception as _e_calm_env:
+        print(f"[config-override] bad PORTOPT_SKIP_DELTA_CALM ignored: {_e_calm_env}")
 EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
 EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
 
@@ -6115,6 +6132,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"lt_defer:{int(globals().get('LT_DEFER_WINDOW_DAYS', 0) or 0)}".encode())
         h.update(f"lt_defer_cond:{int(bool(globals().get('LT_DEFER_DD_CONDITIONAL', False)))}".encode())
         h.update(f"lt_defer_reldd:{float(globals().get('LT_DEFER_RELEASE_DD', 0.0) or 0.0)}".encode())
+        h.update(f"skip_calm:{float(globals().get('SKIP_REBAL_DELTA_CALM', 0.0) or 0.0)}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -6330,6 +6348,16 @@ def run_oos_ensemble_walk_forward(
         _spy_dd_for_defer = (_spy_ser_defer
                              / _spy_ser_defer.rolling(window=252, min_periods=1).max()
                              - 1.0)
+    # Trailing benchmark drawdown for the calm-conditional skip threshold
+    # (pre-registered asym-rebalance experiment, 2026-07-08).
+    _skip_calm_delta = float(globals().get("SKIP_REBAL_DELTA_CALM", 0.0) or 0.0)
+    _spy_dd_for_calm = None
+    _n_calm_widened = 0
+    if _skip_calm_delta > 0 and benchmark_ticker in px.columns:
+        _spy_ser_calm = px[benchmark_ticker].sort_index()
+        _spy_dd_for_calm = (_spy_ser_calm
+                            / _spy_ser_calm.rolling(window=252, min_periods=1).max()
+                            - 1.0)
     _running_nav = float(starting_nav_aud)  # AUD; flat-fee impact scales with NAV
     # Conditional rebalancing diagnostics
     n_skipped = 0
@@ -6566,6 +6594,18 @@ def run_oos_ensemble_walk_forward(
         skip_rebal = False
         _skip_delta_eff = float(SKIP_REBAL_DELTA if skip_rebal_delta is None
                                  else skip_rebal_delta)
+        # Calm-conditional widening: CALM = not an early-trigger insertion
+        # AND benchmark trailing-252d DD > -5%. Any stress signal keeps the
+        # tight production threshold (classifier FIXED per pre-registration).
+        if (_skip_calm_delta > 0 and _spy_dd_for_calm is not None
+                and t not in _early_trigger_dates):
+            try:
+                _dd_now_calm = float(_spy_dd_for_calm.asof(t))
+            except Exception:
+                _dd_now_calm = -1.0
+            if np.isfinite(_dd_now_calm) and _dd_now_calm > -0.05:
+                _skip_delta_eff = _skip_calm_delta
+                _n_calm_widened += 1
         if not _prev_blend_w.empty and _skip_delta_eff > 0:
             union_idx = sorted(set(_prev_blend_w.index).union(w_blend.index))
             delta_sum = float(
@@ -6792,6 +6832,10 @@ def run_oos_ensemble_walk_forward(
 
     rebalance_costs_ser = pd.Series(rebalance_costs).sort_index() if rebalance_costs else pd.Series(dtype=float)
     rebalance_taxes_ser = pd.Series(rebalance_taxes).sort_index() if rebalance_taxes else pd.Series(dtype=float)
+    if _skip_calm_delta > 0:
+        print(f"[skip-calm] calm threshold {_skip_calm_delta*100:.0f}% applied at "
+              f"{_n_calm_widened} rebal(s); skipped {n_skipped} of "
+              f"{n_skipped + n_executed} total")
     if _defer_events > 0 or _defer_released_rebals > 0:
         print(f"[lt-defer] {_defer_events} lot-shield event(s) over window, "
               f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
