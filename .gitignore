@@ -41,3 +41,25 @@ _version.py
 
 # OOS disk cache (Phase 3a, 2026-06-29) — recomputable, never share
 .cache/
+
+# Reorganised outputs (2026-07-08) — regenerable run/experiment artefacts.
+# All *.log now live in logs/; experiment summaries + diagnostic charts too.
+# Keeps the working tree + git status clean as experiments regenerate them.
+logs/
+archive/
+*.log
+*_summary.json
+dev_validation_chart.png
+scale_analysis_chart.png
+simulator_nav_chart.png
+
+# Broker/live state — local-only, append-only, never share
+ibkr_fills_log.jsonl
+ibkr_nav_log.jsonl
+simulator_fills.jsonl
+simulator_nav.jsonl
+simulator_sanity.jsonl
+sanity_alerts.jsonl
+metrics_history.jsonl
+tlh_cooldown_state.json
+engine_done.flag

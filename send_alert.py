@@ -44,12 +44,23 @@ def _load_config():
         cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception as e:
         return None, f"mail config unreadable: {e}"
-    pw = str(cfg.get("sender_app_password", "")).strip()
+    # Gmail shows app passwords as "abcd efgh ijkl mnop" — strip all spaces
+    # so a copy-paste-with-spaces still authenticates.
+    pw = "".join(str(cfg.get("sender_app_password", "")).split())
     if not pw or pw == PLACEHOLDER:
         return None, "placeholder credentials (bot app password not set yet)"
+    if len(pw) != 16:
+        return None, (f"app password is {len(pw)} chars, expected 16 — that looks "
+                      f"like a normal account password, not a Google App Password")
+    cfg["sender_app_password"] = pw
     for k in ("smtp_host", "smtp_port", "sender_email", "recipient_email"):
         if not str(cfg.get(k, "")).strip():
             return None, f"config missing {k}"
+    # Auto-correct the one field users mis-edit: for a gmail sender the host
+    # is always smtp.gmail.com, not the email address.
+    if ("gmail.com" in str(cfg["sender_email"]).lower()
+            and not str(cfg["smtp_host"]).lower().startswith("smtp.")):
+        cfg["smtp_host"] = "smtp.gmail.com"
     return cfg, None
 
 
