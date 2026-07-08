@@ -4956,6 +4956,71 @@ def compute_actual_nav_series(prices, fills_path, seed_path):
     return nav
 
 
+def _load_broker_nav_series(path=None) -> pd.Series:
+    """Broker-truth NAV (NetLiquidation, AUD) by date from ibkr_nav_log.jsonl
+    (written by ibkr_paper_exec.py --snapshot-nav / the daily wrapper).
+    Last snapshot per calendar day wins. Empty series if no log."""
+    p = Path(path) if path is not None else (APP_DIR / "ibkr_nav_log.jsonl")
+    if not p.exists():
+        return pd.Series(dtype=float)
+    vals: dict = {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    d = pd.Timestamp(r["ts"]).normalize().tz_localize(None)
+                    nl = float(r.get("net_liquidation_aud") or 0)
+                    if nl > 0:
+                        vals[d] = nl  # later rows overwrite = last-per-day
+                except Exception:
+                    continue
+    except Exception:
+        return pd.Series(dtype=float)
+    return pd.Series(vals).sort_index()
+
+
+def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
+                                      broker_nav_path=None) -> pd.Series:
+    """Actual-NAV path: fills-log reconstruction, upgraded to BROKER truth
+    where ibkr_nav_log.jsonl has data (user directive 2026-07-08 — the
+    fund's performance record is the broker's number).
+
+    Currency subtlety: the reconstruction lives in the mixed USD/AUD price
+    convention while NetLiquidation is pure AUD, so LEVELS cannot be mixed.
+    We chain-link instead: reconstruction path up to the first broker
+    snapshot, broker RETURNS applied cumulatively from there. On overlap
+    days a return divergence > 50bps prints a [drift][WARN] — that gap is
+    reconstruction error (missed fees/marks), worth knowing about."""
+    recon = compute_actual_nav_series(prices, fills_path, seed_path)
+    broker = _load_broker_nav_series(broker_nav_path)
+    if len(broker) < 2 or recon.empty:
+        return recon
+    seam = broker.index[0]
+    recon_at_seam = recon.reindex(recon.index.union(broker.index)).ffill().asof(seam)
+    if not np.isfinite(recon_at_seam) or recon_at_seam <= 0:
+        return recon
+    spliced_tail = recon_at_seam * (broker / float(broker.iloc[0]))
+    out = pd.concat([recon[recon.index < seam], spliced_tail]).sort_index()
+    # Return-divergence check on overlapping days (unit-free).
+    try:
+        rr = recon.pct_change().reindex(broker.index).dropna()
+        br = broker.pct_change().dropna()
+        both = rr.index.intersection(br.index)
+        bad = (rr.reindex(both) - br.reindex(both)).abs() > 0.005
+        if bool(bad.any()):
+            days = [str(d.date()) for d in both[bad][:5]]
+            print(f"[drift][WARN] fills-log NAV reconstruction diverges from broker "
+                  f"NetLiq by >50bps/day on {int(bad.sum())} day(s) (e.g. {days}) — "
+                  f"reconstruction is missing fees/marks; broker series is authoritative")
+    except Exception:
+        pass
+    return out
+
+
 def _update_lots_after_trades(
     lots_df: pd.DataFrame,
     trade_df: pd.DataFrame,
@@ -11597,6 +11662,22 @@ if USE_XLWINGS:
                       f"n_trades={_n_trades}")
                 globals()["REBAL_TRIGGER_VERDICT"] = _verdict
                 globals()["REBAL_TRIGGER_SUMMED_DW"] = _summed_abs_dw
+                # Broker-vs-engine mark reconciliation (READ-ONLY, informs
+                # nothing downstream — the verdict above is already final).
+                # Uses the latest --snapshot-nav row if it's fresh (<3 days):
+                # a persistent gap means fees/marks the engine isn't seeing.
+                try:
+                    _bnav = _load_broker_nav_series()
+                    if (not _bnav.empty
+                            and (pd.Timestamp.now().normalize() - _bnav.index[-1]).days <= 3
+                            and _portfolio_val_for_verdict > 0):
+                        _gap = (_portfolio_val_for_verdict - float(_bnav.iloc[-1])) / float(_bnav.iloc[-1])
+                        _sev = "[drift][WARN]" if abs(_gap) > 0.01 else "[drift]"
+                        print(f"{_sev} engine mark ${_portfolio_val_for_verdict:,.0f} vs "
+                              f"broker NetLiq ${float(_bnav.iloc[-1]):,.0f} "
+                              f"({_gap*100:+.2f}%, snapshot {_bnav.index[-1].date()})")
+                except Exception:
+                    pass
             except Exception as _e_rebal_trig:
                 print(f"[rebal-trigger] verdict computation failed: {_e_rebal_trig}")
                 globals()["REBAL_TRIGGER_VERDICT"] = "UNKNOWN"
@@ -13685,7 +13766,7 @@ def export_to_ppt(results, trades, charts=None):
         # NASDAQ. Now reconstructs real NAV; line stubs in at LIVE_START.
         _actual_nav_series_local = pd.Series(dtype=float)
         try:
-            _actual_nav_series_local = compute_actual_nav_series(
+            _actual_nav_series_local = compute_actual_nav_series_spliced(
                 prices,
                 APP_DIR / "ibkr_fills_log.jsonl",
                 APP_DIR / "lots_seed.json",
