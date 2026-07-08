@@ -496,5 +496,47 @@ switch ($verdict) {
     }
 }
 
+# --- Email exception alert (2026-07-08, user directive) ---
+# Reaches the phone when the user is away from the desk (a toast can't).
+# Exception-only: RUN (action needed) and HALTED (must investigate). SKIP
+# stays silent by design — a daily email on the ~9-in-10 no-op case would
+# train the recipient to ignore the channel. Non-fatal; silently no-ops
+# if the mailer isn't configured (see send_alert.py). Uses a dedicated
+# throwaway bot sender so the user's personal Gmail password stays off
+# this machine.
+$mailSubject = $null
+$mailBody = $null
+switch ($verdict) {
+    "RUN" {
+        $mailSubject = "[Portfolio Optimiser] RUN - rebalance ready"
+        $mailBody = "Verdict: RUN`nsummed|dw| = $summedDw  (>= 0.03 threshold)`nPortfolio: $portfolioAud AUD`nMode: $mode`n`nReview the PPT, then execute via ibkr_paper_exec.py.$simSuffix"
+    }
+    "HALTED" {
+        $mailSubject = "[Portfolio Optimiser] HALTED - sanity violation"
+        $mailBody = "ENGINE HALTED BY SANITY LAYER.`nReason: $haltReason`n`nDO NOT execute any pending trade plan. Investigate state (sanity_alerts.jsonl) before re-running."
+    }
+}
+if ($mailSubject) {
+    # Fold in the engine-vs-broker mark drift warning if this run emitted one.
+    try {
+        if (Test-Path $LogPath) {
+            $driftLine = Select-String -Path $LogPath -Pattern "\[drift\]\[WARN\].*broker NetLiq" -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($driftLine) { $mailBody = "$mailBody`n`nDRIFT: $($driftLine.Line.Trim())" }
+        }
+    } catch { }
+    try {
+        $bodyFile = Join-Path $env:TEMP "po_alert_body.txt"
+        Set-Content -Path $bodyFile -Value $mailBody -Encoding utf8
+        $mailPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+        $mailScript = Join-Path $ScriptDir "send_alert.py"
+        if ((Test-Path $mailPy) -and (Test-Path $mailScript)) {
+            $mailOut = & $mailPy $mailScript --subject $mailSubject --body-file $bodyFile 2>&1 | Select-Object -Last 1
+            Write-Log "Email alert ($verdict): $mailOut"
+        }
+    } catch {
+        Write-Log "Email alert failed (non-fatal): $($_.Exception.Message)"
+    }
+}
+
 Write-Log "Done."
 exit 0
