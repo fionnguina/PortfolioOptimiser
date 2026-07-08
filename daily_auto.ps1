@@ -59,7 +59,9 @@ if (-not $LogPath) {
 # silently destroying the wrapper's evidence trail (discovered 2026-07-06).
 $DailyLogPath = Join-Path $ScriptDir "daily_auto.log"
 $FlagPath = Join-Path $ScriptDir "dist\engine_done.flag"
-$EngineTimeoutSec = 600
+# 1200s: the full pipeline with SCALE_SENSITIVITY (multi-scale OOS) exceeds
+# 10min, which timed out + killed the 2026-07-09 graduation run mid-backtest.
+$EngineTimeoutSec = 1200
 
 # --- IBKR / TWS autostart settings ----------------------------------------
 # Port 7497 = paper TWS (7496 is live, never used here).
@@ -168,7 +170,10 @@ function Start-TwsIfNeeded {
     }
 
     $ibcStart = "C:\IBC\StartGateway.bat"
-    $ibcIni = "C:\IBC\config.ini"
+    # IBC reads its config from Documents\IBC\config.ini (its /Config default),
+    # where it was moved 2026-07-08. The old C:\IBC path check false-negatived
+    # and made the 2026-07-09 graduation run fall back to bare TWS.
+    $ibcIni = Join-Path $env:USERPROFILE "Documents\IBC\config.ini"
     $ibcReady = (Test-Path $ibcStart) -and (Test-Path $ibcIni) -and
                 -not (Select-String -Path $ibcIni -Pattern "YOUR_PAPER_USERNAME_HERE" -Quiet)
     if ($ibcReady) {
