@@ -699,16 +699,25 @@ def _run_sync_holdings_mode(workbook: str, execute: bool) -> int:
 
 
 def _available_funds_aud(ib) -> "float | None":
-    """Current AvailableFunds in base currency (AUD on this account).
-    Returns None if the query fails — callers treat None as 'unknown,
-    fall back to legacy submit-everything behaviour' rather than
+    """Funds available for BUYS, in base AUD — the CONSERVATIVE measure.
+
+    IBKR's Error-201 rejection gate tracks settled cash (TotalCashValue),
+    not the margin-based AvailableFunds: on 2026-07-08 AvailableFunds read
+    $129k while the same account rejected a buy against 'Available
+    converted to base: 67,929' (= TotalCashValue). Prefer TotalCashValue,
+    fall back to AvailableFunds. Returns None if the query fails — callers
+    treat None as 'unknown, submit everything (legacy)' rather than
     spuriously deferring the whole batch."""
     try:
+        vals = {}
         for v in ib.accountSummary():
-            if v.tag == "AvailableFunds" and str(v.currency).upper() in ("AUD", "BASE"):
-                return float(v.value)
+            if str(v.currency).upper() in ("AUD", "BASE"):
+                vals[v.tag] = v.value
+        for tag in ("TotalCashValue", "AvailableFunds"):
+            if tag in vals:
+                return float(vals[tag])
     except Exception as e:
-        print(f"[exec][WARN] AvailableFunds query failed: {e}")
+        print(f"[exec][WARN] funds query failed: {e}")
     return None
 
 
