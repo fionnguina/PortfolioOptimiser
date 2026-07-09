@@ -774,6 +774,17 @@ if _stretch_floor_env:
         print(f"[config-override] STRETCH_FLOOR_CALM={STRETCH_FLOOR_CALM} via env")
     except Exception as _e_sf_env:
         print(f"[config-override] bad PORTOPT_STRETCH_FLOOR_CALM ignored: {_e_sf_env}")
+
+# Predictive-release variant (2026-07-09, 2nd formulation): also require the
+# benchmark to be above its 200d MA for the floor to engage — a trend filter
+# that stands the floor down through sustained bears (all of 2022) rather than
+# waiting for the reactive -5% DD. No effect unless STRETCH_FLOOR_CALM > 0.
+STRETCH_FLOOR_PREDICTIVE = False
+_sf_pred_env = os.environ.get("PORTOPT_STRETCH_FLOOR_PREDICTIVE")
+if _sf_pred_env is not None:
+    STRETCH_FLOOR_PREDICTIVE = _sf_pred_env.strip() not in ("", "0", "false", "False")
+    if STRETCH_FLOOR_PREDICTIVE:
+        print("[config-override] STRETCH_FLOOR_PREDICTIVE=1 (SPY>200dMA gate) via env")
 EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
 EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
 
@@ -6215,6 +6226,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"lt_defer_reldd:{float(globals().get('LT_DEFER_RELEASE_DD', 0.0) or 0.0)}".encode())
         h.update(f"skip_calm:{float(globals().get('SKIP_REBAL_DELTA_CALM', 0.0) or 0.0)}".encode())
         h.update(f"stretch_floor:{float(globals().get('STRETCH_FLOOR_CALM', 0.0) or 0.0)}".encode())
+        h.update(f"stretch_pred:{int(bool(globals().get('STRETCH_FLOOR_PREDICTIVE', False)))}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -6436,7 +6448,10 @@ def run_oos_ensemble_walk_forward(
     # Insurance-premium experiment (2026-07-09): min top-slot (Stretch) weight
     # on CALM rebalances. See reference-insurance-premium-experiment memory.
     _stretch_floor = float(globals().get("STRETCH_FLOOR_CALM", 0.0) or 0.0)
+    _stretch_predictive = bool(globals().get("STRETCH_FLOOR_PREDICTIVE", False))
     _spy_dd_for_calm = None
+    _spy_ma200 = None       # 200d SMA for the predictive trend gate
+    _spy_price_calm = None
     _n_calm_widened = 0
     _n_stretch_floored = 0
     if (_skip_calm_delta > 0 or _stretch_floor > 0) and benchmark_ticker in px.columns:
@@ -6444,6 +6459,9 @@ def run_oos_ensemble_walk_forward(
         _spy_dd_for_calm = (_spy_ser_calm
                             / _spy_ser_calm.rolling(window=252, min_periods=1).max()
                             - 1.0)
+        if _stretch_floor > 0 and _stretch_predictive:
+            _spy_price_calm = _spy_ser_calm
+            _spy_ma200 = _spy_ser_calm.rolling(window=200, min_periods=100).mean()
     _running_nav = float(starting_nav_aud)  # AUD; flat-fee impact scales with NAV
     # Conditional rebalancing diagnostics
     n_skipped = 0
@@ -6608,7 +6626,18 @@ def run_oos_ensemble_walk_forward(
                 _dd_now_floor = float(_spy_dd_for_calm.asof(t))
             except Exception:
                 _dd_now_floor = -1.0
-            if np.isfinite(_dd_now_floor) and _dd_now_floor > -0.05:
+            # Predictive trend gate: also require SPY > 200d MA (releases the
+            # floor through sustained bears before the reactive DD confirms).
+            _trend_ok = True
+            if _stretch_predictive and _spy_ma200 is not None:
+                try:
+                    _px_now = float(_spy_price_calm.asof(t))
+                    _ma_now = float(_spy_ma200.asof(t))
+                    _trend_ok = (np.isfinite(_px_now) and np.isfinite(_ma_now)
+                                 and _px_now > _ma_now)
+                except Exception:
+                    _trend_ok = False
+            if np.isfinite(_dd_now_floor) and _dd_now_floor > -0.05 and _trend_ok:
                 _top = ENSEMBLE_SLOT_NAMES[-1]
                 _cur_top = float(soft_w.get(_top, 0.0))
                 if _cur_top < _stretch_floor:
