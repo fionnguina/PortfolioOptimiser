@@ -785,6 +785,20 @@ if _sf_pred_env is not None:
     STRETCH_FLOOR_PREDICTIVE = _sf_pred_env.strip() not in ("", "0", "false", "False")
     if STRETCH_FLOOR_PREDICTIVE:
         print("[config-override] STRETCH_FLOOR_PREDICTIVE=1 (SPY>200dMA gate) via env")
+
+# Trend-following sleeve (PRE-REGISTERED 2026-07-09; memory:
+# reference-trend-sleeve-experiment). Core-satellite: blend a long-only
+# inverse-vol TSMOM sleeve with the ensemble at this weight. First experiment
+# adding a NEW return SOURCE (crisis-alpha diversifier). 0 = OFF (production).
+TREND_SLEEVE_WEIGHT = 0.0
+
+_trend_sleeve_env = os.environ.get("PORTOPT_TREND_SLEEVE_WEIGHT")
+if _trend_sleeve_env:
+    try:
+        TREND_SLEEVE_WEIGHT = min(0.6, max(0.0, float(_trend_sleeve_env)))
+        print(f"[config-override] TREND_SLEEVE_WEIGHT={TREND_SLEEVE_WEIGHT} via env")
+    except Exception as _e_ts_env:
+        print(f"[config-override] bad PORTOPT_TREND_SLEEVE_WEIGHT ignored: {_e_ts_env}")
 EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
 EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
 
@@ -6227,6 +6241,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"skip_calm:{float(globals().get('SKIP_REBAL_DELTA_CALM', 0.0) or 0.0)}".encode())
         h.update(f"stretch_floor:{float(globals().get('STRETCH_FLOOR_CALM', 0.0) or 0.0)}".encode())
         h.update(f"stretch_pred:{int(bool(globals().get('STRETCH_FLOOR_PREDICTIVE', False)))}".encode())
+        h.update(f"trend_sleeve:{float(globals().get('TREND_SLEEVE_WEIGHT', 0.0) or 0.0)}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -6295,6 +6310,45 @@ def run_oos_ensemble_walk_forward_cached(prices_aud: pd.DataFrame,
     result = run_oos_ensemble_walk_forward(prices_aud, **kwargs)
     _oos_cache_save(key, result)
     return result
+
+
+def _compute_trend_sleeve(px, as_of, universe, caps,
+                          lookback: int = 252, skip: int = 21,
+                          vol_window: int = 63) -> "pd.Series":
+    """Long-only inverse-vol time-series-momentum weights (trend sleeve).
+
+    Per asset: signal = 12-1M return (price[t-skip]/price[t-lookback]-1);
+    weight ∝ max(0, signal) / trailing vol; normalized over positive-trend
+    assets; PER_ASSET_WEIGHT_CAPS applied (cap-0 excluded). Returns an EMPTY
+    Series when nothing trends or history is insufficient (→ sleeve = cash).
+    """
+    hist = px.loc[:as_of]
+    if len(hist) < lookback + 5:
+        return pd.Series(dtype=float)
+    p_skip = hist.iloc[-(skip + 1)]
+    p_base = hist.iloc[-(lookback + 1)]
+    mom = (p_skip / p_base) - 1.0
+    vol = hist.pct_change().tail(vol_window).std()
+    raw = {}
+    for tk in universe:
+        cap = float(caps.get(tk, 1.0)) if caps else 1.0
+        if cap <= 0:
+            continue
+        m = float(mom.get(tk, float("nan")))
+        v = float(vol.get(tk, float("nan")))
+        if not np.isfinite(m) or not np.isfinite(v) or v <= 0 or m <= 0:
+            continue
+        raw[tk] = m / v
+    if not raw:
+        return pd.Series(dtype=float)
+    w = pd.Series(raw)
+    w = w / w.sum()
+    if caps:
+        for tk in list(w.index):
+            w[tk] = min(float(w[tk]), float(caps.get(tk, 1.0)))
+        if w.sum() > 0:
+            w = w / w.sum()
+    return w
 
 
 def run_oos_ensemble_walk_forward(
@@ -6454,6 +6508,13 @@ def run_oos_ensemble_walk_forward(
     _spy_price_calm = None
     _n_calm_widened = 0
     _n_stretch_floored = 0
+    # Trend sleeve (core-satellite). Universe = tradable ETFs, no benchmarks.
+    _trend_sleeve_w = float(globals().get("TREND_SLEEVE_WEIGHT", 0.0) or 0.0)
+    _trade_universe = [c for c in px.columns
+                       if c not in (benchmark_ticker, "PortfolioValue")
+                       and not str(c).startswith("^")]
+    _caps_for_trend = globals().get("PER_ASSET_WEIGHT_CAPS", {}) or {}
+    _n_trend_applied = 0
     if (_skip_calm_delta > 0 or _stretch_floor > 0) and benchmark_ticker in px.columns:
         _spy_ser_calm = px[benchmark_ticker].sort_index()
         _spy_dd_for_calm = (_spy_ser_calm
@@ -6689,6 +6750,20 @@ def run_oos_ensemble_walk_forward(
         if w_blend.empty or w_blend.sum() <= 0:
             continue
         w_blend = w_blend / w_blend.sum()
+
+        # Trend-following sleeve (core-satellite): blend a long-only inverse-vol
+        # TSMOM sleeve with the ensemble. If nothing trends the sleeve is CASH,
+        # so the blend de-risks by _trend_sleeve_w (w_blend then sums to <1).
+        if _trend_sleeve_w > 0:
+            _sleeve = _compute_trend_sleeve(px, t, _trade_universe, _caps_for_trend)
+            _union_ts = sorted(set(w_blend.index) | set(_sleeve.index))
+            w_blend = ((1.0 - _trend_sleeve_w) * w_blend.reindex(_union_ts).fillna(0.0)
+                       + _trend_sleeve_w * _sleeve.reindex(_union_ts).fillna(0.0))
+            w_blend = w_blend[w_blend > 1e-6]
+            if w_blend.empty:
+                continue
+            if not _sleeve.empty:
+                _n_trend_applied += 1
 
         # Crash-hedge overlay: if SPY is in a deep enough drawdown (with
         # hysteresis), override the engine's blended target with the hedge
@@ -6977,6 +7052,9 @@ def run_oos_ensemble_walk_forward(
     if _stretch_floor > 0:
         print(f"[stretch-floor] top slot floored to {_stretch_floor*100:.0f}% "
               f"at {_n_stretch_floored} calm rebal(s)")
+    if _trend_sleeve_w > 0:
+        print(f"[trend-sleeve] {_trend_sleeve_w*100:.0f}% core-satellite blend; "
+              f"sleeve invested (non-cash) at {_n_trend_applied} rebal(s)")
     if _defer_events > 0 or _defer_released_rebals > 0:
         print(f"[lt-defer] {_defer_events} lot-shield event(s) over window, "
               f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
