@@ -799,6 +799,17 @@ if _trend_sleeve_env:
         print(f"[config-override] TREND_SLEEVE_WEIGHT={TREND_SLEEVE_WEIGHT} via env")
     except Exception as _e_ts_env:
         print(f"[config-override] bad PORTOPT_TREND_SLEEVE_WEIGHT ignored: {_e_ts_env}")
+
+# Ledoit-Wolf covariance shrinkage (PRE-REGISTERED 2026-07-09; memory:
+# reference-cov-shrinkage-experiment). Σ-side robustness: shrink the noisy
+# sample covariance toward the constant-correlation target for better-
+# conditioned MV weights. Parameter-free. False = sample cov (production).
+COV_SHRINKAGE = False
+_cov_shrink_env = os.environ.get("PORTOPT_COV_SHRINKAGE")
+if _cov_shrink_env is not None:
+    COV_SHRINKAGE = _cov_shrink_env.strip() not in ("", "0", "false", "False")
+    if COV_SHRINKAGE:
+        print("[config-override] COV_SHRINKAGE=1 (Ledoit-Wolf) via env")
 EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
 EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
 
@@ -6242,6 +6253,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"stretch_floor:{float(globals().get('STRETCH_FLOOR_CALM', 0.0) or 0.0)}".encode())
         h.update(f"stretch_pred:{int(bool(globals().get('STRETCH_FLOOR_PREDICTIVE', False)))}".encode())
         h.update(f"trend_sleeve:{float(globals().get('TREND_SLEEVE_WEIGHT', 0.0) or 0.0)}".encode())
+        h.update(f"cov_shrink:{int(bool(globals().get('COV_SHRINKAGE', False)))}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -6310,6 +6322,48 @@ def run_oos_ensemble_walk_forward_cached(prices_aud: pd.DataFrame,
     result = run_oos_ensemble_walk_forward(prices_aud, **kwargs)
     _oos_cache_save(key, result)
     return result
+
+
+def _ledoit_wolf_cc(returns_df: "pd.DataFrame") -> tuple:
+    """Ledoit-Wolf (2004) linear shrinkage of the sample covariance toward the
+    constant-correlation target. Parameter-free — optimal intensity estimated
+    from data. Better-conditioned Σ → more robust MV weights (Σ-side, avoids
+    the μ-side error-max trap). Returns (cov_df, shrinkage_intensity).
+    Verified standalone 2026-07-09 (PSD, symmetric, diag-preserving)."""
+    X = returns_df.dropna(how="any").values
+    T, N = X.shape
+    cols = returns_df.columns
+    if T < 2 or N < 2:
+        return returns_df.cov(), 0.0
+    Xc = X - X.mean(axis=0)
+    S = (Xc.T @ Xc) / T
+    var = np.diag(S).copy()
+    std = np.sqrt(var)
+    outer_std = np.outer(std, std)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr = S / outer_std
+    r_bar = (np.nansum(corr) - N) / (N * (N - 1))
+    F = r_bar * outer_std
+    np.fill_diagonal(F, var)
+    Xc2 = Xc ** 2
+    pi_mat = (Xc2.T @ Xc2) / T - S ** 2
+    pi_hat = pi_mat.sum()
+    term1 = ((Xc ** 3).T @ Xc) / T
+    theta = term1 - var[:, None] * S
+    np.fill_diagonal(theta, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.outer(std, 1.0 / std)
+    rho_hat = np.diag(pi_mat).sum() + r_bar * np.nansum(ratio * theta)
+    gamma = float(np.sum((F - S) ** 2))
+    if gamma <= 0:
+        delta = 0.0
+    else:
+        delta = max(0.0, min(1.0, ((pi_hat - rho_hat) / gamma) / T))
+    # Rescale MLE (/T) sample cov back to unbiased (/(T-1)) convention on the
+    # unshrunk part so levels match pandas .cov().
+    Sigma = delta * F + (1.0 - delta) * S
+    Sigma *= T / (T - 1)
+    return pd.DataFrame(Sigma, index=cols, columns=cols), float(delta)
 
 
 def _compute_trend_sleeve(px, as_of, universe, caps,
@@ -6515,6 +6569,9 @@ def run_oos_ensemble_walk_forward(
                        and not str(c).startswith("^")]
     _caps_for_trend = globals().get("PER_ASSET_WEIGHT_CAPS", {}) or {}
     _n_trend_applied = 0
+    _cov_shrinkage = bool(globals().get("COV_SHRINKAGE", False))
+    _lw_delta_sum = 0.0
+    _lw_delta_n = 0
     if (_skip_calm_delta > 0 or _stretch_floor > 0) and benchmark_ticker in px.columns:
         _spy_ser_calm = px[benchmark_ticker].sort_index()
         _spy_dd_for_calm = (_spy_ser_calm
@@ -6599,7 +6656,12 @@ def run_oos_ensemble_walk_forward(
         log_ret = np.log1p(train_rets)
         mu = pd.Series(np.expm1(log_ret.mean() * 252.0), index=train_rets.columns)
         mu = _apply_mu_shrinkage(mu)
-        Sigma = train_rets.cov()
+        if _cov_shrinkage:
+            Sigma, _lw_delta = _ledoit_wolf_cc(train_rets)
+            _lw_delta_sum += _lw_delta
+            _lw_delta_n += 1
+        else:
+            Sigma = train_rets.cov()
         spy_mu = float(mu[benchmark_ticker]) if benchmark_ticker in mu.index else None
 
         # If auto factor tilts enabled, compute the trailing-N-day factor
@@ -7055,6 +7117,9 @@ def run_oos_ensemble_walk_forward(
     if _trend_sleeve_w > 0:
         print(f"[trend-sleeve] {_trend_sleeve_w*100:.0f}% core-satellite blend; "
               f"sleeve invested (non-cash) at {_n_trend_applied} rebal(s)")
+    if _cov_shrinkage and _lw_delta_n > 0:
+        print(f"[cov-shrink] Ledoit-Wolf mean shrinkage δ={_lw_delta_sum/_lw_delta_n:.3f} "
+              f"over {_lw_delta_n} rebal(s)")
     if _defer_events > 0 or _defer_released_rebals > 0:
         print(f"[lt-defer] {_defer_events} lot-shield event(s) over window, "
               f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
