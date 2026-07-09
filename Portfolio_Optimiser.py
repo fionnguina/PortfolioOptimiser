@@ -813,11 +813,13 @@ if _cov_shrink_env is not None:
     if COV_SHRINKAGE:
         print("[config-override] COV_SHRINKAGE=1 (Ledoit-Wolf) via env")
 
-# Volatility targeting (PRE-REGISTERED 2026-07-09; memory:
-# reference-vol-targeting-experiment). Cap ex-ante portfolio vol at this
-# annual target by scaling the blend toward cash (long-only, de-risk only).
-# 0 = OFF (production). Env PORTOPT_VOL_TARGET_ANNUAL, fingerprint-aware.
-VOL_TARGET_ANNUAL = 0.0
+# Volatility targeting (memory: reference-vol-targeting-experiment). Cap
+# ex-ante portfolio vol at this annual target by scaling the blend toward cash
+# (long-only, de-risk only). SHIPPED 2026-07-09 at 0.16 after CV + dev/val:
+# validation MaxDD -3pp (crisis window) at flat Sharpe, bull window no-op,
+# ~47bps/yr cost — the clearest win of the search, on the fund's core axis.
+# 0 = OFF. Env PORTOPT_VOL_TARGET_ANNUAL, fingerprint-aware.
+VOL_TARGET_ANNUAL = 0.16
 _vol_target_env = os.environ.get("PORTOPT_VOL_TARGET_ANNUAL")
 if _vol_target_env:
     try:
@@ -10995,6 +10997,21 @@ try:
         w_ensemble_live = w_ensemble_live[w_ensemble_live > 1e-6]
         if not w_ensemble_live.empty and w_ensemble_live.sum() > 0:
             w_ensemble_live = w_ensemble_live / w_ensemble_live.sum()
+        # Volatility targeting (ship-consistency with the backtest): cap the
+        # live ex-ante vol at VOL_TARGET_ANNUAL by scaling toward cash. Uses
+        # the same LW live Σ; long-only (de-risk only). Mirrors the walk-forward.
+        _vt_live = float(globals().get("VOL_TARGET_ANNUAL", 0.0) or 0.0)
+        if _vt_live > 0 and not w_ensemble_live.empty:
+            _cvl = [c for c in w_ensemble_live.index if c in _Sigma_live.index]
+            if len(_cvl) >= 2:
+                _wvl = w_ensemble_live.reindex(_cvl).fillna(0.0).values
+                _Sl = _Sigma_live.reindex(index=_cvl, columns=_cvl).fillna(0.0).values
+                _sig_l = float(np.sqrt(max(float(_wvl @ _Sl @ _wvl), 0.0) * 252.0))
+                if _sig_l > _vt_live > 0:
+                    _sc = _vt_live / _sig_l
+                    w_ensemble_live = w_ensemble_live * _sc
+                    print(f"[vol-target] live ex-ante vol {_sig_l*100:.1f}% > "
+                          f"{_vt_live*100:.0f}% target → scaled to {_sc:.2f} (rest cash)")
     # PRODUCTION CONFIG crash-hedge: check trigger NOW; if active, replace
     # w_ensemble_live with hedge basket. Mirrors the engine's per-rebalance
     # hedge check so the live trade plan reflects current crash-hedge status.
