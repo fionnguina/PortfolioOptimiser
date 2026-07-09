@@ -18,7 +18,11 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
   live pipeline ~11200-12800, Excel/PPT export ~13000-16000.
 - `cgt.py` — CGT profiles, LotBook (FIFO lots, `protect=` shielding), compute_cgt_tax,
   compute_fy_tax_ledger (per-FY ledger from actual fills).
-- `tlh.py`, `brokerage.py`, `drift.py`, `ensemble.py` — extracted modules.
+- Extracted modules (constants canonical in-module, engine imports/re-exports back):
+  `metrics.py`, `ensemble.py`, `tlh.py`, `brokerage.py`, `drift.py`, `factors.py`
+  (FF5/MOM + region mapping), `dialogs.py` (holdings/tilts Tk dialogs),
+  `solvers.py` (MV core: max_sharpe/frontier/candidates + Ledoit-Wolf — engine syncs
+  caps + ENSEMBLE_SLOTS into it), `lots.py` (lot-book construction from fills/holdings).
 - `Stock Analysis.xlsm` — **Holdings sheet Security column IS the ticker universe.**
   Engine writes Holdings back each run (Units stay sticky; engine never writes Units).
 - `tlh_pairs.json` — TLH substitutes. Keys must match engine symbols EXACTLY
