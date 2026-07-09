@@ -812,6 +812,19 @@ if _cov_shrink_env is not None:
     COV_SHRINKAGE = _cov_shrink_env.strip() not in ("", "0", "false", "False")
     if COV_SHRINKAGE:
         print("[config-override] COV_SHRINKAGE=1 (Ledoit-Wolf) via env")
+
+# Volatility targeting (PRE-REGISTERED 2026-07-09; memory:
+# reference-vol-targeting-experiment). Cap ex-ante portfolio vol at this
+# annual target by scaling the blend toward cash (long-only, de-risk only).
+# 0 = OFF (production). Env PORTOPT_VOL_TARGET_ANNUAL, fingerprint-aware.
+VOL_TARGET_ANNUAL = 0.0
+_vol_target_env = os.environ.get("PORTOPT_VOL_TARGET_ANNUAL")
+if _vol_target_env:
+    try:
+        VOL_TARGET_ANNUAL = max(0.0, float(_vol_target_env))
+        print(f"[config-override] VOL_TARGET_ANNUAL={VOL_TARGET_ANNUAL} via env")
+    except Exception as _e_vt_env:
+        print(f"[config-override] bad PORTOPT_VOL_TARGET_ANNUAL ignored: {_e_vt_env}")
 EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
 EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
 
@@ -6256,6 +6269,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"stretch_pred:{int(bool(globals().get('STRETCH_FLOOR_PREDICTIVE', False)))}".encode())
         h.update(f"trend_sleeve:{float(globals().get('TREND_SLEEVE_WEIGHT', 0.0) or 0.0)}".encode())
         h.update(f"cov_shrink:{int(bool(globals().get('COV_SHRINKAGE', False)))}".encode())
+        h.update(f"vol_target:{float(globals().get('VOL_TARGET_ANNUAL', 0.0) or 0.0)}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -6574,6 +6588,8 @@ def run_oos_ensemble_walk_forward(
     _cov_shrinkage = bool(globals().get("COV_SHRINKAGE", False))
     _lw_delta_sum = 0.0
     _lw_delta_n = 0
+    _vol_target = float(globals().get("VOL_TARGET_ANNUAL", 0.0) or 0.0)
+    _n_vol_scaled = 0
     if (_skip_calm_delta > 0 or _stretch_floor > 0) and benchmark_ticker in px.columns:
         _spy_ser_calm = px[benchmark_ticker].sort_index()
         _spy_dd_for_calm = (_spy_ser_calm
@@ -6828,6 +6844,21 @@ def run_oos_ensemble_walk_forward(
                 continue
             if not _sleeve.empty:
                 _n_trend_applied += 1
+
+        # Volatility targeting (long-only): cap the ex-ante portfolio vol at
+        # VOL_TARGET_ANNUAL by scaling the blend toward cash. σ_ex_ante =
+        # sqrt(w'Σw) annualized from the SAME Σ the solve used (no look-ahead).
+        # Long-only → scale capped at 1.0 (de-risk only, never lever up).
+        if _vol_target > 0:
+            _cv = [c for c in w_blend.index if c in Sigma.index]
+            if len(_cv) >= 2:
+                _wv = w_blend.reindex(_cv).fillna(0.0).values
+                _Sig = Sigma.reindex(index=_cv, columns=_cv).fillna(0.0).values
+                _var_d = float(_wv @ _Sig @ _wv)
+                _sig_ann = float(np.sqrt(max(_var_d, 0.0) * 252.0))
+                if _sig_ann > _vol_target > 0:
+                    w_blend = w_blend * (_vol_target / _sig_ann)  # rest → cash
+                    _n_vol_scaled += 1
 
         # Crash-hedge overlay: if SPY is in a deep enough drawdown (with
         # hysteresis), override the engine's blended target with the hedge
@@ -7122,6 +7153,9 @@ def run_oos_ensemble_walk_forward(
     if _cov_shrinkage and _lw_delta_n > 0:
         print(f"[cov-shrink] Ledoit-Wolf mean shrinkage δ={_lw_delta_sum/_lw_delta_n:.3f} "
               f"over {_lw_delta_n} rebal(s)")
+    if _vol_target > 0:
+        print(f"[vol-target] target {_vol_target*100:.0f}% ann; de-risked toward cash "
+              f"at {_n_vol_scaled} rebal(s)")
     if _defer_events > 0 or _defer_released_rebals > 0:
         print(f"[lt-defer] {_defer_events} lot-shield event(s) over window, "
               f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
