@@ -1,0 +1,228 @@
+"""Excel/PPT sheet writers + formatting utilities (module split #18, 2026-07-09).
+
+xlwings sheet writers + generic openpyxl/pptx helpers, split out of the monolith.
+Take a workbook/table + a DataFrame; no engine state beyond TARGET_PORTFOLIO_VALUE_AUD
+(synced by the engine after import). _write_holdings_sheet stays in the engine (it
+needs the FX helpers) and calls these utilities via the engine's re-export.
+  get_or_clear_sheet / set_number_formats / set_truefalse_validation  xlwings helpers.
+  _ensure_actual_fills_sheet / _read_actual_fills                     Actual_Fills sheet.
+  _write_drift_sheets / _write_cash_ledger_sheet / _write_tilts_sheet Sheet renderers.
+  _autofit_table_width                                                PPT table column fit.
+"""
+from __future__ import annotations
+
+import pandas as pd
+from pptx.util import Cm
+
+# Synced by the engine after import (cash-ledger "drift vs target" anchor).
+TARGET_PORTFOLIO_VALUE_AUD = 0.0
+
+
+def get_or_clear_sheet(wb, name):
+    """Return sheet `name` (creating after the last sheet if absent), with contents cleared."""
+    try:
+        sht = wb.sheets[name]
+        try:
+            sht.used_range.clear_contents()
+        except Exception:
+            pass
+    except Exception:
+        sht = wb.sheets.add(name, after=wb.sheets[-1])
+    return sht
+
+
+def set_truefalse_validation(sht, a1_range):
+    """Apply TRUE/FALSE data validation to the given A1-style range; silent on failure."""
+    try:
+        val_rng = sht.range(a1_range).api
+        val_rng.Validation.Delete()
+        val_rng.Validation.Add(3, 1, 1, "TRUE,FALSE")
+    except Exception:
+        pass
+
+
+def set_number_formats(sht, fmt_by_range):
+    """Apply Excel NumberFormat strings to multiple ranges in one go. fmt_by_range: {a1_range: fmt}."""
+    try:
+        for rng, fmt in fmt_by_range.items():
+            sht.range(rng).api.NumberFormat = fmt
+    except Exception:
+        pass
+
+
+def _ensure_actual_fills_sheet(wb) -> None:
+    """Create Actual_Fills sheet with column headers if missing. NEVER touches
+    existing user data (user enters fills by hand)."""
+    try:
+        existing = [s.name for s in wb.sheets]
+    except Exception:
+        return
+    if "Actual_Fills" in existing:
+        return
+    try:
+        sht = wb.sheets.add("Actual_Fills", after=wb.sheets[-1])
+        headers = ["Fill Date", "Ticker", "Side", "Units", "Px AUD",
+                   "Fees AUD", "Notes"]
+        sht.range("A1").value = headers
+        sht.range("A2").value = "(enter fills below — date YYYY-MM-DD, units signed +/-)"
+    except Exception as e:
+        print(f"[drift] could not create Actual_Fills sheet: {e}")
+
+
+def _read_actual_fills(wb) -> pd.DataFrame:
+    """Read Actual_Fills sheet. Returns empty DataFrame if missing/empty."""
+    try:
+        if "Actual_Fills" not in [s.name for s in wb.sheets]:
+            return pd.DataFrame()
+        sht = wb.sheets["Actual_Fills"]
+        raw = sht.range("A1").expand().value
+        if not raw or len(raw) < 2:
+            return pd.DataFrame()
+        hdr = [str(h).strip() for h in raw[0]]
+        rows = [r for r in raw[1:] if r and any(c is not None for c in r)]
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=hdr)
+        # Drop the placeholder hint row (first row of body that has no Ticker).
+        df = df[df.get("Ticker").notna()] if "Ticker" in df.columns else df
+        if df.empty:
+            return df
+        df["Fill Date"] = pd.to_datetime(df["Fill Date"], errors="coerce")
+        for col in ("Units", "Px AUD", "Fees AUD"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Fill Date", "Ticker", "Units"])
+        df["Ticker"] = df["Ticker"].astype(str).str.strip()
+        return df.reset_index(drop=True)
+    except Exception as e:
+        print(f"[drift] could not read Actual_Fills sheet: {e}")
+        return pd.DataFrame()
+
+
+def _write_drift_sheets(
+    wb,
+    fills_drift_df: pd.DataFrame,
+    nav_drift_df: pd.DataFrame,
+    live_nav_series: pd.Series,
+    live_dd: float,
+) -> None:
+    """Write Drift_Fills + Drift_NAV sheets. Overwrites each run."""
+    try:
+        sht = get_or_clear_sheet(wb, "Drift_Fills")
+        if fills_drift_df is not None and not fills_drift_df.empty:
+            sht.range("A1").options(index=False).value = fills_drift_df
+        else:
+            sht.range("A1").value = "(no fills in Actual_Fills yet — enter fills to populate)"
+    except Exception as e:
+        print(f"[drift] could not write Drift_Fills sheet: {e}")
+    try:
+        sht = get_or_clear_sheet(wb, "Drift_NAV")
+        # Summary header
+        sht.range("A1").value = "Live MaxDD (current from peak)"
+        sht.range("B1").value = round(float(live_dd) * 100, 2)
+        sht.range("C1").value = "%"
+        sht.range("A2").value = "Live NAV samples"
+        sht.range("B2").value = int(live_nav_series.size)
+        if nav_drift_df is not None and not nav_drift_df.empty:
+            sht.range("A4").options(index=False).value = nav_drift_df
+        else:
+            sht.range("A4").value = ("(monthly drift table inactive — set "
+                                     "LIVE_TRADING_START_DATE in config to enable)")
+    except Exception as e:
+        print(f"[drift] could not write Drift_NAV sheet: {e}")
+
+
+def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame) -> None:
+    """Render the cash ledger to an Excel sheet. Overwrites each run."""
+    try:
+        sht = get_or_clear_sheet(wb, "Cash_Ledger")
+        if ledger_df is None or ledger_df.empty:
+            sht.range("A1").value = "(cash ledger empty — first run after this update populates it)"
+            return
+        # Summary band across the top.
+        latest = ledger_df.iloc[-1]
+        n_runs = len(ledger_df)
+        sht.range("A1").value = "Target Portfolio (AUD)"
+        sht.range("B1").value = round(TARGET_PORTFOLIO_VALUE_AUD, 2)
+        sht.range("A2").value = "Latest Portfolio (AUD)"
+        sht.range("B2").value = float(latest["portfolio_value_aud"])
+        sht.range("A3").value = "Total Drift vs Target"
+        sht.range("B3").value = float(latest["drift_vs_target_aud"])
+        sht.range("A4").value = "Total Drift vs Start (run 1)"
+        sht.range("B4").value = float(latest["drift_vs_start_aud"])
+        sht.range("A5").value = "Cum. Brokerage (all runs)"
+        sht.range("B5").value = float(latest["cum_brokerage_aud"])
+        sht.range("A6").value = "Cum. CGT (all runs)"
+        sht.range("B6").value = float(latest["cum_cgt_aud"])
+        sht.range("A7").value = "Total Cost (Brokerage + CGT)"
+        sht.range("B7").value = float(latest["cum_brokerage_aud"] + latest["cum_cgt_aud"])
+        sht.range("A8").value = "Runs recorded"
+        sht.range("B8").value = int(n_runs)
+        # Per-run detail starts below.
+        display_cols = [
+            "date", "selected_mode",
+            "portfolio_value_aud", "net_invested_aud", "cash_balance_aud",
+            "delta_vs_prev_aud",
+            "brokerage_this_run_aud", "cgt_this_run_aud",
+            "loss_carry_forward_tax_aud",
+            "cum_brokerage_aud", "cum_cgt_aud",
+            "drift_vs_start_aud", "drift_vs_target_aud",
+            "unexplained_delta_aud",
+        ]
+        present = [c for c in display_cols if c in ledger_df.columns]
+        out_df = ledger_df[present].copy()
+        out_df.rename(columns={
+            "date": "Date",
+            "selected_mode": "Mode",
+            "portfolio_value_aud": "Portfolio (AUD)",
+            "net_invested_aud": "Net Invested (AUD)",
+            "cash_balance_aud": "Cash (AUD)",
+            "delta_vs_prev_aud": "Δ vs Prior (AUD)",
+            "brokerage_this_run_aud": "Brokerage (AUD)",
+            "cgt_this_run_aud": "CGT (AUD)",
+            "loss_carry_forward_tax_aud": "Tax Saved (AUD)",
+            "cum_brokerage_aud": "Cum. Brokerage",
+            "cum_cgt_aud": "Cum. CGT",
+            "drift_vs_start_aud": "Drift vs Start",
+            "drift_vs_target_aud": "Drift vs Target",
+            "unexplained_delta_aud": "Unexplained Δ",
+        }, inplace=True)
+        sht.range("A10").options(index=False).value = out_df
+    except Exception as e:
+        print(f"[cash] could not write Cash_Ledger sheet: {e}")
+
+
+def _write_tilts_sheet(wb, tilts_df, sheet_name="Tilts"):
+    sht = get_or_clear_sheet(wb, sheet_name)
+
+    out = tilts_df.reset_index().rename(columns={"index": "Factor"})
+    out = out[["Factor","Target","Band","Use?"]]
+    sht.range("A1").value = [["Factor","Target","Band","Use?"]]
+    sht.range("A2").options(index=False, header=False).value = out
+    last_row = 1 + len(out)
+    set_number_formats(sht, {
+        f"B2:B{last_row}": "0.000",
+        f"C2:C{last_row}": "0.000",
+    })
+    set_truefalse_validation(sht, f"D2:D{last_row}")
+    sht.autofit()
+
+
+def _autofit_table_width(table, df, total_width_cm=12.02):
+    """Auto-fit PPT table column widths from a DataFrame's content."""
+    def est_width(text):
+        return len(str(text)) * 0.22  # empirical avg for 9pt Calibri
+    est_widths = []
+    for col in df.columns:
+        header_w = est_width(col)
+        data_w = max(est_width(v) for v in df[col].astype(str)) if len(df) else header_w
+        width = max(header_w, data_w)
+        if col.lower() in ("target", "change"):
+            width = max(width, 1.85)
+        elif col.lower() == "security":
+            width = max(width, 1.778)
+        est_widths.append(width)
+    total_est = sum(est_widths)
+    scale = total_width_cm / total_est if total_est else 1.0
+    for j, est in enumerate(est_widths):
+        table.columns[j].width = Cm(est * scale)
