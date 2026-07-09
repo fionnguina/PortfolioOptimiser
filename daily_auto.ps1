@@ -275,14 +275,14 @@ try {
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.WindowStyle = "Hidden"
-    # Hybrid evidence config (2026-06-27): daily scheduled runs auto-
-    # enable SCALE_SENSITIVITY so metrics_history.jsonl accumulates a
-    # continuous track at every NAV ($100k / $250k / $500k / $1M) in
-    # parallel. User decided to skip QuantConnect — the existing engine
-    # at multiple scales is the evidence pipeline for the wholesale-
-    # fund pitch. Interactive runs (without this wrapper) stay fast by
-    # leaving SCALE_SENSITIVITY off unless explicitly enabled.
-    $psi.EnvironmentVariables["SCALE_SENSITIVITY"] = "1"
+    # SCALE_SENSITIVITY intentionally NOT set here (2026-07-09): the morning
+    # run's job is the fast ~90s trade-trigger verdict + broker NAV snapshot
+    # + notify. The multi-scale evidence sweep (~25min) moved to a separate
+    # EVENING task (evidence_run.ps1) so it can't delay/timeout-kill the
+    # decision or clobber a trade plan mid-execution. Daily-evolving evidence
+    # (production 3Y/5Y/10Y metrics, regime mix, TLH, real broker NAV) still
+    # accrues on THIS fast run; only the near-static per-NAV scale block is
+    # deferred to evening.
     $engineProc = [System.Diagnostics.Process]::Start($psi)
 } catch {
     Write-Log "Engine launch threw: $($_.Exception.Message)"
