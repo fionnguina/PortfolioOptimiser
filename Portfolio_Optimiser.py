@@ -800,11 +800,13 @@ if _trend_sleeve_env:
     except Exception as _e_ts_env:
         print(f"[config-override] bad PORTOPT_TREND_SLEEVE_WEIGHT ignored: {_e_ts_env}")
 
-# Ledoit-Wolf covariance shrinkage (PRE-REGISTERED 2026-07-09; memory:
-# reference-cov-shrinkage-experiment). Σ-side robustness: shrink the noisy
-# sample covariance toward the constant-correlation target for better-
-# conditioned MV weights. Parameter-free. False = sample cov (production).
-COV_SHRINKAGE = False
+# Ledoit-Wolf covariance shrinkage (memory: reference-cov-shrinkage-experiment).
+# Σ-side robustness: shrink the noisy sample covariance toward the constant-
+# correlation target for better-conditioned + more STABLE MV weights.
+# Parameter-free. SHIPPED 2026-07-09 as production default (True) after CV +
+# 2× dev/val: +0.03 full-period Sharpe, +0.06 dev Sharpe, crisis cost ~0.5pp
+# within noise, textbook-correct estimator, more stable than sample cov.
+COV_SHRINKAGE = True
 _cov_shrink_env = os.environ.get("PORTOPT_COV_SHRINKAGE")
 if _cov_shrink_env is not None:
     COV_SHRINKAGE = _cov_shrink_env.strip() not in ("", "0", "false", "False")
@@ -10892,6 +10894,22 @@ ensemble_mix_live = pd.Series(dtype=float)
 try:
     _mu_live = _apply_mu_shrinkage(pd.Series(mu_ann_geo).astype(float).dropna())
     _Sigma_live = Sigma_daily.copy()
+    # Ship-consistency: the live solve must use the SAME covariance estimator
+    # as the shipped backtest. Overlay Ledoit-Wolf on the good-coverage recent
+    # window (matches the walk-forward), keep sample cov for ragged-edge
+    # tickers. Fallback to sample cov on any failure (never break the plan).
+    if bool(globals().get("COV_SHRINKAGE", False)) and "df_cov_wide" in globals():
+        try:
+            _win = df_cov_wide.tail(504)
+            _win = _win.loc[:, _win.notna().mean() >= 0.8].dropna(how="any")
+            if _win.shape[0] >= 60 and _win.shape[1] >= 3:
+                _lw_live, _lwd = _ledoit_wolf_cc(_win)
+                _Sigma_live.loc[_lw_live.index, _lw_live.columns] = _lw_live.values
+                print(f"[cov-shrink] live Σ shrunk (Ledoit-Wolf δ={_lwd:.3f}, "
+                      f"{_win.shape[1]} tickers)")
+        except Exception as _e_lwlive:
+            print(f"[cov-shrink] live LW failed ({_e_lwlive}); using sample cov")
+            _Sigma_live = Sigma_daily.copy()
     _spy_mu_live = float(_mu_live["SPY"]) if "SPY" in _mu_live.index else None
     _cand_live = solve_candidate_portfolios(_mu_live, _Sigma_live, _spy_mu_live)
     # Publish the live slot weights so downstream consumers (EF chart, TLH,
