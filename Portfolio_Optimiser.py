@@ -186,6 +186,7 @@ from excel_sheets import (
     _write_drift_sheets,
     _write_cash_ledger_sheet,
     _write_tilts_sheet,
+    _write_holdings_sheet,
     _autofit_table_width,
 )
 
@@ -4504,61 +4505,6 @@ OPEN_PPT_AFTER_SAVE = bool(globals().get("OPEN_PPT_AFTER_SAVE", CFG.get("open_pp
 # -------------------------------
 # Writers (used by Block 7)
 # -------------------------------
-def _write_holdings_sheet(wb, prices, units, include_flags,
-                          sheet_name="Holdings", fx_to_aud_map=None):
-    if fx_to_aud_map is None:
-        usd_aud = get_usd_aud_fx()
-        fx_to_aud_map = fx_to_aud_for_tickers(prices.columns, usd_aud)
-
-    tickers_all = [
-        t for t in prices.columns
-        if t != "PortfolioValue"
-    ]
-    last_px = prices.ffill().iloc[-1]
-    rows = []
-    units_s = pd.Series(units)
-    include_s = pd.Series(include_flags)
-    for t in tickers_all:
-        # Default True: tickers added to the universe but not yet in the
-        # Holdings dict should be tradable. False here previously silently
-        # froze every newly-added ticker — make_trade_plan would override
-        # tgt_units with cur_units (=0), producing 0 trades despite the
-        # ensemble recommending them. Aligns with make_trade_plan's own
-        # fillna(True) default for missing include_flags entries.
-        inc = bool(include_s.get(t, True))
-        rows.append({
-            "Security": t,
-            "Units": float(units_s.get(t, 0.0)),
-            "Last Price": float(pd.Series(last_px).get(t, np.nan)),
-            "FX to AUD": float(pd.Series(fx_to_aud_map).get(t, 1.0)),
-            "Market Value": 0.0,
-            "Weight": 0.0,
-            "Include?": inc,
-        })
-    df = pd.DataFrame(rows)
-
-    sht = get_or_clear_sheet(wb, sheet_name)
-
-    sht.range('A1').value = [["Security","Units","Last Price","FX to AUD","Market Value","Weight","Include?"]]
-    sht.range('A2').options(index=False, header=False).value = df
-    n = len(df); last_row = 1 + n
-    if n >= 1:
-        sht.range('E2').formula = "=B2*C2*D2"
-        if n > 1:
-            sht.range(f"E2:E{last_row}").api.FillDown()
-        sumif_den = f"SUMIF($G$2:$G${last_row},TRUE,$E$2:$E${last_row})"
-        sht.range('F2').formula = f"=IF({sumif_den}=0,0,IF($G2,E2/{sumif_den},0))"
-        if n > 1:
-            sht.range(f"F2:F{last_row}").api.FillDown()
-        set_truefalse_validation(sht, f"G2:G{last_row}")
-        set_number_formats(sht, {
-            f"C2:C{last_row}": "0.0000",
-            f"D2:D{last_row}": "0.0000",
-            f"E2:E{last_row}": "$0.00",
-            f"F2:F{last_row}": "0.00%",
-        })
-    sht.autofit()
-
 def update_efficient_frontier_chart(
     opt_sheet, stats_df, start_s_row, rf_annual,
     tan_ret, tan_vol, current_point,
