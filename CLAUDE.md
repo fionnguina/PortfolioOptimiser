@@ -22,7 +22,11 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
   `metrics.py`, `ensemble.py`, `tlh.py`, `brokerage.py`, `drift.py`, `factors.py`
   (FF5/MOM + region mapping), `dialogs.py` (holdings/tilts Tk dialogs),
   `solvers.py` (MV core: max_sharpe/frontier/candidates + Ledoit-Wolf — engine syncs
-  caps + ENSEMBLE_SLOTS into it), `lots.py` (lot-book construction from fills/holdings).
+  caps + ENSEMBLE_SLOTS into it), `lots.py` (lot-book construction from fills/holdings),
+  `nav.py` (broker-truth actual-NAV series — engine syncs APP_DIR),
+  `excel_sheets.py` (xlwings sheet writers + pptx formatting — engine syncs
+  TARGET_PORTFOLIO_VALUE_AUD; imports fx), `fx.py` (USD/AUD conversion — engine syncs
+  the runtime fx_usdaud series).
 - `Stock Analysis.xlsm` — **Holdings sheet Security column IS the ticker universe.**
   Engine writes Holdings back each run (Units stay sticky; engine never writes Units).
 - `tlh_pairs.json` — TLH substitutes. Keys must match engine symbols EXACTLY
