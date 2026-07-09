@@ -543,5 +543,19 @@ if ($mailSubject) {
     }
 }
 
+# --- Evidence backup to OneDrive (2026-07-09) ---
+# The real-money track record + lot book live in gitignored local-only
+# files; mirror them to OneDrive each run so a disk failure can't erase the
+# fund's most valuable asset. Non-fatal.
+try {
+    $backupScript = Join-Path $ScriptDir "backup_evidence.ps1"
+    if (Test-Path $backupScript) {
+        $bkOut = & powershell -ExecutionPolicy Bypass -NonInteractive -File $backupScript 2>&1 | Select-Object -Last 1
+        Write-Log "Evidence backup: $bkOut"
+    }
+} catch {
+    Write-Log "Evidence backup failed (non-fatal): $($_.Exception.Message)"
+}
+
 Write-Log "Done."
 exit 0
