@@ -758,6 +758,22 @@ if _skip_calm_env:
         print(f"[config-override] SKIP_REBAL_DELTA_CALM={SKIP_REBAL_DELTA_CALM} via env")
     except Exception as _e_calm_env:
         print(f"[config-override] bad PORTOPT_SKIP_DELTA_CALM ignored: {_e_calm_env}")
+
+# Insurance-premium experiment (PRE-REGISTERED 2026-07-09; memory:
+# reference-insurance-premium-experiment). On CALM rebalances (not early-
+# triggered AND benchmark 252d DD > -5%) floor the top/Stretch slot weight at
+# this value, redistributing from the defensive slots — captures more bull
+# return, releases instantly on stress. 0 = OFF (production). This LOOSENS the
+# drawdown defense; gate hardest (full-period MaxDD must not deepen > 1pp).
+STRETCH_FLOOR_CALM = 0.0
+
+_stretch_floor_env = os.environ.get("PORTOPT_STRETCH_FLOOR_CALM")
+if _stretch_floor_env:
+    try:
+        STRETCH_FLOOR_CALM = min(1.0, max(0.0, float(_stretch_floor_env)))
+        print(f"[config-override] STRETCH_FLOOR_CALM={STRETCH_FLOOR_CALM} via env")
+    except Exception as _e_sf_env:
+        print(f"[config-override] bad PORTOPT_STRETCH_FLOOR_CALM ignored: {_e_sf_env}")
 EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
 EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
 
@@ -6198,6 +6214,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"lt_defer_cond:{int(bool(globals().get('LT_DEFER_DD_CONDITIONAL', False)))}".encode())
         h.update(f"lt_defer_reldd:{float(globals().get('LT_DEFER_RELEASE_DD', 0.0) or 0.0)}".encode())
         h.update(f"skip_calm:{float(globals().get('SKIP_REBAL_DELTA_CALM', 0.0) or 0.0)}".encode())
+        h.update(f"stretch_floor:{float(globals().get('STRETCH_FLOOR_CALM', 0.0) or 0.0)}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -6416,9 +6433,13 @@ def run_oos_ensemble_walk_forward(
     # Trailing benchmark drawdown for the calm-conditional skip threshold
     # (pre-registered asym-rebalance experiment, 2026-07-08).
     _skip_calm_delta = float(globals().get("SKIP_REBAL_DELTA_CALM", 0.0) or 0.0)
+    # Insurance-premium experiment (2026-07-09): min top-slot (Stretch) weight
+    # on CALM rebalances. See reference-insurance-premium-experiment memory.
+    _stretch_floor = float(globals().get("STRETCH_FLOOR_CALM", 0.0) or 0.0)
     _spy_dd_for_calm = None
     _n_calm_widened = 0
-    if _skip_calm_delta > 0 and benchmark_ticker in px.columns:
+    _n_stretch_floored = 0
+    if (_skip_calm_delta > 0 or _stretch_floor > 0) and benchmark_ticker in px.columns:
         _spy_ser_calm = px[benchmark_ticker].sort_index()
         _spy_dd_for_calm = (_spy_ser_calm
                             / _spy_ser_calm.rolling(window=252, min_periods=1).max()
@@ -6577,6 +6598,29 @@ def run_oos_ensemble_walk_forward(
             override_sum = float(override.sum())
             if override_sum > 0:
                 soft_w = override / override_sum
+        # Insurance-premium floor: on CALM rebalances raise the top slot to
+        # STRETCH_FLOOR_CALM, redistributing the deficit proportionally from the
+        # defensive slots. Stress rebalances (early-trigger OR SPY 252d DD ≤ -5%)
+        # are left untouched so the softmax still de-risks in the first leg down.
+        if (_stretch_floor > 0 and slot_weights_override is None
+                and _spy_dd_for_calm is not None and t not in _early_trigger_dates):
+            try:
+                _dd_now_floor = float(_spy_dd_for_calm.asof(t))
+            except Exception:
+                _dd_now_floor = -1.0
+            if np.isfinite(_dd_now_floor) and _dd_now_floor > -0.05:
+                _top = ENSEMBLE_SLOT_NAMES[-1]
+                _cur_top = float(soft_w.get(_top, 0.0))
+                if _cur_top < _stretch_floor:
+                    _others = [n for n in ENSEMBLE_SLOT_NAMES if n != _top]
+                    _osum = float(soft_w.reindex(_others).fillna(0.0).sum())
+                    if _osum > 0:
+                        soft_w = soft_w.copy()
+                        _scale = (1.0 - _stretch_floor) / _osum
+                        for _n in _others:
+                            soft_w[_n] = float(soft_w.get(_n, 0.0)) * _scale
+                        soft_w[_top] = _stretch_floor
+                        _n_stretch_floored += 1
         softmax_rows[t] = soft_w
 
         # Save per-candidate weights at this rebal.
@@ -6901,6 +6945,9 @@ def run_oos_ensemble_walk_forward(
         print(f"[skip-calm] calm threshold {_skip_calm_delta*100:.0f}% applied at "
               f"{_n_calm_widened} rebal(s); skipped {n_skipped} of "
               f"{n_skipped + n_executed} total")
+    if _stretch_floor > 0:
+        print(f"[stretch-floor] top slot floored to {_stretch_floor*100:.0f}% "
+              f"at {_n_stretch_floored} calm rebal(s)")
     if _defer_events > 0 or _defer_released_rebals > 0:
         print(f"[lt-defer] {_defer_events} lot-shield event(s) over window, "
               f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
