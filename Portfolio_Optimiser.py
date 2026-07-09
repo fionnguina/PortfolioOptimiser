@@ -827,6 +827,47 @@ if _vol_target_env:
         print(f"[config-override] VOL_TARGET_ANNUAL={VOL_TARGET_ANNUAL} via env")
     except Exception as _e_vt_env:
         print(f"[config-override] bad PORTOPT_VOL_TARGET_ANNUAL ignored: {_e_vt_env}")
+
+# Market-timed inverse-ETF crisis hedge (PRE-REGISTERED 2026-07-09; memory:
+# reference-inverse-hedge-experiment). When SPY is below its 200d SMA (trend
+# down), carve this fraction of the book into BEAR.AX (-1x AU inverse) and
+# scale the long book to (1-w). First lever with GENUINE NEGATIVE beta — the
+# axis every prior defensive tool (cash/bonds/gold/defensive slots) lacked;
+# they all co-fell in 2022. Trend-triggered (not DD-triggered like the dormant
+# HBRD/GOLD crash hedge, which engaged too late). 0 = OFF (production default).
+# Env PORTOPT_CRISIS_HEDGE_WEIGHT, fingerprint-aware. BEAR.AX chosen over BBUS
+# (which is -2x + has corrupted yfinance history: 517% ann vol).
+CRISIS_HEDGE_WEIGHT = 0.0
+CRISIS_HEDGE_TICKER = "BEAR.AX"
+# Signal = lower Bollinger band: hedge ON iff SPY_close < SMA(MA_DAYS) - BAND_SD·σ,
+# where σ = rolling std of SPY over the same MA_DAYS window. BAND_SD=0 → plain
+# SMA crossover (the formulation that FAILED 2026-07-09: fired ~43% of rebals,
+# mostly chop, deepened MaxDD). BAND_SD>0 = selective dislocation trigger meant
+# to fire ONLY on sharp selloffs (exploratory variant, user-proposed).
+CRISIS_HEDGE_MA_DAYS = 200
+CRISIS_HEDGE_BAND_SD = 0.0
+_crisis_hedge_env = os.environ.get("PORTOPT_CRISIS_HEDGE_WEIGHT")
+if _crisis_hedge_env:
+    try:
+        CRISIS_HEDGE_WEIGHT = min(0.5, max(0.0, float(_crisis_hedge_env)))
+        print(f"[config-override] CRISIS_HEDGE_WEIGHT={CRISIS_HEDGE_WEIGHT} via env")
+    except Exception as _e_ch_env:
+        print(f"[config-override] bad PORTOPT_CRISIS_HEDGE_WEIGHT ignored: {_e_ch_env}")
+_crisis_ma_env = os.environ.get("PORTOPT_CRISIS_HEDGE_MA_DAYS")
+if _crisis_ma_env:
+    try:
+        CRISIS_HEDGE_MA_DAYS = max(5, int(_crisis_ma_env))
+        print(f"[config-override] CRISIS_HEDGE_MA_DAYS={CRISIS_HEDGE_MA_DAYS} via env")
+    except Exception as _e_cma_env:
+        print(f"[config-override] bad PORTOPT_CRISIS_HEDGE_MA_DAYS ignored: {_e_cma_env}")
+_crisis_band_env = os.environ.get("PORTOPT_CRISIS_HEDGE_BAND_SD")
+if _crisis_band_env:
+    try:
+        CRISIS_HEDGE_BAND_SD = max(0.0, float(_crisis_band_env))
+        print(f"[config-override] CRISIS_HEDGE_BAND_SD={CRISIS_HEDGE_BAND_SD} via env")
+    except Exception as _e_cband_env:
+        print(f"[config-override] bad PORTOPT_CRISIS_HEDGE_BAND_SD ignored: {_e_cband_env}")
+
 EARLY_TRIGGER_DD_DEEPEN   = 0.05   # 5% SPY DD deepen since last rebal
 EARLY_TRIGGER_MIN_DAYS    = 10     # min days from prior rebal before re-trigger
 
@@ -1079,6 +1120,10 @@ def _log_config_snapshot() -> None:
           f"release={CRASH_HEDGE_DD_RELEASE*100:+.0f}%DD  "
           f"lookback={CRASH_HEDGE_LOOKBACK_DAYS}d  "
           f"basket={CRASH_HEDGE_BASKET}")
+    print(f"[config] CRISIS HEDGE          weight={CRISIS_HEDGE_WEIGHT*100:.0f}%  "
+          f"ticker={CRISIS_HEDGE_TICKER}  "
+          f"trigger=SPY<{CRISIS_HEDGE_MA_DAYS}dMA"
+          f"{'' if CRISIS_HEDGE_BAND_SD<=0 else f'-{CRISIS_HEDGE_BAND_SD:g}σ'}")
     print(f"[config] FUND FEES             active={FUND_FEES_ACTIVE}  "
           f"mgmt={MANAGEMENT_FEE_PCT_ANN*100:.1f}%/yr  "
           f"perf={PERFORMANCE_FEE_PCT*100:.0f}%>HWM  "
@@ -6272,6 +6317,9 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"trend_sleeve:{float(globals().get('TREND_SLEEVE_WEIGHT', 0.0) or 0.0)}".encode())
         h.update(f"cov_shrink:{int(bool(globals().get('COV_SHRINKAGE', False)))}".encode())
         h.update(f"vol_target:{float(globals().get('VOL_TARGET_ANNUAL', 0.0) or 0.0)}".encode())
+        h.update(f"crisis_hedge:{float(globals().get('CRISIS_HEDGE_WEIGHT', 0.0) or 0.0)}".encode())
+        h.update(f"crisis_ma:{int(globals().get('CRISIS_HEDGE_MA_DAYS', 200))}".encode())
+        h.update(f"crisis_band:{float(globals().get('CRISIS_HEDGE_BAND_SD', 0.0) or 0.0)}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -6592,6 +6640,23 @@ def run_oos_ensemble_walk_forward(
     _lw_delta_n = 0
     _vol_target = float(globals().get("VOL_TARGET_ANNUAL", 0.0) or 0.0)
     _n_vol_scaled = 0
+    # Market-timed inverse-ETF crisis hedge: hold BEAR.AX when SPY < 200d SMA.
+    _crisis_hedge_w = float(globals().get("CRISIS_HEDGE_WEIGHT", 0.0) or 0.0)
+    _crisis_hedge_tkr = str(globals().get("CRISIS_HEDGE_TICKER", "BEAR.AX"))
+    _crisis_ma_days = int(globals().get("CRISIS_HEDGE_MA_DAYS", 200))
+    _crisis_band_sd = float(globals().get("CRISIS_HEDGE_BAND_SD", 0.0) or 0.0)
+    _n_crisis_hedged = 0
+    _spy_ma_crisis = None
+    _spy_lb_crisis = None  # lower band = MA - band_sd·σ
+    if (_crisis_hedge_w > 0 and benchmark_ticker in px.columns
+            and _crisis_hedge_tkr in px.columns):
+        _spy_ser_crisis = px[benchmark_ticker].sort_index()
+        _mp_crisis = max(2, _crisis_ma_days // 2)
+        _spy_ma_crisis = _spy_ser_crisis.rolling(
+            window=_crisis_ma_days, min_periods=_mp_crisis).mean()
+        _spy_sd_crisis = _spy_ser_crisis.rolling(
+            window=_crisis_ma_days, min_periods=_mp_crisis).std()
+        _spy_lb_crisis = _spy_ma_crisis - _crisis_band_sd * _spy_sd_crisis
     if (_skip_calm_delta > 0 or _stretch_floor > 0) and benchmark_ticker in px.columns:
         _spy_ser_calm = px[benchmark_ticker].sort_index()
         _spy_dd_for_calm = (_spy_ser_calm
@@ -6861,6 +6926,23 @@ def run_oos_ensemble_walk_forward(
                 if _sig_ann > _vol_target > 0:
                     w_blend = w_blend * (_vol_target / _sig_ann)  # rest → cash
                     _n_vol_scaled += 1
+
+        # Market-timed inverse-ETF crisis hedge (partial short): when SPY is
+        # below its 200d SMA (trend down), scale the long book to (1-w) and
+        # allocate w to BEAR.AX (-1x AU inverse). First lever with genuine
+        # NEGATIVE beta. Applied AFTER vol-target (on the already-de-risked
+        # book), BEFORE the crash-hedge. Uses only history up to t (no look-
+        # ahead: the SMA is trailing). No effect unless _crisis_hedge_w > 0.
+        if _crisis_hedge_w > 0 and _spy_lb_crisis is not None:
+            _spy_now = _spy_ser_crisis.asof(t)
+            _lb_now = _spy_lb_crisis.asof(t)
+            if (pd.notna(_spy_now) and pd.notna(_lb_now)
+                    and float(_spy_now) < float(_lb_now)):
+                w_blend = w_blend * (1.0 - _crisis_hedge_w)
+                w_blend.loc[_crisis_hedge_tkr] = (
+                    w_blend.get(_crisis_hedge_tkr, 0.0) + _crisis_hedge_w)
+                w_blend = w_blend[w_blend > 1e-6]
+                _n_crisis_hedged += 1
 
         # Crash-hedge overlay: if SPY is in a deep enough drawdown (with
         # hysteresis), override the engine's blended target with the hedge
@@ -7158,6 +7240,11 @@ def run_oos_ensemble_walk_forward(
     if _vol_target > 0:
         print(f"[vol-target] target {_vol_target*100:.0f}% ann; de-risked toward cash "
               f"at {_n_vol_scaled} rebal(s)")
+    if _crisis_hedge_w > 0:
+        _band_str = (f"{_crisis_ma_days}dMA" if _crisis_band_sd <= 0
+                     else f"{_crisis_ma_days}dMA-{_crisis_band_sd:g}σ")
+        print(f"[crisis-hedge] w={_crisis_hedge_w*100:.0f}% into {_crisis_hedge_tkr} "
+              f"when SPY<{_band_str}; active at {_n_crisis_hedged} rebal(s)")
     if _defer_events > 0 or _defer_released_rebals > 0:
         print(f"[lt-defer] {_defer_events} lot-shield event(s) over window, "
               f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
@@ -11012,6 +11099,35 @@ try:
                     w_ensemble_live = w_ensemble_live * _sc
                     print(f"[vol-target] live ex-ante vol {_sig_l*100:.1f}% > "
                           f"{_vt_live*100:.0f}% target → scaled to {_sc:.2f} (rest cash)")
+        # Market-timed inverse-ETF crisis hedge (ship-consistency with the
+        # backtest): if SPY is below its 200d SMA, carve _ch_live into BEAR.AX
+        # and scale the long book to (1-w). Mirrors the walk-forward overlay.
+        _ch_live = float(globals().get("CRISIS_HEDGE_WEIGHT", 0.0) or 0.0)
+        _ch_tkr = str(globals().get("CRISIS_HEDGE_TICKER", "BEAR.AX"))
+        _ch_ma = int(globals().get("CRISIS_HEDGE_MA_DAYS", 200))
+        _ch_band = float(globals().get("CRISIS_HEDGE_BAND_SD", 0.0) or 0.0)
+        if (_ch_live > 0 and not w_ensemble_live.empty
+                and "SPY" in oos_prices_aud_long.columns):
+            _spy_l = oos_prices_aud_long["SPY"].sort_index()
+            _mp_l = max(2, _ch_ma // 2)
+            _ma_l = _spy_l.rolling(window=_ch_ma, min_periods=_mp_l).mean()
+            _sd_l = _spy_l.rolling(window=_ch_ma, min_periods=_mp_l).std()
+            _lb_l = _ma_l - _ch_band * _sd_l
+            _spy_last = _spy_l.iloc[-1] if not _spy_l.empty else np.nan
+            _lb_last = _lb_l.iloc[-1] if not _lb_l.empty else np.nan
+            _band_lbl = (f"{_ch_ma}dMA" if _ch_band <= 0 else f"{_ch_ma}dMA-{_ch_band:g}σ")
+            if pd.notna(_spy_last) and pd.notna(_lb_last):
+                if float(_spy_last) < float(_lb_last) and _ch_tkr in oos_prices_aud_long.columns:
+                    w_ensemble_live = w_ensemble_live * (1.0 - _ch_live)
+                    w_ensemble_live.loc[_ch_tkr] = (
+                        w_ensemble_live.get(_ch_tkr, 0.0) + _ch_live)
+                    w_ensemble_live = w_ensemble_live[w_ensemble_live > 1e-6]
+                    print(f"[crisis-hedge] live SPY {float(_spy_last):.2f} < "
+                          f"{_band_lbl} {float(_lb_last):.2f} → {_ch_live*100:.0f}% "
+                          f"into {_ch_tkr} (long book scaled to {(1-_ch_live)*100:.0f}%)")
+                else:
+                    print(f"[crisis-hedge] live armed, SPY {float(_spy_last):.2f} "
+                          f">= {_band_lbl} {float(_lb_last):.2f} → not triggered")
     # PRODUCTION CONFIG crash-hedge: check trigger NOW; if active, replace
     # w_ensemble_live with hedge basket. Mirrors the engine's per-rebalance
     # hedge check so the live trade plan reflects current crash-hedge status.
