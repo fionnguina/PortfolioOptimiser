@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 import requests
 
 ANNUAL_TRADING_DAYS = 252  # annualisation constant (kept local, as in metrics.py)
@@ -463,3 +464,206 @@ def auto_recommend_factor_tilts(ff_data: pd.DataFrame,
         target = max(-max_magnitude, min(max_magnitude, target))
         out[f] = round(target, 4)
     return out
+
+
+# --- Fama-French beta regressions (moved from the monolith 2026-07-10) -------
+# Dimson-style FF5 betas via OLS; multi-region wrapper stitches per-region betas.
+
+def compute_ff5_betas(
+    df_returns_wide: pd.DataFrame,
+    ff5_returns: pd.DataFrame,
+    min_obs: int = 120,
+    n_lags: int = 1,
+    return_stats: bool = False,
+):
+    """
+    Estimate FF5+MOM betas per security via OLS with a Dimson (1979) correction for
+    non-synchronous trading.
+
+    Each factor enters contemporaneously PLUS n_lags lagged terms, and the reported
+    beta is the SUM of the contemporaneous and lagged coefficients. This recovers the
+    true exposure of assets that trade in a different timezone from the US factors:
+    ASX-listed ETFs close ~16h before the US market, so their same-day beta to US
+    factors is spuriously near zero while the lagged term carries the real loading.
+
+    When `return_stats=True`, also returns a per-security DataFrame of diagnostic stats
+    (n_obs, R², adj R², per-factor contemporaneous t-stats, alpha t-stat, residual σ).
+
+    Returns:
+        (B, alpha_daily, resid_var)                 when return_stats=False
+        (B, alpha_daily, resid_var, stats_df)       when return_stats=True
+    """
+    joined = df_returns_wide.join(ff5_returns, how="inner").dropna(how="any").sort_index()
+    if joined.empty:
+        empty_stats = pd.DataFrame() if return_stats else None
+        return (None, None, None, empty_stats) if return_stats else (None, None, None)
+
+    securities = list(df_returns_wide.columns)
+    factors = [c for c in ff5_returns.columns if c != "RF"]
+    n_lags = max(0, int(n_lags))
+
+    # Design matrix: contemporaneous factors + lagged copies for the Dimson sum.
+    design = {f: pd.to_numeric(joined[f], errors="coerce") for f in factors}
+    lag_cols = {f: [] for f in factors}
+    for L in range(1, n_lags + 1):
+        for f in factors:
+            col = f"{f}__lag{L}"
+            design[col] = pd.to_numeric(joined[f], errors="coerce").shift(L)
+            lag_cols[f].append(col)
+    X_all = pd.DataFrame(design, index=joined.index)
+    all_factor_cols = list(X_all.columns)
+
+    B = pd.DataFrame(index=securities, columns=factors, dtype=float)
+    alpha_daily = pd.Series(index=securities, dtype=float)
+    resid_var = pd.Series(index=securities, dtype=float)
+
+    # Diagnostic columns: filled per security when return_stats=True.
+    stats_rows = [] if return_stats else None
+
+    for sec in securities:
+        y = pd.to_numeric(joined[sec], errors="coerce")
+        reg_df = pd.concat([y.rename("y"), X_all], axis=1).dropna(how="any")
+        if len(reg_df) < min_obs:
+            continue
+
+        X_reg = sm.add_constant(reg_df[all_factor_cols])
+        try:
+            model = sm.OLS(reg_df["y"], X_reg, missing="drop").fit()
+        except Exception:
+            continue
+
+        alpha_daily.loc[sec] = model.params.get("const", np.nan)
+        resid_var.loc[sec] = float(np.nanvar(model.resid, ddof=1))
+
+        for f in factors:
+            # Dimson beta = contemporaneous coefficient + sum of lagged coefficients.
+            beta_f = float(model.params.get(f, np.nan))
+            for col in lag_cols[f]:
+                beta_f += float(model.params.get(col, 0.0))
+            B.loc[sec, f] = beta_f
+
+        if return_stats:
+            # tvalues is indexed by parameter name. Contemporaneous t-stat per factor
+            # is the right "is this factor significant?" sniff test even though the
+            # reported beta is the Dimson sum (contemporaneous + lags).
+            row = {
+                "Security": sec,
+                "N obs": int(model.nobs),
+                "R^2": float(model.rsquared),
+                "R^2 adj": float(model.rsquared_adj),
+                "alpha_daily": float(model.params.get("const", np.nan)),
+                "alpha_t": float(model.tvalues.get("const", np.nan)),
+                "resid_std_daily": float(np.sqrt(resid_var.loc[sec])) if pd.notna(resid_var.loc[sec]) else np.nan,
+            }
+            for f in factors:
+                row[f"{f}_t"] = float(model.tvalues.get(f, np.nan))
+            stats_rows.append(row)
+
+    if return_stats:
+        stats_df = pd.DataFrame(stats_rows).set_index("Security") if stats_rows else pd.DataFrame()
+        return B, alpha_daily, resid_var, stats_df
+    return B, alpha_daily, resid_var
+
+
+def compute_ff5_betas_multi_region(
+    df_returns_wide: pd.DataFrame,
+    regional_factors: dict,
+    region_map,
+    min_obs: int = 120,
+    n_lags: int = 1,
+    reference_region: str = "US",
+    standardise_factors: bool = True,
+    return_stats: bool = False,
+):
+    """Compute FF5+MOM betas where each security is regressed against its home-region factor set.
+
+    Each security's beta vector lives in the canonical 6-factor space (Mkt-RF, SMB, HML, RMW,
+    CMA, MOM) but the underlying factors are the security's regional series — i.e. an ASX ETF's
+    "Mkt-RF" beta is its loading against the Asia-Pacific ex Japan market factor, not the US one.
+
+    When `standardise_factors` is True (default), each non-reference region's factor returns are
+    rescaled so their per-factor volatility matches the reference region (US by default). This
+    means a security's "Mkt-RF" beta is expressed in "units of US-Mkt-RF volatility" regardless of
+    home region, making cross-region aggregation Σ w_i × β_i^f mathematically clean. The reference
+    region's betas are unchanged — preserves backward continuity with the US-only model.
+
+    Args:
+        df_returns_wide: wide DataFrame of asset daily returns (one column per security).
+        regional_factors: {region_key: factor_df_with_RF}. Region keys must match `region_map` output.
+        region_map: callable taking a security column name and returning a region key.
+        reference_region: which region's factor vols define the common scale (default "US").
+        standardise_factors: when True, rescale non-reference regional factors to match the
+            reference region's per-factor volatility. See task #6 design notes.
+
+    Returns: (B, alpha_daily, resid_var) in the same shape as compute_ff5_betas.
+    """
+    securities = list(df_returns_wide.columns)
+    by_region: dict[str, list[str]] = {}
+    for sec in securities:
+        by_region.setdefault(region_map(sec), []).append(sec)
+
+    # Compute the per-factor scaling map ahead of the regression loop so we can log it.
+    factor_cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM"]
+    scaling: dict[str, dict[str, float]] = {}
+    if standardise_factors and reference_region in regional_factors:
+        ref_df = regional_factors[reference_region]
+        ref_vol = {f: float(ref_df[f].std()) for f in factor_cols if f in ref_df.columns}
+        for region, df_r in regional_factors.items():
+            if region == reference_region or df_r is None or df_r.empty:
+                continue
+            scaling[region] = {}
+            for f in factor_cols:
+                if f in df_r.columns and f in ref_vol:
+                    own = float(df_r[f].std())
+                    scaling[region][f] = (ref_vol[f] / own) if own > 0 else 1.0
+                else:
+                    scaling[region][f] = 1.0
+        if scaling:
+            print(
+                "[ff5] factor standardisation (vs " + reference_region + " vol): "
+                + "; ".join(
+                    f"{r}: " + ", ".join(f"{f}={s:.2f}x" for f, s in factors.items())
+                    for r, factors in scaling.items()
+                )
+            )
+
+    B_parts, alpha_parts, resid_parts, stats_parts = [], [], [], []
+    for region, secs in by_region.items():
+        ff = regional_factors.get(region)
+        if ff is None or ff.empty or not secs:
+            continue
+        if region in scaling:
+            ff = ff.copy()
+            for f, mult in scaling[region].items():
+                if f in ff.columns:
+                    ff[f] = ff[f] * mult
+        sub = df_returns_wide[secs]
+        result = compute_ff5_betas(
+            sub, ff, min_obs=min_obs, n_lags=n_lags, return_stats=return_stats,
+        )
+        if return_stats:
+            B_r, alpha_r, resid_r, stats_r = result
+        else:
+            B_r, alpha_r, resid_r = result
+            stats_r = None
+        if B_r is not None and not B_r.empty:
+            B_parts.append(B_r)
+        if alpha_r is not None:
+            alpha_parts.append(alpha_r)
+        if resid_r is not None:
+            resid_parts.append(resid_r)
+        if return_stats and stats_r is not None and not stats_r.empty:
+            # Tag each row with the region it was regressed against — and whether
+            # this region's factors were rescaled to the reference vol.
+            stats_r = stats_r.copy()
+            stats_r.insert(0, "Region", region)
+            stats_r.insert(1, "Standardised", region in scaling)
+            stats_parts.append(stats_r)
+
+    B = pd.concat(B_parts).reindex(securities) if B_parts else None
+    alpha = pd.concat(alpha_parts).reindex(securities) if alpha_parts else None
+    resid = pd.concat(resid_parts).reindex(securities) if resid_parts else None
+    if return_stats:
+        stats_df = pd.concat(stats_parts).reindex(securities) if stats_parts else pd.DataFrame()
+        return B, alpha, resid, stats_df
+    return B, alpha, resid

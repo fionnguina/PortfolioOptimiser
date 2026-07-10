@@ -29,6 +29,7 @@ from factors import (
     FACTOR_TILT_LOOKBACK_DAYS,
     FACTOR_TILT_MAX_MAGNITUDE,
     FACTOR_TILT_SHARPE_TO_MAG,
+    compute_ff5_betas,
 )
 from oos_engine import run_oos_ensemble_walk_forward
 
@@ -37,7 +38,6 @@ _apply_data_lockbox = None
 _evaluate_sweep_result = None
 _normalize_yfinance_close = None
 _print_sweep_verdict = None
-compute_ff5_betas = None
 compute_oos_metrics = None
 ANNUAL_TRADING_DAYS = None
 APP_DIR = None
