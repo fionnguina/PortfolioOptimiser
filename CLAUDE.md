@@ -26,7 +26,9 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
   `nav.py` (broker-truth actual-NAV series — engine syncs APP_DIR),
   `excel_sheets.py` (xlwings sheet writers + pptx formatting — engine syncs
   TARGET_PORTFOLIO_VALUE_AUD; imports fx), `fx.py` (USD/AUD conversion — engine syncs
-  the runtime fx_usdaud series).
+  the runtime fx_usdaud series), `ppt_utils.py` (pure PPT/date primitives),
+  `ppt_export.py` (the 2,243-line deck builder — FUSED to engine state; engine syncs
+  ~55 globals via `_sync_ppt_export()` before each call, back-compat shim delegates).
 - `Stock Analysis.xlsm` — **Holdings sheet Security column IS the ticker universe.**
   Engine writes Holdings back each run (Units stay sticky; engine never writes Units).
 - `tlh_pairs.json` — TLH substitutes. Keys must match engine symbols EXACTLY
