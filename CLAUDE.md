@@ -30,7 +30,9 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
   `ppt_export.py` (the 2,243-line deck builder — FUSED to engine state; engine syncs
   ~55 globals via `_sync_ppt_export()` before each call, back-compat shim delegates),
   `oos_engine.py` (the walk-forward backtest core: run_oos + 7 analytics helpers —
-  engine syncs ~25 config values via `_sync_oos_engine()` after config is defined).
+  engine syncs ~25 config values via `_sync_oos_engine()` after config is defined),
+  `research_modes.py` (the 12 `_run_*` diagnostic CLI drivers — engine injects 6 shared
+  helper fns + 9 config values via `_sync_research_modes()` before dispatch; diagnostic only).
 - `Stock Analysis.xlsm` — **Holdings sheet Security column IS the ticker universe.**
   Engine writes Holdings back each run (Units stay sticky; engine never writes Units).
 - `tlh_pairs.json` — TLH substitutes. Keys must match engine symbols EXACTLY
