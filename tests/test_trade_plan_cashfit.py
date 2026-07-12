@@ -27,6 +27,35 @@ def make_trade_plan():
     return ns["make_trade_plan"]
 
 
+@pytest.fixture(scope="module")
+def compute_target_units():
+    ns = extract_funcs("compute_target_units_for_holdings",
+                       extra_consts=("CASH_RESERVE_PCT", "CASH_RESERVE_MIN_AUD"))
+    ns["ASX_MIN_MARKETABLE_PARCEL_AUD"] = brokerage.ASX_MIN_MARKETABLE_PARCEL_AUD
+    return ns["compute_target_units_for_holdings"]
+
+
+def _implied_net_buys(tgt_units, cur, px):
+    return float(sum((int(tgt_units[t]) - cur[t]) * px[t] for t in px))
+
+
+def test_compute_target_units_cash_fit_fits(compute_target_units):
+    """The preview target-units path also fits net buys to cash."""
+    units, lp, fx, w, inc, holdings = _scenario()
+    cur = dict(zip(units.index, units.values))
+    px = dict(zip(lp.index, lp.values))
+    cash = 67_929.21
+    tu = compute_target_units(units, lp, fx, w, inc, available_cash_aud=cash)
+    assert _implied_net_buys(tu, cur, px) <= cash
+
+def test_compute_target_units_none_falls_back(compute_target_units):
+    units, lp, fx, w, inc, _ = _scenario()
+    cur = dict(zip(units.index, units.values)); px = dict(zip(lp.index, lp.values))
+    tu = compute_target_units(units, lp, fx, w, inc,
+                              portfolio_value_override=250_559.0)
+    assert _implied_net_buys(tu, cur, px) > 67_929.21  # NAV sizing overshoots
+
+
 def _scenario():
     """Holdings ~$180.5k, fully-invested target, $67,929 cash (the real slide)."""
     px = {"BEAR.AX": 7.39, "GOLD.AX": 54.16, "HBRD.AX": 10.07, "PDBC": 23.61,

@@ -4138,7 +4138,11 @@ def compute_target_units_for_holdings(
     w_target,
     include_flags,
     portfolio_value_override=None,
+    available_cash_aud=None,
 ):
+    # Cash-fit sizing (mirrors make_trade_plan): when available_cash_aud is
+    # given, size the target book to (holdings + cash - reserve) so the implied
+    # net buys never exceed cash on hand. Falls back to NAV sizing otherwise.
     tickers = list(pd.Index(w_target.index))
 
     inc = pd.Series(include_flags).reindex(tickers).fillna(True).astype(bool)
@@ -4150,8 +4154,12 @@ def compute_target_units_for_holdings(
     )
     cur_units = pd.Series(units_cur).reindex(tickers).fillna(0.0).astype(float)
 
-    cur_val = float((cur_units * lp_aud).sum())
-    if portfolio_value_override is not None and np.isfinite(portfolio_value_override) and portfolio_value_override > 0:
+    cur_val = float((cur_units * lp_aud).sum())  # actual current holdings value (AUD)
+    if available_cash_aud is not None and np.isfinite(available_cash_aud):
+        _reserve = max(CASH_RESERVE_MIN_AUD,
+                       CASH_RESERVE_PCT * (cur_val + float(available_cash_aud)))
+        cur_val = cur_val + max(0.0, float(available_cash_aud) - _reserve)
+    elif portfolio_value_override is not None and np.isfinite(portfolio_value_override) and portfolio_value_override > 0:
         cur_val = float(portfolio_value_override)
 
     if cur_val <= 0:
@@ -7860,7 +7868,10 @@ if USE_XLWINGS:
             if not UPDATED_LOTS.empty:
                 sht_lots.range("A2").options(index=False, header=False).value = UPDATED_LOTS
             
-            tgt_units_full = compute_target_units_for_holdings(units, last_px_hold, fx_map_all, w_star, include_flags, portfolio_value_override=portfolio_value_override)
+            tgt_units_full = compute_target_units_for_holdings(
+                units, last_px_hold, fx_map_all, w_star, include_flags,
+                portfolio_value_override=portfolio_value_override,
+                available_cash_aud=globals().get("_avail_cash_aud"))
 
             # Holdings reconciliation fix (2026-06-27): pass the engine's
             # CURRENT units, NOT the new target. Writing target back to
