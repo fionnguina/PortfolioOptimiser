@@ -699,6 +699,13 @@ IBKR_CLIENT_ID         = 10      # distinct from helper scripts (7/8/9)
 IBKR_CONNECT_TIMEOUT   = 8
 IBKR_SNAPSHOT_WAIT_SEC = 6
 # IBKR_DIVERGENCE_WARN_BPS canonical definition moved to ibkr.py (Phase 4 split).
+
+# Cash-fit sizing: size the live trade plan to (holdings + available cash -
+# reserve) so net buys never exceed the cash on hand (see make_trade_plan +
+# _get_available_cash_aud). Reserve = max($ floor, pct of investable), covering
+# brokerage + FX spread + unit rounding so orders don't reject on funds.
+CASH_RESERVE_PCT       = 0.005   # 0.5% of investable
+CASH_RESERVE_MIN_AUD   = 300.0   # never reserve less than this
 # Imported at top of file.
 
 
@@ -3607,9 +3614,16 @@ def make_trade_plan(
     include_flags,
     include_zero_lines: bool = False,
     portfolio_value_override=None,
+    available_cash_aud=None,
 ):
     """
     Return (trade_df, residual_cash) to move from current units to target weights (AUD).
+
+    Cash-fit sizing: when `available_cash_aud` is given, the target book is sized
+    to (current holdings + available_cash - reserve) so the net buys can never
+    exceed the cash on hand. The reserve (max of CASH_RESERVE_MIN_AUD and
+    CASH_RESERVE_PCT of investable) covers brokerage + FX spread + unit rounding.
+    Falls back to `portfolio_value_override` (NAV sizing) when cash is unknown.
     """
     tickers = pd.Index(w_target.index, name="Security")
 
@@ -3621,8 +3635,14 @@ def make_trade_plan(
     px_aud = (lp * fx).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     cur_units = pd.to_numeric(units_cur, errors="coerce").reindex(tickers).fillna(0).astype(int)
 
-    cur_val = float((cur_units * px_aud).sum())
-    if portfolio_value_override is not None and np.isfinite(portfolio_value_override) and portfolio_value_override > 0:
+    cur_val = float((cur_units * px_aud).sum())  # actual current holdings value (AUD)
+    if available_cash_aud is not None and np.isfinite(available_cash_aud):
+        # Cash-fit: target = holdings + (cash - reserve). Net buys (= target -
+        # holdings) then never exceed the cash on hand, so the plan is fundable.
+        _reserve = max(CASH_RESERVE_MIN_AUD,
+                       CASH_RESERVE_PCT * (cur_val + float(available_cash_aud)))
+        cur_val = cur_val + max(0.0, float(available_cash_aud) - _reserve)
+    elif portfolio_value_override is not None and np.isfinite(portfolio_value_override) and portfolio_value_override > 0:
         cur_val = float(portfolio_value_override)
 
     tgt_val = pd.to_numeric(w_target, errors="coerce").reindex(tickers).fillna(0.0) * cur_val
@@ -4037,6 +4057,75 @@ def fetch_ibkr_live_prices_native(tickers: list[str]) -> dict[str, float]:
     finally:
         if ib.isConnected():
             ib.disconnect()
+
+
+def _fetch_ibkr_cash_aud() -> "float | None":
+    """Live IBKR TotalCashValue in the account's base currency (AUD), paper
+    account only. Returns None on any failure (Gateway down, non-paper, etc.)
+    so the caller falls back to the last broker snapshot. Read-only."""
+    try:
+        from ib_insync import IB
+    except ImportError:
+        return None
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID + 3,
+                   timeout=IBKR_CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[cash-fit] IBKR cash query skipped ({type(e).__name__}); "
+              f"will try last broker snapshot")
+        return None
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed or not str(managed[0]).startswith("DU"):
+            print(f"[cash-fit] non-paper account {managed} — refusing cash query")
+            return None
+        ib.sleep(1.5)  # let the account-update subscription populate
+        cash = None
+        for v in ib.accountValues(managed[0]):
+            if v.tag == "TotalCashValue" and v.currency in ("AUD", "BASE"):
+                cash = float(v.value)
+                break
+        return cash
+    except Exception as e:
+        print(f"[cash-fit] IBKR cash query failed ({type(e).__name__}): {e}")
+        return None
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+def _get_available_cash_aud() -> "float | None":
+    """Best available cash figure for sizing the live plan to fit:
+      1. live IBKR TotalCashValue (freshest — Gateway up), else
+      2. cash_aud from the latest ibkr_nav_log.jsonl snapshot (offline), else
+      3. None (caller keeps NAV-based sizing = current behavior).
+    """
+    cash = _fetch_ibkr_cash_aud()
+    if cash is not None and np.isfinite(cash):
+        print(f"[cash-fit] live IBKR TotalCashValue = ${cash:,.2f} AUD")
+        return float(cash)
+    try:
+        p = APP_DIR / "ibkr_nav_log.jsonl"
+        if p.exists():
+            last = None
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    last = json.loads(line)
+                except Exception:
+                    continue
+            if last is not None and last.get("cash_aud") is not None:
+                c = float(last["cash_aud"])
+                if np.isfinite(c):
+                    print(f"[cash-fit] using last broker snapshot cash_aud = "
+                          f"${c:,.2f} AUD (ts {last.get('ts', '?')})")
+                    return c
+    except Exception as e:
+        print(f"[cash-fit] snapshot cash read failed: {e}")
+    return None
 
 
 # NOTE: apply_ibkr_price_override moved to ibkr.py (Phase 4 split).
@@ -6661,18 +6750,29 @@ if USE_XLWINGS:
                     print(f"[tlh-live] skipped: {_e_live_tlh}")
             globals()["LIVE_TLH_EVENTS"] = live_tlh_events
 
+            # Cash-fit: size all three plans to the cash actually on hand so
+            # the net buys are always fundable (live IBKR → last snapshot →
+            # None=NAV sizing). Fetched ONCE and shared across the variants.
+            _avail_cash_aud = _get_available_cash_aud()
+            if _avail_cash_aud is not None:
+                print(f"[cash-fit] sizing live plans to holdings + "
+                      f"${_avail_cash_aud:,.0f} cash − reserve "
+                      f"(was NAV ${(portfolio_value_override or 0):,.0f})")
+
             # Build ALL three trade plans up-front; downstream code can compare
             # what each one implies, and the "active" one is picked below.
             trade_no, resid_no = make_trade_plan(
                 units, last_px_hold, fx_map_all, w_star,
                 include_zero_lines=True, include_flags=include_flags,
-                portfolio_value_override=portfolio_value_override
+                portfolio_value_override=portfolio_value_override,
+                available_cash_aud=_avail_cash_aud
             )
 
             trade_with, resid_with = make_trade_plan(
                 units, last_px_hold, fx_map_all, w_star_with_tilts,
                 include_zero_lines=True, include_flags=include_flags,
-                portfolio_value_override=portfolio_value_override
+                portfolio_value_override=portfolio_value_override,
+                available_cash_aud=_avail_cash_aud
             )
 
             trade_ens, resid_ens = None, None
@@ -6698,7 +6798,8 @@ if USE_XLWINGS:
                     trade_ens, resid_ens = make_trade_plan(
                         units, last_px_hold, fx_map_all, _w_ens_full,
                         include_zero_lines=True, include_flags=include_flags,
-                        portfolio_value_override=portfolio_value_override
+                        portfolio_value_override=portfolio_value_override,
+                        available_cash_aud=_avail_cash_aud
                     )
                 except Exception as _e_ens:
                     print(f"[tradeplan] ensemble plan build failed: {_e_ens}")
