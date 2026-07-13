@@ -2506,9 +2506,19 @@ def _build_ticker_universe(sheet_tickers: list[str], starters: list[str]) -> lis
     return universe
 
 
+# Sweep support: PORTOPT_EXTRA_TICKERS appends universe candidates (e.g. low-vol
+# diversifier sleeves) WITHOUT editing the Holdings workbook (memory: reference-
+# lowvol-diversifier-experiment). Comma-separated; deduped downstream; changes
+# the price cols so the OOS cache invalidates, plus an explicit fingerprint line.
+EXTRA_TICKERS: list[str] = [
+    t.strip() for t in os.environ.get("PORTOPT_EXTRA_TICKERS", "").split(",") if t.strip()
+]
+if EXTRA_TICKERS:
+    print(f"[config-override] PORTOPT_EXTRA_TICKERS += {EXTRA_TICKERS}")
+
 # Build universe
 tickers_from_sheet = _extract_tickers_from_holdings(_XL_PATH, sheet="Holdings")
-tickers = _build_ticker_universe(tickers_from_sheet, STATIC_STARTERS)
+tickers = _build_ticker_universe(tickers_from_sheet, STATIC_STARTERS + EXTRA_TICKERS)
 print(f"XL_PATH = {_XL_PATH}")
 print(f"Tickers loaded from sheet: {tickers_from_sheet}")
 
@@ -5116,6 +5126,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"trend_sleeve:{float(globals().get('TREND_SLEEVE_WEIGHT', 0.0) or 0.0)}".encode())
         h.update(f"cov_shrink:{int(bool(globals().get('COV_SHRINKAGE', False)))}".encode())
         h.update(f"cov_method:{_effective_cov_method()}".encode())
+        h.update(f"extra_tickers:{','.join(sorted(globals().get('EXTRA_TICKERS', [])))}".encode())
         h.update(f"vol_target:{float(globals().get('VOL_TARGET_ANNUAL', 0.0) or 0.0)}".encode())
         h.update(f"crisis_hedge:{float(globals().get('CRISIS_HEDGE_WEIGHT', 0.0) or 0.0)}".encode())
         h.update(f"crisis_ma:{int(globals().get('CRISIS_HEDGE_MA_DAYS', 200))}".encode())
