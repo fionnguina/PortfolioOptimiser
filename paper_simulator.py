@@ -556,12 +556,32 @@ def load_seed(seed_path: Path = SEED_PATH,
                 )
         except Exception as e:
             print(f"[sim] seed load failed: {e}")
-    if state_path.exists():
+    # Cash = the account's REAL broker cash, from the latest ibkr_nav_log.jsonl
+    # snapshot. The old `portfolio_value - net_invested` formula gave ~$0 because
+    # net_invested ≈ NAV in portfolio_state.json, so the simulator NAV was just
+    # the seed positions (~$192k vs the real ~$250k). That understatement
+    # inflated turnover% / single-trade% and produced spurious sanity rejections.
+    _cash_set = False
+    _navlog = APP_DIR / "ibkr_nav_log.jsonl"
+    if _navlog.exists():
         try:
+            _last = None
+            for _l in _navlog.read_text(encoding="utf-8").splitlines():
+                _l = _l.strip()
+                if _l:
+                    try:
+                        _last = json.loads(_l)
+                    except Exception:
+                        continue
+            if _last is not None and _last.get("cash_aud") is not None:
+                state.cash_aud = float(_last["cash_aud"])
+                _cash_set = True
+        except Exception as e:
+            print(f"[sim] broker cash read failed: {e}")
+    if not _cash_set and state_path.exists():
+        try:  # fallback: portfolio_state (approximate; see note above)
             ps = json.loads(state_path.read_text(encoding="utf-8"))
-            total_nav = float(ps.get("portfolio_value", 0) or 0)
-            invested = float(ps.get("net_invested", 0) or 0)
-            state.cash_aud = total_nav - invested
+            state.cash_aud = float(ps.get("portfolio_value", 0) or 0) - float(ps.get("net_invested", 0) or 0)
         except Exception as e:
             print(f"[sim] state load failed: {e}")
     return state

@@ -73,32 +73,55 @@ def _ensure_actual_fills_sheet(wb) -> None:
 
 
 def _read_actual_fills(wb) -> pd.DataFrame:
-    """Read Actual_Fills sheet. Returns empty DataFrame if missing/empty."""
+    """Read the Actual_Fills ledger into the schema drift's fill-adherence join
+    expects (Fill Date / Ticker / Units).
+
+    The sheet has a summary BANNER (rows 1-5: title, source, batch counts, note)
+    above the ledger table (header at ~row 7 with columns Exec TS / Ticker /
+    Side / Qty Filled / ...). The old reader assumed row 1 was the header and
+    A1.expand() grabbed the irregular banner -> "(4,1) vs (4,53)" shape error, so
+    fill-adherence never got any fills. Now we scan for the ledger header (the
+    row containing "Ticker") and map the ledger columns:
+      Fill Date <- Exec TS ; Units <- Qty Filled signed by Side.
+    Px AUD + Fees AUD aren't in the ledger, so the join leaves slippage/fee-delta
+    uncomputed (a known gap — the writer would need to emit AUD px + fees).
+    Returns empty on any problem; fill-adherence is non-fatal."""
     try:
         if "Actual_Fills" not in [s.name for s in wb.sheets]:
             return pd.DataFrame()
-        sht = wb.sheets["Actual_Fills"]
-        raw = sht.range("A1").expand().value
-        if not raw or len(raw) < 2:
+        raw = wb.sheets["Actual_Fills"].used_range.value
+        if not isinstance(raw, list) or not raw:
             return pd.DataFrame()
-        hdr = [str(h).strip() for h in raw[0]]
-        rows = [r for r in raw[1:] if r and any(c is not None for c in r)]
-        if not rows:
+        raw = [r if isinstance(r, (list, tuple)) else [r] for r in raw]
+        hdr_i = next((i for i, r in enumerate(raw)
+                      if any(str(c).strip() == "Ticker" for c in r if c is not None)),
+                     None)
+        if hdr_i is None:
             return pd.DataFrame()
-        df = pd.DataFrame(rows, columns=hdr)
-        # Drop the placeholder hint row (first row of body that has no Ticker).
-        df = df[df.get("Ticker").notna()] if "Ticker" in df.columns else df
-        if df.empty:
-            return df
-        df["Fill Date"] = pd.to_datetime(df["Fill Date"], errors="coerce")
-        for col in ("Units", "Px AUD", "Fees AUD"):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["Fill Date", "Ticker", "Units"])
-        df["Ticker"] = df["Ticker"].astype(str).str.strip()
-        return df.reset_index(drop=True)
+        hdr = [str(h).strip() for h in raw[hdr_i]]
+        ncol = len(hdr)
+        body = []
+        for r in raw[hdr_i + 1:]:
+            r = list(r)[:ncol] + [None] * (ncol - len(r))
+            if any(c is not None for c in r):
+                body.append(r)
+        if not body:
+            return pd.DataFrame()
+        led = pd.DataFrame(body, columns=hdr)
+        if not {"Exec TS", "Ticker", "Qty Filled"}.issubset(led.columns):
+            return pd.DataFrame()
+        out = pd.DataFrame()
+        out["Fill Date"] = pd.to_datetime(led["Exec TS"], errors="coerce")
+        out["Ticker"] = led["Ticker"].astype(str).str.strip()
+        qty = pd.to_numeric(led["Qty Filled"], errors="coerce")
+        side = led.get("Side", "").astype(str).str.upper() if "Side" in led.columns \
+            else pd.Series("", index=led.index)
+        out["Units"] = qty * side.map(lambda s: -1.0 if str(s).startswith("SELL") else 1.0)
+        out = out.dropna(subset=["Fill Date", "Ticker", "Units"])
+        out = out[out["Units"] != 0]
+        return out.reset_index(drop=True)
     except Exception as e:
-        print(f"[drift] could not read Actual_Fills sheet: {e}")
+        print(f"[drift] Actual_Fills read skipped ({type(e).__name__})")
         return pd.DataFrame()
 
 
