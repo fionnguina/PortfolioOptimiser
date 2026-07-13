@@ -47,6 +47,8 @@ CRASH_HEDGE_DD_RELEASE = None
 CRASH_HEDGE_DD_TRIGGER = None
 CRASH_HEDGE_LOOKBACK_DAYS = None
 ENSEMBLE_SLOT_NAMES = ()
+ENSEMBLE_LAMBDA_TEMP = 3.0
+ENSEMBLE_HALFLIFE_DAYS = 60
 REBALANCE_FREQ = None
 prices = None
 
@@ -1370,9 +1372,13 @@ def _run_walk_forward_cv() -> int:
         rebalance=REBALANCE_FREQ,
         benchmark_ticker="SPY",
         score_lookback_days=252,
-        lambda_temp=3.0,
+        lambda_temp=ENSEMBLE_LAMBDA_TEMP,
+        sortino_halflife_days=ENSEMBLE_HALFLIFE_DAYS,
         starting_nav_aud=1_000_000.0,
     )
+    if ENSEMBLE_LAMBDA_TEMP != 3.0 or ENSEMBLE_HALFLIFE_DAYS != 60:
+        print(f"[wf-cv] ensemble-mixing override: λ={ENSEMBLE_LAMBDA_TEMP} "
+              f"halflife={ENSEMBLE_HALFLIFE_DAYS}d")
     strat_rets = out["blended_returns"]
     if strat_rets.empty:
         print("[wf-cv] engine returned empty series; aborting.")

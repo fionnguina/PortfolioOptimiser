@@ -321,6 +321,7 @@ _RESEARCH_INJECT = (
     "_print_sweep_verdict", "compute_oos_metrics",
     "ANNUAL_TRADING_DAYS", "APP_DIR", "CRASH_HEDGE_BASKET", "CRASH_HEDGE_DD_RELEASE",
     "CRASH_HEDGE_DD_TRIGGER", "CRASH_HEDGE_LOOKBACK_DAYS", "ENSEMBLE_SLOT_NAMES",
+    "ENSEMBLE_LAMBDA_TEMP", "ENSEMBLE_HALFLIFE_DAYS",
     "REBALANCE_FREQ", "prices",
 )
 
@@ -1036,6 +1037,29 @@ def _effective_cov_method() -> str:
     if not bool(globals().get("COV_SHRINKAGE", False)):
         return "sample"
     return str(globals().get("COV_METHOD", "lw_cc")).lower()
+
+# Ensemble regime-mixing params (memory: reference-regime-mixing-experiment, OPEN
+# 2026-07-13). The softmax that blends the 5 slots by EWMA IR-vs-SPY:
+#   ENSEMBLE_LAMBDA_TEMP — softmax temperature (concentration on the best slot).
+#   ENSEMBLE_HALFLIFE_DAYS — EWMA adaptation halflife for the IR score.
+# Production defaults (3.0 / 60) were hand-selected on 2016-2026 — env-sweepable
+# for the regime-mixing experiment; cache-fingerprint aware.
+ENSEMBLE_LAMBDA_TEMP = 3.0
+_ens_lambda_env = os.environ.get("PORTOPT_ENSEMBLE_LAMBDA")
+if _ens_lambda_env:
+    try:
+        ENSEMBLE_LAMBDA_TEMP = float(_ens_lambda_env)
+        print(f"[config-override] ENSEMBLE_LAMBDA_TEMP={ENSEMBLE_LAMBDA_TEMP} via env")
+    except ValueError:
+        print(f"[config-override] bad PORTOPT_ENSEMBLE_LAMBDA={_ens_lambda_env!r} — ignored")
+ENSEMBLE_HALFLIFE_DAYS = 60
+_ens_hl_env = os.environ.get("PORTOPT_ENSEMBLE_HALFLIFE")
+if _ens_hl_env:
+    try:
+        ENSEMBLE_HALFLIFE_DAYS = int(_ens_hl_env)
+        print(f"[config-override] ENSEMBLE_HALFLIFE_DAYS={ENSEMBLE_HALFLIFE_DAYS} via env")
+    except ValueError:
+        print(f"[config-override] bad PORTOPT_ENSEMBLE_HALFLIFE={_ens_hl_env!r} — ignored")
 
 # Volatility targeting (memory: reference-vol-targeting-experiment). Cap
 # ex-ante portfolio vol at this annual target by scaling the blend toward cash
@@ -5127,6 +5151,8 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"cov_shrink:{int(bool(globals().get('COV_SHRINKAGE', False)))}".encode())
         h.update(f"cov_method:{_effective_cov_method()}".encode())
         h.update(f"extra_tickers:{','.join(sorted(globals().get('EXTRA_TICKERS', [])))}".encode())
+        h.update(f"ens_lambda:{float(globals().get('ENSEMBLE_LAMBDA_TEMP', 3.0))}".encode())
+        h.update(f"ens_halflife:{int(globals().get('ENSEMBLE_HALFLIFE_DAYS', 60))}".encode())
         h.update(f"vol_target:{float(globals().get('VOL_TARGET_ANNUAL', 0.0) or 0.0)}".encode())
         h.update(f"crisis_hedge:{float(globals().get('CRISIS_HEDGE_WEIGHT', 0.0) or 0.0)}".encode())
         h.update(f"crisis_ma:{int(globals().get('CRISIS_HEDGE_MA_DAYS', 200))}".encode())
