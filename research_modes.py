@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import time
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -48,6 +49,16 @@ CRASH_HEDGE_LOOKBACK_DAYS = None
 ENSEMBLE_SLOT_NAMES = ()
 REBALANCE_FREQ = None
 prices = None
+
+
+def _research_out(name: str) -> Path:
+    """Resolve a research-mode output file (summary JSON / diagnostic PNG) under
+    APP_DIR/logs/ instead of the repo root, creating the dir. logs/ is gitignored
+    (experiment summaries + charts belong there, not the working tree). Falls back
+    to a cwd-relative logs/ if APP_DIR wasn't injected (source-run edge case)."""
+    base = (APP_DIR / "logs") if APP_DIR is not None else Path("logs")
+    base.mkdir(parents=True, exist_ok=True)
+    return base / name
 
 
 def _run_gfc_stress_test() -> int:
@@ -185,7 +196,7 @@ def _run_gfc_stress_test() -> int:
         ax.legend(loc="lower right")
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
-        out_path = APP_DIR / "gfc_stress_drawdown.png"
+        out_path = _research_out("gfc_stress_drawdown.png")
         fig.savefig(out_path, dpi=120)
         plt.close(fig)
         print(f"\n[stress] Drawdown chart → {out_path}")
@@ -219,7 +230,7 @@ def _run_gfc_stress_test() -> int:
                 "skipped": int(out.get("n_skipped", 0)),
             },
         }
-        json_path = APP_DIR / "gfc_stress_summary.json"
+        json_path = _research_out("gfc_stress_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         print(f"[stress] Summary JSON → {json_path}")
@@ -374,7 +385,7 @@ def _run_gfc_stress_test() -> int:
                 "delta_dd_stretchhedge_vs_blend_pct": float(delta_dd_sh * 100),
                 "hedge_saves_pct": float(hedge_saves * 100),
             }
-            json_path = APP_DIR / "gfc_stress_summary.json"
+            json_path = _research_out("gfc_stress_summary.json")
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2)
             print(f"\n[stress] Updated summary JSON → {json_path}")
@@ -551,7 +562,7 @@ def _run_scale_analysis() -> int:
             "spy_ann_return_window": results[0]["spy_ann_return"],
             "scales": results,
         }
-        json_path = APP_DIR / "scale_analysis_summary.json"
+        json_path = _research_out("scale_analysis_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         print(f"\n[scale] summary JSON → {json_path}")
@@ -582,7 +593,7 @@ def _run_scale_analysis() -> int:
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         fig.tight_layout()
-        chart_path = APP_DIR / "scale_analysis_chart.png"
+        chart_path = _research_out("scale_analysis_chart.png")
         fig.savefig(chart_path, dpi=120)
         plt.close(fig)
         print(f"[scale] chart → {chart_path}")
@@ -810,7 +821,7 @@ def _run_dev_validation() -> int:
             "sharpe_gap": round(sharpe_gap, 3),
             "alpha_gap": round(alpha_gap, 6),
         }
-        json_path = APP_DIR / "dev_validation_summary.json"
+        json_path = _research_out("dev_validation_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         print(f"\n[devval] summary JSON → {json_path}")
@@ -836,7 +847,7 @@ def _run_dev_validation() -> int:
             ax.grid(True, alpha=0.3)
         fig.suptitle("Dev vs Validation OOS — same engine, disjoint windows", fontsize=12)
         fig.tight_layout()
-        chart_path = APP_DIR / "dev_validation_chart.png"
+        chart_path = _research_out("dev_validation_chart.png")
         fig.savefig(chart_path, dpi=120)
         plt.close(fig)
         print(f"[devval] chart → {chart_path}")
@@ -1064,7 +1075,7 @@ def _run_rebal_skip_sweep() -> int:
             "val_winner": val_winner,
             "val_baseline": val_baseline,
         }
-        json_path = APP_DIR / "rebal_skip_sweep_summary.json"
+        json_path = _research_out("rebal_skip_sweep_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n[skip-sweep] summary JSON → {json_path}")
@@ -1294,7 +1305,7 @@ def _run_turnover_penalty_sweep() -> int:
             "val_winner": val_winner,
             "val_baseline": val_baseline,
         }
-        json_path = APP_DIR / "turnover_sweep_summary.json"
+        json_path = _research_out("turnover_sweep_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n[turnover-sweep] summary JSON → {json_path}")
@@ -1554,7 +1565,7 @@ def _run_walk_forward_cv() -> int:
                 "alpha_vs_spy": round(full_ann - _spy_fp_ann, 6),
             },
         }
-        json_path = APP_DIR / "walk_forward_cv_summary.json"
+        json_path = _research_out("walk_forward_cv_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n[wf-cv] summary JSON → {json_path}")
@@ -1863,7 +1874,7 @@ def _run_attribution() -> int:
                                  for t, c in sorted_assets[-n_show:]],
             "per_regime": regime_rows,
         }
-        json_path = APP_DIR / "attribution_summary.json"
+        json_path = _research_out("attribution_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n[attr] summary JSON → {json_path}")
@@ -2125,7 +2136,7 @@ def _run_crash_hedge_test() -> int:
                 "max_drawdown": round(float(d_dd), 6),
             },
         }
-        json_path = APP_DIR / "crash_hedge_test_summary.json"
+        json_path = _research_out("crash_hedge_test_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n[hedge-test] summary JSON → {json_path}")
@@ -2358,7 +2369,7 @@ def _run_crash_hedge_release_sweep() -> int:
             "sweep": results,
             "winner_release": winner["release"],
         }
-        json_path = APP_DIR / "crash_hedge_release_sweep_summary.json"
+        json_path = _research_out("crash_hedge_release_sweep_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n[hedge-rel] summary JSON → {json_path}")
@@ -2584,7 +2595,7 @@ def _run_stretch_only_test() -> int:
                 "max_drawdown": round(float(d_dd), 6),
             },
         }
-        json_path = APP_DIR / "stretch_only_test_summary.json"
+        json_path = _research_out("stretch_only_test_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n[stretch] summary JSON → {json_path}")
@@ -2846,7 +2857,7 @@ def _run_stretch_hedge_sweep() -> int:
             ],
             "winner_release": (winner["release"] if treatments else None),
         }
-        json_path = APP_DIR / "stretch_hedge_sweep_summary.json"
+        json_path = _research_out("stretch_hedge_sweep_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n[stretch-hedge] summary JSON → {json_path}")
@@ -3109,7 +3120,7 @@ def _run_tilted_ensemble_test() -> int:
                 "full_period_max_drawdown_delta": float(d_full_dd),
             },
         }
-        json_path = APP_DIR / "tilted_ensemble_test_summary.json"
+        json_path = _research_out("tilted_ensemble_test_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"[tilted-ens] summary JSON → {json_path}")

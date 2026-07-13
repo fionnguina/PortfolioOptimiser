@@ -47,6 +47,20 @@ def test_drivers_take_no_required_args():
         assert not required, f"{name} grew a required arg: {required}"
 
 
+def test_research_out_redirects_under_logs(tmp_path, monkeypatch):
+    """Research-mode outputs go under APP_DIR/logs/ (gitignored), not repo root."""
+    monkeypatch.setattr(research_modes, "APP_DIR", tmp_path)
+    out = research_modes._research_out("scale_analysis_summary.json")
+    assert out == tmp_path / "logs" / "scale_analysis_summary.json"
+    assert out.parent.is_dir()          # dir created
+
+def test_research_out_falls_back_to_cwd_logs(monkeypatch):
+    monkeypatch.setattr(research_modes, "APP_DIR", None)
+    from pathlib import Path
+    out = research_modes._research_out("x.png")
+    assert out == Path("logs") / "x.png"
+
+
 def test_ppt_export_contract():
     assert callable(ppt_export.export_to_ppt)
     params = list(inspect.signature(ppt_export.export_to_ppt).parameters)
