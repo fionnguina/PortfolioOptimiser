@@ -682,7 +682,20 @@ ANNUAL_TRADING_DAYS = 252  # For Sharpe calculation
 LIVE_TRADING_START_DATE: str | None = "2026-06-22"  # paper trading commenced this date; drift tracker active from here. Update to real-money start once AFSL issues + first live fill.
 # DRIFT_* threshold canonical definitions moved to drift.py (Phase 4 split).
 # Imported at top of file.
-TARGET_PORTFOLIO_VALUE_AUD = 1_000_000.0  # anchor for "drift vs target" in cash ledger
+# "Drift vs target" in the cash ledger anchors to the account's ACTUAL NAV
+# (portfolio_state.json), not a $1M nominal — otherwise it always reads ~-$750k
+# for a ~$250k account, drowning any real signal. Falls back to $1M if the
+# state file is missing (e.g. a fresh checkout).
+TARGET_PORTFOLIO_VALUE_AUD = 1_000_000.0
+try:
+    _tgt_state = APP_DIR / "portfolio_state.json"
+    if _tgt_state.exists():
+        _tgt_pv = float(json.loads(_tgt_state.read_text(encoding="utf-8"))
+                        .get("portfolio_value", 0) or 0)
+        if np.isfinite(_tgt_pv) and _tgt_pv > 0:
+            TARGET_PORTFOLIO_VALUE_AUD = _tgt_pv
+except Exception:
+    pass
 # Sync into excel_sheets (its only engine coupling — the cash-ledger anchor).
 _excel_sheets.TARGET_PORTFOLIO_VALUE_AUD = TARGET_PORTFOLIO_VALUE_AUD
 
