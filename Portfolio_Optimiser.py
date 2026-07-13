@@ -309,6 +309,7 @@ from research_modes import (
     _run_rebal_skip_sweep,
     _run_turnover_penalty_sweep,
     _run_walk_forward_cv,
+    _run_meta_opt_mixing,
     _run_attribution,
     _run_crash_hedge_test,
     _run_crash_hedge_release_sweep,
@@ -411,6 +412,12 @@ if _TURNOVER_SWEEP_MODE:
 _WALK_FORWARD_CV_MODE = "--walk-forward-cv" in sys.argv
 if _WALK_FORWARD_CV_MODE:
     print("[wf-cv] --walk-forward-cv detected; will skip dialog + live pipeline")
+# `--meta-opt-mixing`: bounded nested walk-forward hyperparameter optimisation
+# over the ensemble mixing family {λ, halflife}. Selects on the opt-region
+# (pre-2024) and confirms on an untouched holdout. Skips dialog + live pipeline.
+_META_OPT_MIXING_MODE = "--meta-opt-mixing" in sys.argv
+if _META_OPT_MIXING_MODE:
+    print("[meta-opt] --meta-opt-mixing detected; will skip dialog + live pipeline")
 # `--attribution`: decompose OOS returns by slot, asset, and regime to
 # answer "where does the engine earn its money / lose to SPY?" Purely
 # descriptive — no parameters to tune, no validation budget consumed.
@@ -491,6 +498,7 @@ _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _SHOW_METRICS_HISTORY_MODE
                        or _FACTOR_RECS_MODE
                        or _TILTED_ENSEMBLE_TEST_MODE
+                       or _META_OPT_MIXING_MODE
                        or _PREFLIGHT_MODE
                        or OOS_KERNEL_MODE)
 
@@ -2371,7 +2379,8 @@ _DATA_LOCKBOX_RESEARCH_MODE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                                or _CRASH_HEDGE_RELEASE_SWEEP_MODE
                                or _STRETCH_ONLY_TEST_MODE
                                or _STRETCH_HEDGE_SWEEP_MODE
-                               or _TILTED_ENSEMBLE_TEST_MODE)
+                               or _TILTED_ENSEMBLE_TEST_MODE
+                               or _META_OPT_MIXING_MODE)
 _lockbox_env = os.environ.get("DATA_LOCKBOX_DATE")
 if _lockbox_env is None:
     if _DATA_LOCKBOX_RESEARCH_MODE:
@@ -5436,6 +5445,17 @@ if "--turnover-penalty-sweep" in sys.argv:
 # folds with reasonable std, NOT max single-window Sharpe.
 if "--walk-forward-cv" in sys.argv:
     _exit_code = _run_walk_forward_cv()
+    sys.exit(_exit_code)
+
+
+# === Meta-optimisation of the mixing family (--meta-opt-mixing) =============
+# Bounded nested walk-forward hyperparameter optimisation over {λ, halflife}.
+# Selects the config by penalised opt-region (pre-2024) performance, then
+# confirms ONCE on an untouched holdout (2024→now). Complexity penalty shrinks
+# toward the incumbent (λ=3.0, hl=60). The rigorous form of parameter selection
+# the wf-cv docstring anticipated. See reference-regime-mixing-experiment.
+if "--meta-opt-mixing" in sys.argv:
+    _exit_code = _run_meta_opt_mixing()
     sys.exit(_exit_code)
 
 

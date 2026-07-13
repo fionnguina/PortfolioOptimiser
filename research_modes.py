@@ -1584,6 +1584,165 @@ def _run_walk_forward_cv() -> int:
     return 0
 
 
+def _run_meta_opt_mixing() -> int:
+    """Bounded nested walk-forward hyperparameter optimisation over the ensemble
+    mixing family {λ (softmax temperature), halflife}. Lookback fixed at the
+    incumbent (252) to bound dimensionality.
+
+    Rigour (memory: reference-regime-mixing-experiment):
+      - SELECT the config on the OPT region (OOS folds < HOLDOUT_START) using a
+        COMPLEXITY-PENALISED objective that shrinks toward the incumbent
+        (λ=3.0, hl=60) — a marginally-better exotic config is NOT chosen.
+      - A config is DISQUALIFIED if its opt-region MaxDD is worse than the
+        incumbent's by more than MAXDD_TOL (the fund's core axis is a constraint).
+      - CONFIRM the selected config ONCE on the untouched HOLDOUT (≥ HOLDOUT_START),
+        which the selection never saw. Ship only if it holds up there.
+    Every config is a FAITHFUL full walk-forward (net of CGT/brokerage/turnover) —
+    no offline re-blend, because λ changes concentration → turnover → costs."""
+    print("\n" + "=" * 88)
+    print("META-OPT: nested walk-forward over the ensemble mixing family {λ, halflife}")
+    print("=" * 88)
+
+    # --- pre-registered grid + selection config --------------------------------
+    LAMBDAS = [1.5, 2.0, 3.0]
+    HALFLIVES = [45, 60, 90]
+    LOOKBACK = 252
+    INCUMBENT = (3.0, 60)
+    HOLDOUT_START = pd.Timestamp("2024-01-01")
+    MIN_OOS_YEAR = 2016
+    GAMMA = 0.03          # complexity penalty per unit log-distance from incumbent
+    MAXDD_TOL = 0.005     # opt MaxDD may not be worse than incumbent by >0.5pp
+    NOISE_SHARPE = 0.02   # run-to-run Sharpe noise floor
+    TRAIN_MONTHS = 24
+
+    # --- data prep (once; mirrors --walk-forward-cv) ---------------------------
+    _tk = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[meta-opt] universe: {len(_tk)} tickers; opt<{HOLDOUT_START.date()} / holdout≥ that")
+    print(f"[meta-opt] grid: λ∈{LAMBDAS} × halflife∈{HALFLIVES} (lookback fixed {LOOKBACK}) "
+          f"= {len(LAMBDAS)*len(HALFLIVES)} faithful walk-forwards")
+    t0 = time.perf_counter()
+    raw = yf.download(_tk, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    print(f"[meta-opt] data ready ({px_aud.shape[0]}d × {px_aud.shape[1]}t) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    def _win_metrics(r):
+        r = pd.to_numeric(r, errors="coerce").dropna()
+        if len(r) < 60:
+            return None
+        nav = (1.0 + r).cumprod()
+        yrs = len(r) / ANNUAL_TRADING_DAYS
+        ann = float(nav.iloc[-1] ** (1.0 / yrs) - 1.0)
+        vol = float(r.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        return {"ann_return": ann, "vol": vol,
+                "sharpe": (ann / vol if vol > 0 else 0.0),
+                "max_drawdown": float((nav / nav.cummax() - 1.0).min()),
+                "n_days": int(len(r))}
+
+    def _penalty(lam, hl):
+        return abs(float(np.log(lam / 3.0))) + abs(float(np.log(hl / 60.0)))
+
+    # --- run every config faithfully -------------------------------------------
+    rows = []
+    for lam in LAMBDAS:
+        for hl in HALFLIVES:
+            t1 = time.perf_counter()
+            out = run_oos_ensemble_walk_forward(
+                px_aud, train_window_months=TRAIN_MONTHS, rebalance=REBALANCE_FREQ,
+                benchmark_ticker="SPY", score_lookback_days=LOOKBACK,
+                lambda_temp=lam, sortino_halflife_days=hl,
+                starting_nav_aud=1_000_000.0)
+            rets = out["blended_returns"]
+            rets = rets[rets.index.year >= MIN_OOS_YEAR] if not rets.empty else rets
+            opt = rets[rets.index < HOLDOUT_START]
+            hold = rets[rets.index >= HOLDOUT_START]
+            mo, mh = _win_metrics(opt), _win_metrics(hold)
+            rows.append({"lambda": lam, "halflife": hl,
+                         "is_incumbent": (lam, hl) == INCUMBENT,
+                         "opt": mo, "holdout": mh, "penalty": _penalty(lam, hl)})
+            print(f"[meta-opt] λ={lam} hl={hl}: "
+                  f"opt Sh {mo['sharpe']:.3f} DD {mo['max_drawdown']*100:.1f}% | "
+                  f"hold Sh {mh['sharpe']:.3f} DD {mh['max_drawdown']*100:.1f}% "
+                  f"({time.perf_counter()-t1:.0f}s)")
+
+    inc = next(r for r in rows if r["is_incumbent"])
+    inc_opt_dd = inc["opt"]["max_drawdown"]
+
+    # --- SELECTION: opt-region only, penalised, MaxDD-constrained ---------------
+    for r in rows:
+        r["J"] = r["opt"]["sharpe"] - GAMMA * r["penalty"]
+        r["disqualified"] = r["opt"]["max_drawdown"] < inc_opt_dd - MAXDD_TOL
+    print("\n" + "-" * 88)
+    print("OPT-REGION SELECTION (penalised; holdout NOT yet consulted)")
+    print("-" * 88)
+    print(f"  {'λ':>5} {'hl':>4} {'optSharpe':>10} {'optMaxDD':>9} {'penalty':>8} "
+          f"{'J':>8} {'flag':>6}")
+    for r in sorted(rows, key=lambda x: -x["J"]):
+        flag = "DQ" if r["disqualified"] else ("INC" if r["is_incumbent"] else "")
+        print(f"  {r['lambda']:>5} {r['halflife']:>4} {r['opt']['sharpe']:>10.4f} "
+              f"{r['opt']['max_drawdown']*100:>8.2f}% {r['penalty']:>8.3f} "
+              f"{r['J']:>8.4f} {flag:>6}")
+
+    qualified = [r for r in rows if not r["disqualified"]]
+    best = max(qualified, key=lambda x: x["J"])
+    print(f"\n[meta-opt] SELECTED (opt-region): λ={best['lambda']} halflife={best['halflife']}"
+          f"  (J={best['J']:.4f}; incumbent J={inc['J']:.4f})")
+
+    # --- CONFIRM on the untouched holdout (one look) ---------------------------
+    print("\n" + "-" * 88)
+    print("HOLDOUT CONFIRMATION (untouched ≥ 2024 — consulted ONCE, now)")
+    print("-" * 88)
+    print(f"  {'config':>16} {'holdSharpe':>11} {'holdMaxDD':>10} {'holdRet':>9}")
+    for r in (inc, best):
+        tag = f"λ={r['lambda']},hl={r['halflife']}" + (" [INC]" if r["is_incumbent"] else "")
+        print(f"  {tag:>16} {r['holdout']['sharpe']:>11.4f} "
+              f"{r['holdout']['max_drawdown']*100:>9.2f}% {r['holdout']['ann_return']*100:>+8.2f}%")
+
+    if best["is_incumbent"]:
+        verdict = "NO-CHANGE — selection chose the incumbent."
+    else:
+        d_sh = best["holdout"]["sharpe"] - inc["holdout"]["sharpe"]
+        d_dd = best["holdout"]["max_drawdown"] - inc["holdout"]["max_drawdown"]
+        holds = (d_sh > -NOISE_SHARPE) and (d_dd > -MAXDD_TOL)
+        verdict = (f"SHIP-CANDIDATE — holds on holdout (ΔSharpe {d_sh:+.3f}, "
+                   f"ΔMaxDD {d_dd*100:+.2f}pp)." if holds else
+                   f"NO-GO — fails holdout (ΔSharpe {d_sh:+.3f}, ΔMaxDD {d_dd*100:+.2f}pp); "
+                   f"opt-region edge did NOT generalise (overfit).")
+    print(f"\n[meta-opt] VERDICT: {verdict}")
+
+    try:
+        jp = _research_out("meta_opt_mixing_summary.json")
+        with open(jp, "w", encoding="utf-8") as f:
+            json.dump({"grid": {"lambda": LAMBDAS, "halflife": HALFLIVES, "lookback": LOOKBACK},
+                       "holdout_start": str(HOLDOUT_START.date()), "gamma": GAMMA,
+                       "incumbent": {"lambda": INCUMBENT[0], "halflife": INCUMBENT[1]},
+                       "selected": {"lambda": best["lambda"], "halflife": best["halflife"]},
+                       "verdict": verdict, "rows": rows}, f, indent=2, default=str)
+        print(f"[meta-opt] summary JSON → {jp}")
+    except Exception as e:
+        print(f"[meta-opt] summary JSON save failed: {e}")
+
+    print("\n" + "=" * 88)
+    print("META-OPT COMPLETE")
+    print("=" * 88)
+    return 0
+
+
 def _run_attribution() -> int:
     print("\n" + "=" * 88)
     print("PERFORMANCE ATTRIBUTION — where does the engine earn its money?")
