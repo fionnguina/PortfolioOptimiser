@@ -63,3 +63,6 @@ sanity_alerts.jsonl
 metrics_history.jsonl
 tlh_cooldown_state.json
 engine_done.flag
+
+# Manual backups (e.g. *.jsonl.bak made before hand-editing state files)
+*.bak

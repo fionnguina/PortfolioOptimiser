@@ -222,6 +222,26 @@ def _write_fills_log(rec_entry: dict, trades: list, log_path: Path) -> int:
                                   for fl in fills) / filled_qty
                 else:
                     avg_px = None  # null in JSON — NaN is invalid JSON
+                # IBKR commission per fill lives on fl.commissionReport (arrives
+                # asynchronously after the execution). Sum across fills; charged
+                # in the instrument's trading currency (AUD for .AX, USD for US),
+                # which is the same currency as avg_fill_price_local, so the
+                # engine fx-converts both with one ticker->AUD rate. null when no
+                # fills or the commission report hasn't arrived yet.
+                fees_local = None
+                if fills:
+                    try:
+                        _fee_sum = 0.0
+                        _have_fee = False
+                        for fl in fills:
+                            _cr = getattr(fl, "commissionReport", None)
+                            _c = getattr(_cr, "commission", None) if _cr is not None else None
+                            if _c is not None:
+                                _fee_sum += float(_c)
+                                _have_fee = True
+                        fees_local = _fee_sum if _have_fee else None
+                    except Exception:
+                        fees_local = None
                 try:
                     is_done = bool(trade.isDone())
                 except Exception:
@@ -249,6 +269,7 @@ def _write_fills_log(rec_entry: dict, trades: list, log_path: Path) -> int:
                     "qty_filled": int(filled_qty),
                     "qty_remaining": int(remaining_qty),
                     "avg_fill_price_local": avg_px,
+                    "fees_local": fees_local,
                     "rec_px_aud": float(rec.get("px_aud", 0.0) or 0.0),
                     "rec_delta_value_aud": float(rec.get("delta_value_aud", 0.0) or 0.0),
                     "status_final": str(trade.orderStatus.status),

@@ -146,6 +146,30 @@ def test_matches_most_recent_rec_for_ticker(tmp_path, drift):
     assert row["Slippage (bps)"] == pytest.approx(0.0, abs=0.5)
 
 
+def test_fill_missing_px_and_fees_leaves_metrics_blank(tmp_path, drift):
+    """Old ledger with no Px AUD / Fees AUD columns → slippage + fee-delta are
+    None (not a fake -100% slippage or a spurious -brokerage fee delta), but the
+    fill still matches its rec and reports Fee Expected."""
+    rec_log = tmp_path / "rec.jsonl"
+    _write_rec_log(rec_log, {
+        "run_at": "2026-08-01T10:00:00",
+        "recommended_trades": [
+            {"ticker": "SMH", "side": "buy", "delta_units": 10,
+             "px_aud": 100.0, "delta_value_aud": 1000.0, "brokerage_aud": 5.0},
+        ],
+    })
+    fills = pd.DataFrame({
+        "Fill Date": pd.to_datetime(["2026-08-02"]),
+        "Ticker": ["SMH"], "Units": [10],  # no Px AUD / Fees AUD columns
+    })
+    out = drift["compute_fill_drift"](fills, rec_log)
+    row = out.iloc[0]
+    assert bool(row["Recommended"]) is True
+    assert pd.isna(row["Slippage (bps)"])
+    assert pd.isna(row["Fee Delta (AUD)"])
+    assert row["Fee Expected (AUD)"] == pytest.approx(5.0)
+
+
 # === NAV history + DD =========================================================
 
 def test_nav_append_idempotent_within_day(tmp_path, drift):

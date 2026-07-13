@@ -82,9 +82,10 @@ def _read_actual_fills(wb) -> pd.DataFrame:
     A1.expand() grabbed the irregular banner -> "(4,1) vs (4,53)" shape error, so
     fill-adherence never got any fills. Now we scan for the ledger header (the
     row containing "Ticker") and map the ledger columns:
-      Fill Date <- Exec TS ; Units <- Qty Filled signed by Side.
-    Px AUD + Fees AUD aren't in the ledger, so the join leaves slippage/fee-delta
-    uncomputed (a known gap — the writer would need to emit AUD px + fees).
+      Fill Date <- Exec TS ; Units <- Qty Filled signed by Side ;
+      Px AUD <- Px AUD ; Fees AUD <- Fees AUD (both fx-converted by the writer).
+    Px AUD / Fees AUD are optional — older ledgers written before the writer
+    emitted them are left as NaN, so drift skips slippage/fee-delta for those.
     Returns empty on any problem; fill-adherence is non-fatal."""
     try:
         if "Actual_Fills" not in [s.name for s in wb.sheets]:
@@ -117,6 +118,12 @@ def _read_actual_fills(wb) -> pd.DataFrame:
         side = led.get("Side", "").astype(str).str.upper() if "Side" in led.columns \
             else pd.Series("", index=led.index)
         out["Units"] = qty * side.map(lambda s: -1.0 if str(s).startswith("SELL") else 1.0)
+        # Optional AUD-converted price/fees — only present in ledgers written by
+        # the post-2026-07 writer. Absent => NaN => drift skips slippage/fee-delta.
+        if "Px AUD" in led.columns:
+            out["Px AUD"] = pd.to_numeric(led["Px AUD"], errors="coerce")
+        if "Fees AUD" in led.columns:
+            out["Fees AUD"] = pd.to_numeric(led["Fees AUD"], errors="coerce")
         out = out.dropna(subset=["Fill Date", "Ticker", "Units"])
         out = out[out["Units"] != 0]
         return out.reset_index(drop=True)

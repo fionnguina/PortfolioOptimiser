@@ -71,3 +71,33 @@ def test_read_actual_fills_missing_sheet_returns_empty():
     class _EmptyWB:
         sheets = _Sheets([])
     assert excel_sheets._read_actual_fills(_EmptyWB()).empty
+
+
+def _sheet_with_aud(width=8):
+    def pad(row): return list(row) + [None] * (width - len(row))
+    return [
+        pad(["IBKR Actual Fills — Phase 3 log"]),
+        pad(["Source: ibkr_fills_log.jsonl"]),
+        pad(["Most recent batch: 2026-07-13"]),
+        pad(["  Submitted: 2 · Filled: 2"]),
+        pad(["Note: for broker truth use --check-fills"]),
+        pad([None]),
+        ["Exec TS", "Ticker", "Side", "Qty Filled", "Avg Fill Px",
+         "Px AUD", "Fees AUD", "Status"],
+        ["2026-07-13T11:00:00", "BBUS.AX", "BUY", 100, 23.36,
+         23.36, 6.0, "Filled"],
+        ["2026-07-13T11:01:00", "SMH", "SELL", 40, 250.0,
+         375.0, 4.5, "Filled"],
+    ]
+
+
+def test_read_actual_fills_maps_px_and_fees_aud():
+    """Post-2026-07 ledger carries Px AUD + Fees AUD through to drift's schema."""
+    df = excel_sheets._read_actual_fills(_WB(_sheet_with_aud()))
+    assert {"Px AUD", "Fees AUD"}.issubset(df.columns)
+    bbus = df[df["Ticker"] == "BBUS.AX"].iloc[0]
+    assert float(bbus["Px AUD"]) == pytest.approx(23.36)
+    assert float(bbus["Fees AUD"]) == pytest.approx(6.0)
+    smh = df[df["Ticker"] == "SMH"].iloc[0]
+    assert float(smh["Units"]) == -40.0            # SELL -> signed negative
+    assert float(smh["Px AUD"]) == pytest.approx(375.0)  # USD fx-converted by writer

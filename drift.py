@@ -66,12 +66,23 @@ def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
     if fills_df is None or fills_df.empty:
         return pd.DataFrame()
     recs = _load_recommendation_log(log_path)
+
+    def _num(v):
+        """float(v) or None — treats NaN and non-numeric as missing so an
+        absent Px/Fees column can't masquerade as a real 0 (which would show
+        as -100% slippage or a spurious negative fee delta)."""
+        try:
+            f = float(v)
+            return f if f == f else None
+        except (TypeError, ValueError):
+            return None
+
     rows: list[dict] = []
     for _, fr in fills_df.iterrows():
         matched = _match_fill_to_recommendation(fr, recs)
         actual_units = float(fr["Units"])
-        actual_px = float(fr.get("Px AUD") or 0)
-        actual_fees = float(fr.get("Fees AUD") or 0)
+        actual_px = _num(fr.get("Px AUD"))
+        actual_fees = _num(fr.get("Fees AUD"))
         side_actual = "buy" if actual_units > 0 else ("sell" if actual_units < 0 else "flat")
         if matched is None:
             rows.append({
@@ -90,7 +101,8 @@ def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
         rec_broke = float(matched.get("brokerage_aud") or 0)
         rec_at = pd.Timestamp(matched["recommendation_at"])
         # Slippage: + means worse than expected (paid more on buy, got less on sell).
-        if rec_px > 0:
+        # Requires a real actual fill price — skip when Px AUD is absent.
+        if rec_px > 0 and actual_px is not None:
             if side_actual == "buy":
                 slip_bps = (actual_px - rec_px) / rec_px * 10000.0
             elif side_actual == "sell":
@@ -99,7 +111,8 @@ def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
                 slip_bps = 0.0
         else:
             slip_bps = None
-        fee_delta = actual_fees - rec_broke
+        # Fee delta only when actual fees were captured (older ledgers have none).
+        fee_delta = (actual_fees - rec_broke) if actual_fees is not None else None
         ttf = (pd.Timestamp(fr["Fill Date"]) - rec_at).total_seconds() / 86400.0
         rows.append({
             "Fill Date": fr["Fill Date"], "Ticker": fr["Ticker"],
@@ -110,7 +123,7 @@ def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
             "Units Recommended": rec_units,
             "Slippage (bps)": round(slip_bps, 2) if slip_bps is not None else None,
             "Fee Expected (AUD)": round(rec_broke, 2),
-            "Fee Delta (AUD)": round(fee_delta, 2),
+            "Fee Delta (AUD)": round(fee_delta, 2) if fee_delta is not None else None,
             "Time-to-Fill (days)": round(ttf, 2),
             "Notes": fr.get("Notes", ""),
         })

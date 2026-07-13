@@ -7804,6 +7804,29 @@ if USE_XLWINGS:
                         "Note: fills_log captures script-side state at write time. "
                         "For broker truth use: ibkr_paper_exec.py --check-fills"
                     )
+                    # avg_fill_price_local + fees_local are in the instrument's
+                    # trading currency (AUD for .AX, USD for US). Convert both to
+                    # AUD with one ticker->AUD multiplier so drift can compute
+                    # slippage-vs-rec (rec_px is already AUD) and fee-delta.
+                    def _fx_aud(_tk):
+                        try:
+                            _v = float(fx_map_all.get(_tk))
+                            if _v > 0:
+                                return _v
+                        except Exception:
+                            pass
+                        _tk = str(_tk)
+                        return (1.0 if _tk.endswith(".AX") or _tk.startswith("^")
+                                else float(get_usd_aud_fx()))
+
+                    def _to_aud(_val, _tk):
+                        if _val is None:
+                            return None
+                        try:
+                            return round(float(_val) * _fx_aud(_tk), 4)
+                        except Exception:
+                            return None
+
                     _fills_df = pd.DataFrame([{
                         "Exec TS":       r.get("exec_timestamp", ""),
                         "Rec Run TS":    r.get("rec_log_run_at", ""),
@@ -7813,6 +7836,10 @@ if USE_XLWINGS:
                         "Qty Filled":    r.get("qty_filled", 0),
                         "Qty Remaining": r.get("qty_remaining", 0),
                         "Avg Fill Px":   r.get("avg_fill_price_local", None),
+                        "Px AUD":        _to_aud(r.get("avg_fill_price_local"),
+                                                 r.get("ticker", "")),
+                        "Fees AUD":      _to_aud(r.get("fees_local"),
+                                                 r.get("ticker", "")),
                         "Rec Px (AUD)":  r.get("rec_px_aud", None),
                         "Status":        (r.get("status_final")
                                             or r.get("status") or "?"),
