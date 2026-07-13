@@ -154,6 +154,7 @@ from solvers import (
     solve_frontier_point_cvxpy_with_tilts,
     solve_candidate_portfolios,
     _ledoit_wolf_cc,
+    estimate_covariance,
 )
 
 # Lot-book construction + expansion (module split #18, 2026-07-09). Pure
@@ -275,7 +276,7 @@ from oos_engine import (
     _is_us_ticker,
 )
 _OOS_ENGINE_INJECT = (
-    "COV_SHRINKAGE", "CRASH_HEDGE_BASKET", "CRASH_HEDGE_DD_RELEASE",
+    "COV_SHRINKAGE", "COV_METHOD", "CRASH_HEDGE_BASKET", "CRASH_HEDGE_DD_RELEASE",
     "CRASH_HEDGE_DD_TRIGGER", "CRASH_HEDGE_LOOKBACK_DAYS", "CRISIS_HEDGE_BAND_SD",
     "CRISIS_HEDGE_MA_DAYS", "CRISIS_HEDGE_TICKER", "CRISIS_HEDGE_WEIGHT",
     "EARLY_TRIGGER_DD_DEEPEN", "EARLY_TRIGGER_MIN_DAYS", "ENSEMBLE_SLOT_NAMES",
@@ -1016,6 +1017,25 @@ if _cov_shrink_env is not None:
     COV_SHRINKAGE = _cov_shrink_env.strip() not in ("", "0", "false", "False")
     if COV_SHRINKAGE:
         print("[config-override] COV_SHRINKAGE=1 (Ledoit-Wolf) via env")
+
+# Σ estimator selector (memory: reference-cov-estimator-experiment, OPEN 2026-07-13).
+# Which covariance estimator the MV solver uses when COV_SHRINKAGE is on:
+#   lw_cc  — Ledoit-Wolf (2004) constant-correlation linear shrinkage (SHIPPED default).
+#   qis    — Ledoit-Wolf (2020) nonlinear shrinkage (Quadratic-Inverse Shrinkage).
+#   sample — plain sample cov (equivalent to COV_SHRINKAGE=False).
+# COV_SHRINKAGE=False forces 'sample' regardless (back-compat). Env-sweepable.
+COV_METHOD = "lw_cc"
+_cov_method_env = os.environ.get("PORTOPT_COV_METHOD")
+if _cov_method_env:
+    COV_METHOD = _cov_method_env.strip().lower()
+    print(f"[config-override] COV_METHOD={COV_METHOD} via env")
+
+def _effective_cov_method() -> str:
+    """Resolve the Σ method actually used: 'sample' when shrinkage is off, else
+    the selected COV_METHOD. One source of truth for both call sites + fingerprint."""
+    if not bool(globals().get("COV_SHRINKAGE", False)):
+        return "sample"
+    return str(globals().get("COV_METHOD", "lw_cc")).lower()
 
 # Volatility targeting (memory: reference-vol-targeting-experiment). Cap
 # ex-ante portfolio vol at this annual target by scaling the blend toward cash
@@ -5095,6 +5115,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"stretch_pred:{int(bool(globals().get('STRETCH_FLOOR_PREDICTIVE', False)))}".encode())
         h.update(f"trend_sleeve:{float(globals().get('TREND_SLEEVE_WEIGHT', 0.0) or 0.0)}".encode())
         h.update(f"cov_shrink:{int(bool(globals().get('COV_SHRINKAGE', False)))}".encode())
+        h.update(f"cov_method:{_effective_cov_method()}".encode())
         h.update(f"vol_target:{float(globals().get('VOL_TARGET_ANNUAL', 0.0) or 0.0)}".encode())
         h.update(f"crisis_hedge:{float(globals().get('CRISIS_HEDGE_WEIGHT', 0.0) or 0.0)}".encode())
         h.update(f"crisis_ma:{int(globals().get('CRISIS_HEDGE_MA_DAYS', 200))}".encode())
@@ -5854,17 +5875,18 @@ try:
     # as the shipped backtest. Overlay Ledoit-Wolf on the good-coverage recent
     # window (matches the walk-forward), keep sample cov for ragged-edge
     # tickers. Fallback to sample cov on any failure (never break the plan).
-    if bool(globals().get("COV_SHRINKAGE", False)) and "df_cov_wide" in globals():
+    _cov_method_live = _effective_cov_method()
+    if _cov_method_live != "sample" and "df_cov_wide" in globals():
         try:
             _win = df_cov_wide.tail(504)
             _win = _win.loc[:, _win.notna().mean() >= 0.8].dropna(how="any")
             if _win.shape[0] >= 60 and _win.shape[1] >= 3:
-                _lw_live, _lwd = _ledoit_wolf_cc(_win)
+                _lw_live, _lwd = estimate_covariance(_win, method=_cov_method_live)
                 _Sigma_live.loc[_lw_live.index, _lw_live.columns] = _lw_live.values
-                print(f"[cov-shrink] live Σ shrunk (Ledoit-Wolf δ={_lwd:.3f}, "
-                      f"{_win.shape[1]} tickers)")
+                print(f"[cov-shrink] live Σ estimated ({_cov_method_live} "
+                      f"intensity={_lwd:.3f}, {_win.shape[1]} tickers)")
         except Exception as _e_lwlive:
-            print(f"[cov-shrink] live LW failed ({_e_lwlive}); using sample cov")
+            print(f"[cov-shrink] live {_cov_method_live} failed ({_e_lwlive}); using sample cov")
             _Sigma_live = Sigma_daily.copy()
     _spy_mu_live = float(_mu_live["SPY"]) if "SPY" in _mu_live.index else None
     _cand_live = solve_candidate_portfolios(_mu_live, _Sigma_live, _spy_mu_live)

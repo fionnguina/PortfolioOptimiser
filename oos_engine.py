@@ -15,12 +15,13 @@ import pandas as pd
 from brokerage import BROKER_CONFIG
 from cgt import CGT_CONFIG, LotBook, _effective_cgt_rate
 from tlh import TLH_ENABLED, _run_tlh_pass
-from solvers import _ledoit_wolf_cc, solve_candidate_portfolios
+from solvers import _ledoit_wolf_cc, solve_candidate_portfolios, estimate_covariance
 from factors import auto_recommend_factor_tilts
 from ensemble import softmax_ensemble_weights
 
 # Config injected by the engine's _sync_oos_engine() after config is defined.
 COV_SHRINKAGE = None
+COV_METHOD = None
 CRASH_HEDGE_BASKET = None
 CRASH_HEDGE_DD_RELEASE = None
 CRASH_HEDGE_DD_TRIGGER = None
@@ -499,6 +500,10 @@ def run_oos_ensemble_walk_forward(
     _caps_for_trend = globals().get("PER_ASSET_WEIGHT_CAPS", {}) or {}
     _n_trend_applied = 0
     _cov_shrinkage = bool(globals().get("COV_SHRINKAGE", False))
+    # Σ estimator for this run: 'sample' when shrinkage off, else the selected
+    # method (lw_cc default / qis). Mirrors the engine's _effective_cov_method().
+    _cov_method = ("sample" if not _cov_shrinkage
+                   else str(globals().get("COV_METHOD", "lw_cc") or "lw_cc").lower())
     _lw_delta_sum = 0.0
     _lw_delta_n = 0
     _vol_target = float(globals().get("VOL_TARGET_ANNUAL", 0.0) or 0.0)
@@ -604,8 +609,8 @@ def run_oos_ensemble_walk_forward(
         log_ret = np.log1p(train_rets)
         mu = pd.Series(np.expm1(log_ret.mean() * 252.0), index=train_rets.columns)
         mu = _apply_mu_shrinkage(mu)
-        if _cov_shrinkage:
-            Sigma, _lw_delta = _ledoit_wolf_cc(train_rets)
+        if _cov_method != "sample":
+            Sigma, _lw_delta = estimate_covariance(train_rets, method=_cov_method)
             _lw_delta_sum += _lw_delta
             _lw_delta_n += 1
         else:
@@ -1097,8 +1102,8 @@ def run_oos_ensemble_walk_forward(
     if _trend_sleeve_w > 0:
         print(f"[trend-sleeve] {_trend_sleeve_w*100:.0f}% core-satellite blend; "
               f"sleeve invested (non-cash) at {_n_trend_applied} rebal(s)")
-    if _cov_shrinkage and _lw_delta_n > 0:
-        print(f"[cov-shrink] Ledoit-Wolf mean shrinkage δ={_lw_delta_sum/_lw_delta_n:.3f} "
+    if _cov_method != "sample" and _lw_delta_n > 0:
+        print(f"[cov-shrink] {_cov_method} mean intensity={_lw_delta_sum/_lw_delta_n:.3f} "
               f"over {_lw_delta_n} rebal(s)")
     if _vol_target > 0:
         print(f"[vol-target] target {_vol_target*100:.0f}% ann; de-risked toward cash "

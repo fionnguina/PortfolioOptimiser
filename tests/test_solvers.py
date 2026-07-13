@@ -215,3 +215,45 @@ def test_ledoit_wolf_tiny_sample_degenerate():
     df = pd.DataFrame({"A": [0.01], "B": [0.02]})
     cov, delta = solvers._ledoit_wolf_cc(df)
     assert delta == 0.0
+
+
+# ============================================================================
+# _qis_shrinkage + estimate_covariance dispatcher (cov-estimator experiment)
+# ============================================================================
+
+def test_qis_symmetric_psd_and_trace_preserving():
+    df = _returns(n=300, k=8)
+    cov, intensity = solvers._qis_shrinkage(df)
+    M = cov.values
+    assert np.allclose(M, M.T, atol=1e-10)
+    assert (np.linalg.eigvalsh(M) > 0).all()          # strictly PD
+    # QIS preserves the trace of the sample covariance.
+    assert np.trace(M) == pytest.approx(np.trace(df.cov().values), rel=1e-6)
+    assert intensity >= 0.0
+
+
+def test_qis_better_conditioned_than_sample():
+    """The whole point: QIS yields a lower condition number than sample cov."""
+    df = _returns(n=90, k=20, seed=3)               # moderate concentration
+    cov, _ = solvers._qis_shrinkage(df)
+    assert np.linalg.cond(cov.values) < np.linalg.cond(df.cov().values)
+
+
+def test_qis_degenerate_falls_back():
+    df = pd.DataFrame({"A": [0.01, 0.02], "B": [0.0, 0.01]})   # T<12
+    cov, _ = solvers._qis_shrinkage(df)
+    assert cov.shape == (2, 2)                        # returned something usable
+
+
+def test_estimate_covariance_dispatch():
+    df = _returns(n=200, k=6)
+    sample, i0 = solvers.estimate_covariance(df, method="sample")
+    assert i0 == 0.0
+    assert np.allclose(sample.values, df.cov().values)
+    lw, _ = solvers.estimate_covariance(df, method="lw_cc")
+    assert np.allclose(lw.values, solvers._ledoit_wolf_cc(df)[0].values)
+    qis, _ = solvers.estimate_covariance(df, method="qis")
+    assert np.allclose(qis.values, solvers._qis_shrinkage(df)[0].values)
+    # Unknown method -> incumbent lw_cc (never breaks the solve).
+    unk, _ = solvers.estimate_covariance(df, method="banana")
+    assert np.allclose(unk.values, lw.values)

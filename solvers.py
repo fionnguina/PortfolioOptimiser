@@ -389,3 +389,81 @@ def _ledoit_wolf_cc(returns_df: "pd.DataFrame") -> tuple:
     Sigma = delta * F + (1.0 - delta) * S
     Sigma *= T / (T - 1)
     return pd.DataFrame(Sigma, index=cols, columns=cols), float(delta)
+
+
+def _qis_shrinkage(returns_df: "pd.DataFrame") -> tuple:
+    """Ledoit-Wolf (2020/2022) NONLINEAR covariance shrinkage via Quadratic-Inverse
+    Shrinkage (QIS). Ported from the authors' reference QIS.m (Olivier Ledoit &
+    Michael Wolf, BSD-2-Clause). Unlike lw_cc's single global shrinkage target,
+    QIS shrinks each sample eigenvalue individually toward a data-driven nonlinear
+    profile — provably optimal in high dimensions.
+
+    Returns (cov_df, intensity) where intensity = mean |Δλ|/λ (eigenvalue-adjustment
+    magnitude, a diagnostic). Parameter-free. Falls back to lw_cc on any degeneracy
+    (too few obs, c>=1 pathologies) so the solve never breaks.
+
+    Verified standalone 2026-07-13: symmetric, PSD, better-conditioned than sample,
+    and recovers the sample cov in the T>>N (c->0) limit."""
+    cols = returns_df.columns
+    X = returns_df.dropna(how="any").values.astype(float)
+    T, N = X.shape
+    # QIS needs T > N+1 (p<=n) for the primary branch; fall back otherwise.
+    if T < 12 or N < 2:
+        return _ledoit_wolf_cc(returns_df)
+    Y = X - X.mean(axis=0, keepdims=True)          # demean (k=1)
+    n = T - 1
+    p = N
+    c = p / n
+    S = (Y.T @ Y) / n
+    S = (S + S.T) / 2.0
+    try:
+        lam, u = np.linalg.eigh(S)                 # ascending eigenvalues
+    except np.linalg.LinAlgError:
+        return _ledoit_wolf_cc(returns_df)
+    lam = lam.real
+    kept = max(0, p - n)                           # first (p-n) are ~null when p>n
+    lam_pos = np.clip(lam[kept:], 1e-16, None)
+    invlam = 1.0 / lam_pos
+    L = len(invlam)
+    # Bandwidth (per reference QIS.m): h = min(c^2,1/c^2)^0.35 / p^0.35.
+    h = (min(c ** 2, 1.0 / c ** 2) ** 0.35) / (p ** 0.35)
+    # Lj[i,j] = invlam[j]; Lj_i[i,j] = invlam[j] - invlam[i].
+    Lj = np.tile(invlam, (L, 1))
+    Lj_i = Lj - Lj.T
+    denom = Lj_i ** 2 + (h ** 2) * (Lj ** 2)
+    theta = np.mean(Lj * Lj_i / denom, axis=1)     # Stein shrinker (real part)
+    Htheta = np.mean(Lj * (h * Lj) / denom, axis=1)  # conjugate (imag part)
+    Atheta2 = theta ** 2 + Htheta ** 2
+    if p <= n:
+        delta = 1.0 / ((1.0 - c) ** 2 * invlam
+                       + 2.0 * c * (1.0 - c) * invlam * theta
+                       + c ** 2 * invlam * Atheta2)
+    else:
+        delta0 = 1.0 / ((c - 1.0) * np.mean(invlam))
+        delta = np.concatenate([np.full(kept, delta0), 1.0 / (invlam * Atheta2)])
+    # Preserve the trace: rescale shrunk eigenvalues to sum to the sample's.
+    denom_sum = float(np.sum(delta))
+    if not np.isfinite(denom_sum) or denom_sum <= 0:
+        return _ledoit_wolf_cc(returns_df)
+    delta_qis = delta * (float(np.sum(lam)) / denom_sum)
+    Sigma = (u * delta_qis) @ u.T
+    Sigma = (Sigma + Sigma.T) / 2.0
+    intensity = float(np.mean(np.abs(delta_qis - lam) / np.clip(lam, 1e-16, None)))
+    return pd.DataFrame(Sigma, index=cols, columns=cols), intensity
+
+
+def estimate_covariance(returns_df: "pd.DataFrame", method: str = "lw_cc") -> tuple:
+    """Dispatch Σ estimation by method. Returns (cov_df, intensity) where
+    intensity is a scalar diagnostic (LW shrinkage δ, or a QIS proxy, else 0.0).
+
+    Methods (see [[reference-cov-estimator-experiment]]):
+      sample  — plain sample covariance (no shrinkage).
+      lw_cc   — Ledoit-Wolf (2004) constant-correlation linear shrinkage (INCUMBENT).
+      qis     — Ledoit-Wolf (2020) nonlinear shrinkage (Quadratic-Inverse Shrinkage).
+    Unknown methods fall back to the incumbent lw_cc (never break the solve)."""
+    m = str(method or "lw_cc").lower()
+    if m in ("sample", "none", "off"):
+        return returns_df.cov(), 0.0
+    if m == "qis":
+        return _qis_shrinkage(returns_df)
+    return _ledoit_wolf_cc(returns_df)
