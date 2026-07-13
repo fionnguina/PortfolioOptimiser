@@ -74,6 +74,23 @@ def test_build_lots_from_holdings_skips_zero_units():
     assert "SMH" in set(df["Security"])
 
 
+def test_expand_with_lots_matches_sells_to_parcels():
+    """Regression: lots.py must import _trade_delta_col/_security_from_row from
+    cgt (the extraction dropped them, breaking the CSV-export fallback)."""
+    trades = pd.DataFrame([{"Security": "IVV.AX", "Delta Units": -60,
+                            "Last Px (AUD)": 50.0}])
+    lotsdf = pd.DataFrame([{"Security": "IVV.AX", "AcqDate": "2024-01-01",
+                            "Units": 100, "CostBaseAUD": 40.0}])
+    out = lots.expand_with_lots(trades, lotsdf, pd.Timestamp("2026-07-13"), method="FIFO")
+    assert not out.empty
+    assert int(out.iloc[0]["UnitsSold"]) == 60  # sold 60 of the 100-unit lot
+
+def test_expand_with_lots_empty_trades():
+    out = lots.expand_with_lots(pd.DataFrame(), pd.DataFrame(),
+                                pd.Timestamp("2026-07-13"))
+    assert out.empty
+
+
 # ============================================================================
 # nav.py — broker NAV parsing + reconstruction/splice
 # ============================================================================

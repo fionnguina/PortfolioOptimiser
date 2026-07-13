@@ -18,6 +18,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# expand_with_lots matches sells to lots using cgt's trade-frame helpers.
+from cgt import _trade_delta_col, _security_from_row
+
 
 def _read_lots_from_path(xl_path, sheet="Lots") -> pd.DataFrame:
     """
