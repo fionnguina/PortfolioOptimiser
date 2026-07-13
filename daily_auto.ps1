@@ -50,6 +50,10 @@ param(
 $ErrorActionPreference = "Continue"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# The scheduled tasks have no WorkingDirectory set, so the CWD defaults to
+# C:\Windows\System32. Anchor to the repo so relative-path writes by child
+# scripts (e.g. ibkr_paper_exec.py --snapshot-nav) don't hit PermissionError.
+Set-Location -LiteralPath $ScriptDir
 $ExePath = Join-Path $ScriptDir "dist\Portfolio Optimiser.exe"
 $PptPath = Join-Path $ScriptDir "dist\Reports\Portfolio_Report.pptx"
 if (-not $LogPath) {

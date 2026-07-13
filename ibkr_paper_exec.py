@@ -69,6 +69,12 @@ FILL_WAIT_SECONDS = 60   # how long to wait for orders to settle before summaris
 FILLS_LOG_FILENAME = "ibkr_fills_log.jsonl"
 REC_LOG_FILENAME = "trade_recommendation_log.jsonl"
 
+# Anchor log writes to this script's directory, NOT the process CWD. The daily
+# scheduled task runs with WorkingDir unset (CWD = C:\Windows\System32), so a
+# relative "ibkr_nav_log.jsonl" write there fails with PermissionError — which
+# is why the broker-NAV log stopped accumulating after the initial manual row.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
 
 def _confirm_typed_yes(n_orders: int) -> bool:
     """Block until user types exactly 'YES' (case-sensitive). Anything else aborts.
@@ -609,7 +615,7 @@ def _run_snapshot_nav_mode() -> int:
         "n_positions": len(positions),
         "positions": positions,
     }
-    with Path("ibkr_nav_log.jsonl").open("a", encoding="utf-8") as f:
+    with (_SCRIPT_DIR / "ibkr_nav_log.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
     print(f"[nav] snapshot: NetLiq ${row['net_liquidation_aud']:,.2f} AUD "
           f"(cash ${row['cash_aud']:,.2f}, {len(positions)} positions) "
