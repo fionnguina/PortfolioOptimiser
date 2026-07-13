@@ -1376,9 +1376,8 @@ def _run_walk_forward_cv() -> int:
         sortino_halflife_days=ENSEMBLE_HALFLIFE_DAYS,
         starting_nav_aud=1_000_000.0,
     )
-    if ENSEMBLE_LAMBDA_TEMP != 3.0 or ENSEMBLE_HALFLIFE_DAYS != 60:
-        print(f"[wf-cv] ensemble-mixing override: λ={ENSEMBLE_LAMBDA_TEMP} "
-              f"halflife={ENSEMBLE_HALFLIFE_DAYS}d")
+    print(f"[wf-cv] ensemble mixing: λ={ENSEMBLE_LAMBDA_TEMP} "
+          f"halflife={ENSEMBLE_HALFLIFE_DAYS}d")
     strat_rets = out["blended_returns"]
     if strat_rets.empty:
         print("[wf-cv] engine returned empty series; aborting.")
@@ -1739,6 +1738,86 @@ def _run_meta_opt_mixing() -> int:
 
     print("\n" + "=" * 88)
     print("META-OPT COMPLETE")
+    print("=" * 88)
+    return 0
+
+
+def _run_mixing_diagnostic() -> int:
+    """Explain WHERE the softer-blend (low-λ) edge comes from: for selected years,
+    show each slot's realised return vs the softmax blend weight under λ=3.0
+    (incumbent) vs λ=1.5. If the high-λ blend over-concentrates on a slot that
+    then UNDER-performs the equal-weight average, that's the legible mechanism —
+    the trailing-IR ranking is stale at sharp regime turns, so shrinking toward
+    equal-weight (low λ) helps most there. Diagnostic only; changes nothing."""
+    print("\n" + "=" * 88)
+    print("MIXING DIAGNOSTIC — slot weights vs slot returns, λ=3.0 vs λ=1.5")
+    print("=" * 88)
+    FOCUS_YEARS = [2016, 2020, 2022, 2024]   # 2 edge years + 2 crises for contrast
+    TRAIN_MONTHS = 24
+
+    _tk = [c for c in prices.columns if c != "PortfolioValue"]
+    raw = yf.download(_tk, period="max", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+
+    def _run(lam):
+        return run_oos_ensemble_walk_forward(
+            px_aud, train_window_months=TRAIN_MONTHS, rebalance=REBALANCE_FREQ,
+            benchmark_ticker="SPY", score_lookback_days=252, lambda_temp=lam,
+            sortino_halflife_days=60, starting_nav_aud=1_000_000.0)
+
+    out3, out15 = _run(3.0), _run(1.5)
+    slot_rets = out3["per_candidate_returns"]          # per-slot daily returns
+    sh3, sh15 = out3["softmax_history"], out15["softmax_history"]
+    b3, b15 = out3["blended_returns"], out15["blended_returns"]
+    slots = list(slot_rets.columns)
+
+    def _ann(r):
+        r = pd.to_numeric(r, errors="coerce").dropna()
+        if len(r) < 20:
+            return float("nan")
+        return float((1.0 + r).prod() ** (ANNUAL_TRADING_DAYS / len(r)) - 1.0)
+
+    for yr in FOCUS_YEARS:
+        sr = slot_rets[slot_rets.index.year == yr]
+        w3 = sh3[sh3.index.year == yr]
+        w15 = sh15[sh15.index.year == yr]
+        if sr.empty or w3.empty:
+            continue
+        b3y = b3[b3.index.year == yr]; b15y = b15[b15.index.year == yr]
+        edge = _ann(b15y) - _ann(b3y)
+        print(f"\n--- {yr}  (λ1.5 − λ3.0 blended ann-return edge: {edge*100:+.2f}%) ---")
+        print(f"  {'slot':<22} {'slotRet':>9} {'w(λ3.0)':>9} {'w(λ1.5)':>9} {'Δw':>7}")
+        ranked = sorted(slots, key=lambda s: _ann(sr[s]), reverse=True)
+        for s in ranked:
+            r = _ann(sr[s]); a = float(w3[s].mean()) if s in w3 else 0.0
+            c = float(w15[s].mean()) if s in w15 else 0.0
+            print(f"  {s:<22} {r*100:>+8.2f}% {a:>9.3f} {c:>9.3f} {c-a:>+7.3f}")
+        # Mechanism read: did λ3 over-weight a below-average slot?
+        mean_slot = float(np.nanmean([_ann(sr[s]) for s in slots]))
+        top_w3 = max(slots, key=lambda s: float(w3[s].mean()) if s in w3 else 0.0)
+        verdict = ("OVER-concentrated on a BELOW-avg slot → softer blend helps"
+                   if _ann(sr[top_w3]) < mean_slot else
+                   "concentrated on an ABOVE-avg slot → softer blend neutral/hurts")
+        print(f"  → λ3.0 top-weight slot = {top_w3} "
+              f"({_ann(sr[top_w3])*100:+.1f}% vs slot-avg {mean_slot*100:+.1f}%): {verdict}")
+
+    print("\n" + "=" * 88)
+    print("MIXING DIAGNOSTIC COMPLETE")
     print("=" * 88)
     return 0
 

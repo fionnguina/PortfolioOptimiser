@@ -310,6 +310,7 @@ from research_modes import (
     _run_turnover_penalty_sweep,
     _run_walk_forward_cv,
     _run_meta_opt_mixing,
+    _run_mixing_diagnostic,
     _run_attribution,
     _run_crash_hedge_test,
     _run_crash_hedge_release_sweep,
@@ -418,6 +419,11 @@ if _WALK_FORWARD_CV_MODE:
 _META_OPT_MIXING_MODE = "--meta-opt-mixing" in sys.argv
 if _META_OPT_MIXING_MODE:
     print("[meta-opt] --meta-opt-mixing detected; will skip dialog + live pipeline")
+# `--mixing-diagnostic`: explain the low-λ edge (slot weights vs slot returns
+# per year under λ=3.0 vs 1.5). Diagnostic only; skips dialog + live pipeline.
+_MIXING_DIAG_MODE = "--mixing-diagnostic" in sys.argv
+if _MIXING_DIAG_MODE:
+    print("[mix-diag] --mixing-diagnostic detected; will skip dialog + live pipeline")
 # `--attribution`: decompose OOS returns by slot, asset, and regime to
 # answer "where does the engine earn its money / lose to SPY?" Purely
 # descriptive — no parameters to tune, no validation budget consumed.
@@ -499,6 +505,7 @@ _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _FACTOR_RECS_MODE
                        or _TILTED_ENSEMBLE_TEST_MODE
                        or _META_OPT_MIXING_MODE
+                       or _MIXING_DIAG_MODE
                        or _PREFLIGHT_MODE
                        or OOS_KERNEL_MODE)
 
@@ -1050,9 +1057,15 @@ def _effective_cov_method() -> str:
 # 2026-07-13). The softmax that blends the 5 slots by EWMA IR-vs-SPY:
 #   ENSEMBLE_LAMBDA_TEMP — softmax temperature (concentration on the best slot).
 #   ENSEMBLE_HALFLIFE_DAYS — EWMA adaptation halflife for the IR score.
-# Production defaults (3.0 / 60) were hand-selected on 2016-2026 — env-sweepable
-# for the regime-mixing experiment; cache-fingerprint aware.
-ENSEMBLE_LAMBDA_TEMP = 3.0
+# λ SHIPPED at 1.5 on 2026-07-13 (was 3.0): softer/more-equal blend across the 5
+# slots = de-concentration = variance reduction (the softmax-temperature analog of
+# Ledoit-Wolf Σ shrinkage — same "distrust the noisy IR ranking" principle). Chosen
+# by --meta-opt-mixing (nested walk-forward: selected on opt-region <2024 with a
+# complexity penalty, confirmed on untouched holdout ≥2024: +0.084 Sharpe, +0.50pp
+# MaxDD, +0.94% return). --mixing-diagnostic confirmed the mechanism is variance
+# reduction, not regime-timing. Modest but improves all 3 axes net. See
+# reference-regime-mixing-experiment. halflife 60 unchanged (no signal). Env-sweepable.
+ENSEMBLE_LAMBDA_TEMP = 1.5
 _ens_lambda_env = os.environ.get("PORTOPT_ENSEMBLE_LAMBDA")
 if _ens_lambda_env:
     try:
@@ -2380,7 +2393,8 @@ _DATA_LOCKBOX_RESEARCH_MODE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                                or _STRETCH_ONLY_TEST_MODE
                                or _STRETCH_HEDGE_SWEEP_MODE
                                or _TILTED_ENSEMBLE_TEST_MODE
-                               or _META_OPT_MIXING_MODE)
+                               or _META_OPT_MIXING_MODE
+                               or _MIXING_DIAG_MODE)
 _lockbox_env = os.environ.get("DATA_LOCKBOX_DATE")
 if _lockbox_env is None:
     if _DATA_LOCKBOX_RESEARCH_MODE:
@@ -5459,6 +5473,14 @@ if "--meta-opt-mixing" in sys.argv:
     sys.exit(_exit_code)
 
 
+# === Mixing diagnostic (--mixing-diagnostic) ===============================
+# Explains the low-λ edge: per-year slot returns vs softmax blend weights
+# under λ=3.0 vs 1.5. Descriptive; no parameters, no lock-box budget.
+if "--mixing-diagnostic" in sys.argv:
+    _exit_code = _run_mixing_diagnostic()
+    sys.exit(_exit_code)
+
+
 # === Performance attribution (--attribution) ================================
 # Decomposes the engine's OOS returns to answer:
 #   1) Per-slot:   which of the 5 candidate slots adds Sharpe / α?
@@ -5583,7 +5605,7 @@ if bool(CFG.get("oos_validation", True)):
             rebalance=REBALANCE_FREQ,
             benchmark_ticker="SPY",
             score_lookback_days=252,
-            lambda_temp=3.0,
+            lambda_temp=ENSEMBLE_LAMBDA_TEMP,
             starting_nav_aud=_oos_nav,
             # PRODUCTION CONFIG: the metrics shown in PPT/Excel must match
             # what the live trade plan actually trades. See PRODUCTION_*
@@ -5612,7 +5634,7 @@ if bool(CFG.get("oos_validation", True)):
                     rebalance=REBALANCE_FREQ,
                     benchmark_ticker="SPY",
                     score_lookback_days=252,
-                    lambda_temp=3.0,
+                    lambda_temp=ENSEMBLE_LAMBDA_TEMP,
                     starting_nav_aud=float(ROADSHOW_BASE_NAV),
                     slot_weights_override=PRODUCTION_SLOT_OVERRIDE,
                     crash_hedge=PRODUCTION_CRASH_HEDGE,
@@ -5663,7 +5685,7 @@ if bool(CFG.get("oos_validation", True)):
                 rebalance=REBALANCE_FREQ,
                 benchmark_ticker="SPY",
                 score_lookback_days=252,
-                lambda_temp=3.0,
+                lambda_temp=ENSEMBLE_LAMBDA_TEMP,
                 slot_weights_override=PRODUCTION_SLOT_OVERRIDE,
                 crash_hedge=PRODUCTION_CRASH_HEDGE,
             )
@@ -5956,7 +5978,8 @@ try:
     if "SPY" in oos_prices_aud_long.columns:
         _spy_bench_for_score = oos_prices_aud_long["SPY"].pct_change().dropna()
     ensemble_mix_live = softmax_ensemble_weights(
-        _oos_cand_rets, lookback_days=252, lambda_temp=3.0, halflife_days=60,
+        _oos_cand_rets, lookback_days=252, lambda_temp=ENSEMBLE_LAMBDA_TEMP,
+        halflife_days=ENSEMBLE_HALFLIFE_DAYS,
         benchmark_returns=_spy_bench_for_score,
     )
     # Blend with forward-looking SPY regime signal (same as OOS engine).
