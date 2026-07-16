@@ -5680,6 +5680,20 @@ if bool(CFG.get("oos_validation", True)):
             # subprocess path proves flaky in the frozen exe environment.
             _scale_parallel = bool(int(os.environ.get(
                 "SCALE_PARALLEL", "1") or "0"))
+            # The pool spawns [sys.executable, oos_worker.py, in, out]. Under the
+            # FROZEN exe sys.executable IS the .exe, which ignores the script arg
+            # and just re-runs its own entry point — so every "worker" became a
+            # full engine re-run (re-downloading all data, emitting its own
+            # run_*.log) that never wrote out_*.pkl. The parent then blocked on
+            # _proc.wait() forever, so the exception-fallback below never fired.
+            # Measured: the nightly evidence run timed out at 2400s and was killed
+            # 3/3 nights (2026-07-09/10/13) and never once completed.
+            # The pool is only valid from SOURCE, where sys.executable is a real
+            # python.exe. Frozen -> sequential (correct; ~2min/NAV fits the budget).
+            if _scale_parallel and getattr(sys, "frozen", False):
+                _scale_parallel = False
+                print("[scale] frozen exe — using sequential OOS (the subprocess "
+                      "pool needs a real python.exe; sys.executable is the .exe here)")
             _common_kwargs = dict(
                 train_window_months=24,
                 rebalance=REBALANCE_FREQ,
