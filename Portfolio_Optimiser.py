@@ -4973,6 +4973,12 @@ except Exception as _e_ff5_setup:
 
 # ---- Make optimiser globals available ----
 current_holdings_units = units
+# ACTUAL holdings for the Holdings-sheet write. Kept separate because the live
+# TLH pass REBINDS `units` to a post-swap series (see the [tlh-live] block), and
+# that must never reach the sheet — see the 2026-06-27 note at the
+# _write_holdings_sheet call. None here means "units was never rebound, use it
+# as-is". Set only where a rebind happens.
+_units_actual_for_sheet = None
 securities_opt = list(units.index)
 lots_df = lots_df  # already loaded earlier in block 7
 gamma_cgt = 0.005        # soft penalty weight for CGT (tune as desired)
@@ -6972,6 +6978,20 @@ if USE_XLWINGS:
                         # below already incorporates them. Net effect: the
                         # user executes one batch via Phase 3 and the harvest
                         # swap + rebalance both clear together.
+                        #
+                        # Snapshot ACTUAL holdings FIRST. Rebinding `units` here
+                        # silently defeated the 2026-06-27 Holdings-reconciliation
+                        # fix (see the note at _write_holdings_sheet): that fix
+                        # made the sheet write "current" units, but by then
+                        # `units` had become RECOMMENDED units, so the swap was
+                        # persisted as though it had executed. The sheet then
+                        # disagreed with the broker and each run compounded on
+                        # the last — the same self-referential loop that produced
+                        # HBRD=17,122 in June. Observed 2026-07-17: a live SMH ->
+                        # SOXX harvest wrote fractional SOXX units and drift went
+                        # 0.33 -> 0.66 -> 0.99 over three runs. Only the TRADE
+                        # PLAN should see the swap; the sheet stays broker-truth.
+                        _units_actual_for_sheet = pd.Series(units, dtype=float).copy()
                         units = pd.Series(units, dtype=float).copy()
                         for _ev in live_tlh_events:
                             _stk = str(_ev["ticker_sold"])
@@ -8248,7 +8268,14 @@ if USE_XLWINGS:
             # Prices / Market Value / Weight still get refreshed here
             # because those are derivable from current units + current
             # market data; only Units stays sticky.
-            _write_holdings_sheet(wb, prices, units, include_flags, sheet_name="Holdings", fx_to_aud_map=fx_map_all)
+            # `units` may have been rebound to POST-TLH-swap values above; the
+            # sheet must record what we actually HOLD, never a recommendation.
+            _sheet_units = (_units_actual_for_sheet
+                            if _units_actual_for_sheet is not None else units)
+            if _units_actual_for_sheet is not None:
+                print("[holdings] writing PRE-TLH actual units to the sheet "
+                      "(the live swap stays in the trade plan only)")
+            _write_holdings_sheet(wb, prices, _sheet_units, include_flags, sheet_name="Holdings", fx_to_aud_map=fx_map_all)
 
             # --- Step 1: Compute current portfolio values ---
             if not trade_rec.empty:

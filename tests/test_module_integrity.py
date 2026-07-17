@@ -18,6 +18,47 @@ sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 import research_modes
 import ppt_export
 
+_ENGINE_SRC = (_Path(__file__).resolve().parent.parent / "Portfolio_Optimiser.py").read_text(
+    encoding="utf-8", errors="replace")
+
+
+# === Holdings.Units immutability =============================================
+# Source-level guards, because the live pipeline that contains this logic needs
+# full engine state + Excel and cannot be unit-tested. The rule they protect has
+# now been broken TWICE by different routes, each time silently:
+#   2026-06-27  the sheet write passed TARGET units -> engine read its own target
+#               back as next run's "current" -> HBRD compounded 2,034 -> 17,122.
+#   2026-07-17  the live TLH pass REBOUND `units` to post-swap values before the
+#               write, defeating the 2026-06-27 fix through a different door ->
+#               a phantom SMH->SOXX harvest was persisted as though executed and
+#               drift compounded 0.33 -> 0.66 -> 0.99 across three runs.
+# Both are the same failure: the Holdings sheet must record what we HOLD (broker
+# truth), never what the engine RECOMMENDS. A live run is not a sufficient guard
+# — the first breakage survived a month of them.
+
+def test_holdings_sheet_write_uses_actual_units_not_post_tlh():
+    """The sheet write must NOT pass the `units` that the TLH pass rebinds."""
+    calls = [ln.strip() for ln in _ENGINE_SRC.splitlines()
+             if "_write_holdings_sheet(" in ln and not ln.strip().startswith("#")]
+    assert calls, "no _write_holdings_sheet call found — did it get renamed?"
+    for call in calls:
+        assert "_sheet_units" in call, (
+            "Holdings sheet write must pass _sheet_units (the pre-TLH actual "
+            f"holdings), not post-swap `units`. Offending call: {call}")
+
+
+def test_tlh_live_snapshots_actual_units_before_rebinding():
+    """The TLH pass must snapshot actual units BEFORE it rebinds `units`."""
+    src = _ENGINE_SRC
+    snap = src.find("_units_actual_for_sheet = pd.Series(units")
+    assert snap != -1, (
+        "the live TLH block must snapshot _units_actual_for_sheet before "
+        "rebinding `units` to post-swap values")
+    rebind = src.find("units = pd.Series(units, dtype=float).copy()", snap)
+    assert rebind != -1 and rebind > snap, (
+        "the snapshot must come BEFORE the rebind, or it captures post-swap "
+        "units and the guard is worthless")
+
 
 # The 12 CLI drivers the engine dispatches to. Each is called with NO args
 # (state is injected via module globals by _sync_research_modes first).
