@@ -737,6 +737,84 @@ def _resolve_live_nav_aud() -> tuple:
     return 0.0, "unavailable"
 
 
+def _last_executed_rebal_date():
+    """Date of the last ACTUAL execution (a fill with qty_filled > 0) from
+    ibkr_fills_log.jsonl, or None if nothing has ever filled.
+
+    Broker truth — recommendations don't count. As of the 2026-07-17 audit
+    NOTHING has filled since the 06-22 batch (all Cancelled/PreSubmitted/
+    Inactive), i.e. the live portfolio has never been aligned to the model.
+    """
+    try:
+        _p = APP_DIR / "ibkr_fills_log.jsonl"
+        if not _p.exists():
+            return None
+        _dates = []
+        with _p.open("r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _r = json.loads(_line)
+                except Exception:
+                    continue
+                if float(_r.get("qty_filled") or 0) > 0:
+                    _ts = _r.get("exec_timestamp") or ""
+                    try:
+                        _dates.append(pd.Timestamp(_ts).normalize().tz_localize(None))
+                    except Exception:
+                        continue
+        return max(_dates) if _dates else None
+    except Exception:
+        return None
+
+
+def _live_rebal_calendar_gate() -> tuple:
+    """Mirror the BACKTEST's rebalance spacing in the live verdict.
+
+    Backtest (oos_engine ~390): rebalance on the REBALANCE_FREQ grid FROM the
+    prior rebal, plus early-trigger dates when SPY drawdown deepens by
+    >= EARLY_TRIGGER_DD_DEEPEN once >= EARLY_TRIGGER_MIN_DAYS have passed —
+    THEN apply the SKIP_REBAL_DELTA drift filter. The live verdict applied only
+    the drift filter (audit 2026-07-17), so it could fire every single day.
+
+    Returns (allowed: bool, reason: str). Fails OPEN (allowed) on any error —
+    a broken gate must never silently suppress a needed rebalance.
+    """
+    try:
+        _last = _last_executed_rebal_date()
+        if _last is None:
+            return True, "no-prior-fill (never aligned; cadence not yet anchored)"
+        _today = pd.Timestamp.today().normalize()
+        _days = int((_today - _last).days)
+        try:
+            _rpy = float(REBALANCES_PER_YEAR)
+            _period_days = int(round(365.0 / _rpy)) if _rpy > 0 else 42
+        except Exception:
+            _period_days = 42   # 6W fallback
+        if _days >= _period_days:
+            return True, f"scheduled ({_days}d since last fill >= {_period_days}d)"
+        # Early trigger: SPY drawdown deepened since the last rebal.
+        if (EARLY_TRIGGER_DD_DEEPEN and EARLY_TRIGGER_DD_DEEPEN > 0
+                and _days >= int(EARLY_TRIGGER_MIN_DAYS)):
+            try:
+                _spy = prices["SPY"].sort_index()
+                _w = _spy.loc[_last:]
+                if len(_w) >= 2:
+                    _dd = (_w / _w.cummax()) - 1.0
+                    _deepen = float(_dd.iloc[-1]) - float(_dd.iloc[0])
+                    if _deepen <= -float(EARLY_TRIGGER_DD_DEEPEN):
+                        return True, (f"early-trigger (SPY DD deepened "
+                                      f"{_deepen*100:.1f}pp, {_days}d)")
+            except Exception:
+                pass
+        return False, (f"within-cadence ({_days}d since last fill < {_period_days}d, "
+                       f"no early-trigger)")
+    except Exception as _e_gate:
+        return True, f"gate-error-fail-open ({type(_e_gate).__name__})"
+
+
 TARGET_PORTFOLIO_VALUE_AUD = 1_000_000.0
 try:
     _tgt_pv, _tgt_src = _resolve_live_nav_aud()
@@ -7047,13 +7125,34 @@ if USE_XLWINGS:
                 else:
                     _summed_abs_dw = float("nan")
 
-                _verdict = ("SKIP" if (np.isfinite(_summed_abs_dw)
-                                         and _summed_abs_dw < float(SKIP_REBAL_DELTA))
-                              else "RUN")
+                # --- Drift filter (necessary) ---------------------------------
+                _drift_ok = (np.isfinite(_summed_abs_dw)
+                             and _summed_abs_dw >= float(SKIP_REBAL_DELTA))
+                # --- Calendar gate (was MISSING — live/backtest divergence) ----
+                # The BACKTEST rebalances on the REBALANCE_FREQ grid (6W) FROM the
+                # prior rebal, plus early-trigger dates when SPY DD deepens by
+                # >=EARLY_TRIGGER_DD_DEEPEN after >=EARLY_TRIGGER_MIN_DAYS, and
+                # only then applies the SKIP_REBAL_DELTA filter (oos_engine ~390).
+                # Live applied ONLY the drift filter, so it fired every day drift
+                # exceeded 3% -> executing on every RUN would incur far more
+                # turnover/CGT than the modelled ~312bps/yr drag (CGT ~92% of it)
+                # and live would underperform the backtest. Audit 2026-07-17.
+                #
+                # Anchor on the LAST ACTUAL EXECUTION (broker truth), mirroring the
+                # backtest's "6W since the prior rebal". If nothing has ever filled
+                # the portfolio was never aligned, so there is no anchor and the
+                # cadence is not yet meaningful -> allow RUN (do NOT mask a genuine
+                # misalignment behind a calendar that never started).
+                _cal_ok, _cal_why = _live_rebal_calendar_gate()
+                _verdict = "RUN" if (_drift_ok and _cal_ok) else "SKIP"
+                _skip_why = ("" if _verdict == "RUN"
+                             else ("drift<threshold" if not _drift_ok else _cal_why))
                 print(f"[rebal-trigger] summed_|Δw|={_summed_abs_dw:.4f}  "
                       f"threshold={float(SKIP_REBAL_DELTA):.4f}  "
                       f"verdict={_verdict}  "
-                      f"mode={_tp_mode}  "
+                      f"cadence={_cal_why}  "
+                      + (f"skip_reason={_skip_why}  " if _skip_why else "")
+                      + f"mode={_tp_mode}  "
                       f"portfolio_aud={_portfolio_val_for_verdict:,.0f}  "
                       f"trade_volume_aud={_trade_volume_aud:,.0f}  "
                       f"n_trades={_n_trades}")
