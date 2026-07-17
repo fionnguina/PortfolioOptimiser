@@ -5266,9 +5266,18 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
             h.update(f"{k}:{json.dumps(v, sort_keys=True, default=str)}".encode())
         except Exception:
             h.update(f"{k}:{repr(v)}".encode())
-    # Engine version — invalidates cache on any code change
+    # Engine version — invalidates cache on any code change.
+    # The global is _BUILD_GIT_SHA (leading underscore, bound at import from
+    # _version.py). This read said "BUILD_GIT_SHA" until 2026-07-17, so it
+    # silently hashed the literal "unknown" on EVERY run and the sha was never
+    # actually part of the key — the catch-all for code changes that aren't
+    # behind one of the explicitly-hashed knobs below was dead. The knobs
+    # themselves all resolve (audited), so no past experiment was contaminated;
+    # what was missing was invalidation on un-knobbed engine changes.
+    # Under the frozen exe this is the BUILD sha, so the cache invalidates per
+    # rebuild rather than per commit. See test_cache_fingerprint_globals_all_bind.
     try:
-        gsha = str(globals().get("BUILD_GIT_SHA", "unknown"))
+        gsha = str(globals().get("_BUILD_GIT_SHA", "unknown"))
         h.update(f"git:{gsha}".encode())
     except Exception:
         pass
@@ -8941,16 +8950,33 @@ def _print_run_health_summary():
         if os.path.exists(log_path):
             with open(log_path, encoding="utf-8", errors="ignore") as f:
                 log_text = f.read()
-            n_warn = (log_text.count("[WARN") + log_text.count("[warn")
-                      + log_text.count("WARNING") + log_text.count("Warning"))
-            # subtract the count of the word "Warning" inside the health block we're emitting now
-            # (rough — best-effort).
-            n_err = (log_text.count("[ERROR") + log_text.count("Traceback")
-                     + log_text.count("FAILED") + log_text.count("Exception:"))
+            # Count LINES, not substring occurrences, and split OUR tagged
+            # warnings from third-party ones. Counting every "Warning"
+            # substring made this line unreadable: 2026-07-17 reported 103
+            # warnings of which 87 were one numpy RuntimeWarning repeated from
+            # the covariance path — burying 7 real [lots][WARN] lines that said
+            # the lot book matched 0 of 6 broker positions. A number nobody can
+            # act on is the same as no signal at all.
+            _lines = log_text.splitlines()
+            _is_tagged = lambda l: ("[WARN" in l) or ("[warn" in l)
+            n_warn = sum(1 for l in _lines if _is_tagged(l))
+            n_warn_lib = sum(1 for l in _lines
+                             if not _is_tagged(l)
+                             and re.search(r"\bwarn(ing)?\b", l, re.I))
+            # `Windows fatal exception:` (faulthandler, e.g. the 0x800706ba COM
+            # teardown that fires ~25x/run) matched NONE of the old patterns —
+            # lowercase, and "Exception:" was compared case-sensitively. A whole
+            # class of hard faults was being reported as "Errors in log: 0".
+            n_err = sum(1 for l in _lines
+                        if ("[ERROR" in l) or ("Traceback" in l)
+                        or ("FAILED" in l)
+                        or re.search(r"(exception:|fatal exception)", l, re.I))
             n_regress = log_text.count("[metrics-warn]")
             _warn_str = f"  Warnings in log:      {n_warn}"
             if n_warn > 0:
                 _warn_str += "  (grep run.log for [WARN])"
+            if n_warn_lib:
+                _warn_str += f"   [+{n_warn_lib} library/3rd-party, informational]"
             print(_warn_str)
             _err_str = f"  Errors in log:        {n_err}"
             if n_err > 0:

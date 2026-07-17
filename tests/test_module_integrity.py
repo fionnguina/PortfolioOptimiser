@@ -11,6 +11,7 @@ catch import breakage and function rename/signature drift against that contract.
 from __future__ import annotations
 
 import inspect
+import re
 import sys
 from pathlib import Path as _Path
 
@@ -35,6 +36,45 @@ _ENGINE_SRC = (_Path(__file__).resolve().parent.parent / "Portfolio_Optimiser.py
 # Both are the same failure: the Holdings sheet must record what we HOLD (broker
 # truth), never what the engine RECOMMENDS. A live run is not a sufficient guard
 # — the first breakage survived a month of them.
+
+# === OOS cache fingerprint =====================================================
+# The fingerprint reads its inputs via globals().get(NAME, default). A typo'd
+# NAME does not raise — it silently returns the default forever, so that input
+# stops invalidating the cache and stale results are served after a real change.
+# That is exactly what happened to the git-sha catch-all: the read said
+# "BUILD_GIT_SHA" but the global is "_BUILD_GIT_SHA", so from the day it was
+# written it hashed the literal "unknown" and the sha was never in the key.
+# The 18 config knobs all resolved, so no past experiment was contaminated —
+# but nothing would have told us if one hadn't. Hence this guard.
+
+def test_cache_fingerprint_globals_all_bind():
+    """Every globals().get(...) in _oos_cache_fingerprint must name a real
+    module-level binding. A silent default = a dead cache-key input."""
+    m = re.search(r"def _oos_cache_fingerprint.*?(?=\ndef )", _ENGINE_SRC, re.S)
+    assert m, "_oos_cache_fingerprint not found — renamed?"
+    names = re.findall(r"globals\(\)\.get\(['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]",
+                       m.group(0))
+    assert names, "no globals() lookups found — did the fingerprint change shape?"
+    dead = []
+    for n in sorted(set(names)):
+        bound = (re.search(rf"^\s*{re.escape(n)}\s*[:=]", _ENGINE_SRC, re.M)
+                 or re.search(rf"import .*\b{re.escape(n)}\b", _ENGINE_SRC))
+        if not bound:
+            dead.append(n)
+    assert not dead, (
+        f"cache-fingerprint globals never bound (silently hash their default, "
+        f"so that input NEVER invalidates the cache): {dead}")
+
+
+def test_cache_fingerprint_includes_build_sha():
+    """The git-sha catch-all must be present and spelled correctly — it is the
+    only thing invalidating on code changes that aren't behind a knob."""
+    m = re.search(r"def _oos_cache_fingerprint.*?(?=\ndef )", _ENGINE_SRC, re.S)
+    body = m.group(0)
+    assert 'globals().get("_BUILD_GIT_SHA"' in body, (
+        "fingerprint must read _BUILD_GIT_SHA (with the leading underscore); "
+        "the bare name is not bound and silently hashes 'unknown'")
+
 
 def test_holdings_sheet_write_uses_actual_units_not_post_tlh():
     """The sheet write must NOT pass the `units` that the TLH pass rebinds."""

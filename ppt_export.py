@@ -2271,8 +2271,42 @@ def export_to_ppt(results, trades, charts=None):
         except Exception as _e_pds:
             print(f"[pptx] PDS slide skipped: {_e_pds}")
 
+        # Atomic-ish save: write beside the target, then swap in.
+        #
+        # The swap FAILS with WinError 5 whenever the destination is open in
+        # PowerPoint — and the engine opens the deck itself after saving
+        # (OPEN_PPT_AFTER_SAVE), so any run whose deck is still on screen locks
+        # the NEXT run out of its own output. Previously that raised straight
+        # out of here: the caller swallowed it, the run reported "PPT generated:
+        # FAILED / not saved", a ~12MB .__tmp__.pptx was orphaned, and the deck
+        # was simply lost — while the wrapper still emailed the RUN verdict. On
+        # an unattended run (Mon 09:30, deck left open over the weekend) that is
+        # a silent loss of the one artefact the user reviews before trading.
+        #
+        # So: never lose the deck. Fall back to a timestamped sibling, which the
+        # user can open and which leaves no debris.
         tmp_path = ppt_path.replace(".pptx", ".__tmp__.pptx")
         prs.save(tmp_path)
-        os.replace(tmp_path, ppt_path)
+        try:
+            os.replace(tmp_path, ppt_path)
+        except OSError as _e_swap:
+            _stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            _fallback = ppt_path.replace(".pptx", f".{_stamp}.pptx")
+            try:
+                os.replace(tmp_path, _fallback)
+                print(f"[ppt][WARN] could not overwrite {os.path.basename(ppt_path)} "
+                      f"({_e_swap.__class__.__name__}: {_e_swap}). It is most likely "
+                      f"still open in PowerPoint. Deck saved instead to: {_fallback}")
+                return _fallback
+            except Exception as _e_fb:
+                # Both paths failed — clean up so we don't strand a 12MB temp.
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                print(f"[ppt][ERROR] deck could not be saved: swap failed "
+                      f"({_e_swap}), fallback failed ({_e_fb}). Temp cleaned up.")
+                raise
         print(f"[ppt] Report saved to: {ppt_path}")
         return ppt_path
