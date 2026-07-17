@@ -6942,11 +6942,45 @@ if USE_XLWINGS:
                     # Build price snapshot dict (ticker -> AUD price) from
                     # last_px_hold; substitute tickers may be outside the
                     # current holdings universe so widen with all known prices.
+                    #
+                    # CURRENCY: last_px_hold / prices are LOCAL (that's why the
+                    # Holdings sheet carries a separate "FX to AUD" column and
+                    # computes Market Value = Units * Last Price * FX). The lot
+                    # book's CostBaseAUD is AUD, so these MUST be converted or
+                    # _run_tlh_pass compares AUD cost against a USD price and
+                    # invents a ~30% loss on every US holding. Latent until
+                    # 2026-07-17: the old seed was BBUS.AX/BEAR.AX/HBRD.AX —
+                    # all .AX, where local IS AUD, so the mismatch cancelled and
+                    # nothing ever fired. Re-seeding from broker truth added SMH
+                    # and VEA (the first US lots with AUD cost bases) and the
+                    # engine immediately reported a $14,925 loss on SMH whose
+                    # real loss was $3,001 — AUD cost 867.41 vs the USD price
+                    # 568.91 instead of the A$807 mark.
+                    def _px_to_aud(_tk, _v):
+                        """Local -> AUD. Returns None when the rate is unknown
+                        for a non-AUD ticker: refusing to price it is safer than
+                        pricing it wrong, which fabricates a harvestable loss."""
+                        try:
+                            _rate = pd.Series(fx_map_all).get(str(_tk))
+                        except Exception:
+                            _rate = None
+                        if _rate is None or not np.isfinite(float(_rate)) or float(_rate) <= 0:
+                            if str(_tk).endswith(".AX"):
+                                _rate = 1.0
+                            else:
+                                return None
+                        return float(_v) * float(_rate)
+
                     _px_snap = {}
+                    _px_unpriced = []
                     try:
                         for _tk, _v in last_px_hold.items():
                             if pd.notna(_v) and float(_v) > 0:
-                                _px_snap[str(_tk)] = float(_v)
+                                _aud = _px_to_aud(_tk, _v)
+                                if _aud is None:
+                                    _px_unpriced.append(str(_tk))
+                                else:
+                                    _px_snap[str(_tk)] = _aud
                     except Exception:
                         pass
                     # Also accept any tickers in the wider prices DataFrame so
@@ -6955,9 +6989,18 @@ if USE_XLWINGS:
                         _last_row = prices.iloc[-1]
                         for _tk, _v in _last_row.items():
                             if pd.notna(_v) and float(_v) > 0 and str(_tk) not in _px_snap:
-                                _px_snap[str(_tk)] = float(_v)
+                                _aud = _px_to_aud(_tk, _v)
+                                if _aud is None:
+                                    _px_unpriced.append(str(_tk))
+                                else:
+                                    _px_snap[str(_tk)] = _aud
                     except Exception:
                         pass
+                    if _px_unpriced:
+                        print(f"[tlh-live][WARN] no FX rate for "
+                              f"{len(set(_px_unpriced))} non-AUD ticker(s) — excluded "
+                              f"from TLH rather than mispriced: "
+                              f"{sorted(set(_px_unpriced))[:6]}")
                     _tlh_today = pd.Timestamp(prices.index[-1])
                     _live_nav = (float(portfolio_value_override)
                                   if (portfolio_value_override is not None
