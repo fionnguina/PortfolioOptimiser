@@ -64,5 +64,8 @@ metrics_history.jsonl
 tlh_cooldown_state.json
 engine_done.flag
 
-# Manual backups (e.g. *.jsonl.bak made before hand-editing state files)
+# Manual backups (e.g. *.jsonl.bak made before hand-editing state files).
+# *.bak-* also covers timestamped backups (lots_seed.json.bak-2026-07-17_121954),
+# which plain *.bak misses because the suffix trails the extension.
 *.bak
+*.bak-*
