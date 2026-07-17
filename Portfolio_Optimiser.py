@@ -703,14 +703,46 @@ LIVE_TRADING_START_DATE: str | None = "2026-06-22"  # paper trading commenced th
 # (portfolio_state.json), not a $1M nominal — otherwise it always reads ~-$750k
 # for a ~$250k account, drowning any real signal. Falls back to $1M if the
 # state file is missing (e.g. a fresh checkout).
+def _resolve_live_nav_aud() -> tuple:
+    """Live NAV (AUD) with BROKER TRUTH first. Returns (nav, source_label).
+
+    Precedence: ibkr_nav_log NetLiq (written by ibkr_paper_exec.py
+    --snapshot-nav / the daily wrapper) > portfolio_state.json > 0.
+
+    Audit 2026-07-17: portfolio_state.json is written by NOTHING — it is a
+    one-off manual snapshot. It froze at $250,559.51 while real broker NetLiq
+    moved 247,107 -> 249,431 -> 244,440 (2.5% stale). Everything downstream
+    inherited that constant: the OOS starting NAV, the Roadshow base, the
+    rebal-trigger denominator, and live_nav_history — which flat-lined the
+    drift tracker so compute_live_max_drawdown returned 0% forever and the DD
+    alert could never fire. Broker NetLiq is authoritative; state is a fallback.
+    """
+    try:
+        _s = _load_broker_nav_series()
+        if _s is not None and not _s.empty:
+            _v = float(_s.iloc[-1])
+            if np.isfinite(_v) and _v > 0:
+                return _v, f"broker NetLiq @ {_s.index[-1].date()}"
+    except Exception:
+        pass
+    try:
+        _p = APP_DIR / "portfolio_state.json"
+        if _p.exists():
+            _v = float(json.loads(_p.read_text(encoding="utf-8"))
+                       .get("portfolio_value", 0) or 0)
+            if np.isfinite(_v) and _v > 0:
+                return _v, "portfolio_state.json (FALLBACK — no broker NAV log)"
+    except Exception:
+        pass
+    return 0.0, "unavailable"
+
+
 TARGET_PORTFOLIO_VALUE_AUD = 1_000_000.0
 try:
-    _tgt_state = APP_DIR / "portfolio_state.json"
-    if _tgt_state.exists():
-        _tgt_pv = float(json.loads(_tgt_state.read_text(encoding="utf-8"))
-                        .get("portfolio_value", 0) or 0)
-        if np.isfinite(_tgt_pv) and _tgt_pv > 0:
-            TARGET_PORTFOLIO_VALUE_AUD = _tgt_pv
+    _tgt_pv, _tgt_src = _resolve_live_nav_aud()
+    if _tgt_pv > 0:
+        TARGET_PORTFOLIO_VALUE_AUD = _tgt_pv
+        print(f"[nav] live NAV ${_tgt_pv:,.2f} — source: {_tgt_src}")
 except Exception:
     pass
 # Sync into excel_sheets (its only engine coupling — the cash-ledger anchor).
@@ -4807,17 +4839,17 @@ else:
 # "$X invested" label matches what was actually simulated.
 if portfolio_value_override is None:
     try:
-        if os.path.exists(state_path):
-            with open(state_path, "r") as _f_state:
-                _state = json.load(_f_state)
-            _pv = float(_state.get("portfolio_value", 0) or 0)
-            if np.isfinite(_pv) and _pv > 0:
-                portfolio_value_override = _pv
-                print(f"[oos-nav] using portfolio_state.json value "
-                      f"${_pv:,.0f} as starting_nav_aud for backtest + "
-                      f"Roadshow base")
+        # Broker NetLiq first, portfolio_state.json only as fallback — see
+        # _resolve_live_nav_aud(). portfolio_state.json is never written by
+        # anything, so it silently froze the whole live frame at a stale value
+        # (audit 2026-07-17).
+        _pv, _pv_src = _resolve_live_nav_aud()
+        if _pv > 0:
+            portfolio_value_override = _pv
+            print(f"[oos-nav] starting_nav_aud + Roadshow base = ${_pv:,.0f} "
+                  f"(source: {_pv_src})")
     except Exception as _e_pv_state:
-        print(f"[oos-nav] portfolio_state.json read skipped: {_e_pv_state}")
+        print(f"[oos-nav] live NAV resolve skipped: {_e_pv_state}")
 
     current_holdings_units = units.copy()
 
@@ -7146,8 +7178,32 @@ if USE_XLWINGS:
             # recommendation log; compute monthly drift if live trading is on.
             try:
                 _nav_path = APP_DIR / "live_nav_history.jsonl"
+                # THE live NAV series = the same broker-truth-spliced actual-NAV
+                # path the deck already uses (fills reconstruction chain-linked to
+                # broker NetLiq returns). Previously this read live_nav_history,
+                # which was fed portfolio_value_override — a STATIC
+                # portfolio_state.json snapshot nothing ever writes. Result: from
+                # go-live (26 Jun) the "live NAV series" held just TWO distinct
+                # values, so compute_live_max_drawdown returned ~0% forever and the
+                # DD alert could NEVER fire — while real NetLiq fell 249.4k -> 244.4k.
+                # Audit 2026-07-17. Broker series is authoritative.
+                _nav_src = "actual-NAV (fills recon + broker NetLiq)"
+                try:
+                    _live_nav = compute_actual_nav_series_spliced(
+                        prices,
+                        APP_DIR / "ibkr_fills_log.jsonl",
+                        APP_DIR / "lots_seed.json",
+                    )
+                except Exception as _e_nav_src:
+                    print(f"[drift] actual-NAV series failed ({_e_nav_src}); "
+                          f"falling back to live_nav_history")
+                    _live_nav = pd.Series(dtype=float)
+                # Keep the history file as a truthful record — _portfolio_val_for_log
+                # now resolves to broker NetLiq via _resolve_live_nav_aud().
                 append_live_nav_history(_nav_path, _portfolio_val_for_log)
-                _live_nav = _load_live_nav_series(_nav_path)
+                if _live_nav is None or _live_nav.empty:
+                    _live_nav = _load_live_nav_series(_nav_path)
+                    _nav_src = "live_nav_history (fallback)"
                 _live_dd = compute_live_max_drawdown(_live_nav)
                 _ensure_actual_fills_sheet(wb)
                 _fills_df = _read_actual_fills(wb)
@@ -7160,10 +7216,19 @@ if USE_XLWINGS:
                 _n_warn = _print_drift_warnings(_fills_drift, _nav_drift, _live_dd)
                 _adherent = 0 if _fills_drift.empty else int(_fills_drift["Recommended"].sum())
                 _total_fills = 0 if _fills_drift.empty else len(_fills_drift)
-                print(f"[drift] tracker: NAV samples={int(_live_nav.size)}, "
+                # Surface the NAV source + spread: a series with <2 distinct
+                # values means the tracker is blind (that state went unnoticed
+                # from 26 Jun to 17 Jul). Loud is better than silent.
+                _nav_uniq = int(pd.Series(_live_nav).round(2).nunique()) if _live_nav.size else 0
+                print(f"[drift] tracker: NAV samples={int(_live_nav.size)} "
+                      f"({_nav_uniq} distinct) src={_nav_src}, "
                       f"current DD {_live_dd*100:+.2f}%, "
                       f"fills {_adherent}/{_total_fills} adherent, "
                       f"warnings={_n_warn}")
+                if _live_nav.size >= 2 and _nav_uniq < 2:
+                    print("[drift][WARN] live NAV series is CONSTANT — the drawdown "
+                          "alert cannot fire. NAV source is not tracking the "
+                          "portfolio (check ibkr_nav_log.jsonl / --snapshot-nav).")
             except Exception as _e_drift_v2:
                 print(f"[drift] v2/v3 tracker skipped: {_e_drift_v2}")
 
