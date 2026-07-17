@@ -3,36 +3,42 @@
     "Security": "BEAR.AX",
     "AcqDate": "2026-07-08T00:00:00",
     "Units": 1814,
-    "CostBaseAUD": 7.3934936
+    "CostBaseAUD": 7.3934936,
+    "SeedAsOf": "2026-07-17T12:13:50.219237"
   },
   {
     "Security": "GOLD.AX",
     "AcqDate": "2026-07-08T00:00:00",
     "Units": 374,
-    "CostBaseAUD": 54.71714625
+    "CostBaseAUD": 54.71714625,
+    "SeedAsOf": "2026-07-17T12:13:50.219237"
   },
   {
     "Security": "HBRD.AX",
     "AcqDate": "2026-07-08T00:00:00",
     "Units": 280,
-    "CostBaseAUD": 10.10888785
+    "CostBaseAUD": 10.10888785,
+    "SeedAsOf": "2026-07-17T12:13:50.219237"
   },
   {
     "Security": "SMH",
     "AcqDate": "2026-07-08T00:00:00",
     "Units": 50,
-    "CostBaseAUD": 867.4125297190872
+    "CostBaseAUD": 867.4125297190872,
+    "SeedAsOf": "2026-07-17T12:13:50.219237"
   },
   {
     "Security": "VEA",
     "AcqDate": "2026-07-13T00:00:00",
     "Units": 22,
-    "CostBaseAUD": 100.02006764266012
+    "CostBaseAUD": 100.02006764266012,
+    "SeedAsOf": "2026-07-17T12:13:50.219237"
   },
   {
     "Security": "VLUE.AX",
     "AcqDate": "2026-07-08T00:00:00",
     "Units": 2657,
-    "CostBaseAUD": 37.182692
+    "CostBaseAUD": 37.182692,
+    "SeedAsOf": "2026-07-17T12:13:50.219237"
   }
 ]

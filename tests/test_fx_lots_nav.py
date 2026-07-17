@@ -261,6 +261,127 @@ def test_reconcile_empty_broker_is_noop():
     assert lots.reconcile_lots_vs_broker(book, None, fx_map={}) == []
 
 
+# ============================================================================
+# Seed watershed (SeedAsOf) — stops a back-filled historical fill from being
+# replayed on top of a seed that already reflects it.
+# ============================================================================
+
+def _seed_file(tmp_path, lots_list):
+    p = tmp_path / "lots_seed.json"
+    p.write_text(json.dumps(lots_list), encoding="utf-8")
+    return p
+
+
+def _fill_row(ticker, side, qty, ts, px=10.0):
+    return json.dumps({"ticker": ticker, "side": side, "qty_filled": qty,
+                       "exec_timestamp": ts, "avg_fill_price_local": px,
+                       "rec_px_aud": px}) + "\n"
+
+
+def test_watershed_skips_fill_at_or_before_seed(tmp_path):
+    """THE double-count guard: a 2026-07-08 BUY back-filled into the log must
+    NOT be replayed onto a seed taken 2026-07-17 that already includes it."""
+    seed = _seed_file(tmp_path, [{"Security": "VEA", "AcqDate": "2026-07-08T00:00:00",
+                                  "Units": 22, "CostBaseAUD": 100.0,
+                                  "SeedAsOf": "2026-07-17T12:13:50"}])
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text(_fill_row("VEA", "BUY", 22, "2026-07-08T11:09:11", px=69.88),
+                     encoding="utf-8")
+    out = lots._build_lots_from_fills_log(fills, fx_map={"VEA": 1.4312},
+                                          lot_match_method="FIFO", seed_path=seed)
+    # Seed lot only -- the pre-seed fill was skipped, not stacked on top.
+    assert out["Units"].sum() == 22
+    assert len(out) == 1
+    assert out.attrs["pre_seed_fills_skipped"] == 1
+
+
+def test_watershed_applies_fill_after_seed(tmp_path):
+    """A genuinely new fill after the watershed must still be applied."""
+    seed = _seed_file(tmp_path, [{"Security": "VEA", "AcqDate": "2026-07-08T00:00:00",
+                                  "Units": 22, "CostBaseAUD": 100.0,
+                                  "SeedAsOf": "2026-07-17T12:13:50"}])
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text(_fill_row("VEA", "BUY", 10, "2026-07-20T09:35:00", px=70.0),
+                     encoding="utf-8")
+    out = lots._build_lots_from_fills_log(fills, fx_map={"VEA": 1.4312},
+                                          lot_match_method="FIFO", seed_path=seed)
+    assert out["Units"].sum() == 32  # 22 seed + 10 new
+    assert out.attrs["pre_seed_fills_skipped"] == 0
+
+
+def test_watershed_absent_preserves_legacy_behaviour(tmp_path):
+    """Legacy seeds have no SeedAsOf -> no filtering, exactly as before."""
+    seed = _seed_file(tmp_path, [{"Security": "VEA", "AcqDate": "2026-07-08T00:00:00",
+                                  "Units": 22, "CostBaseAUD": 100.0}])
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text(_fill_row("VEA", "BUY", 22, "2026-07-08T11:09:11", px=69.88),
+                     encoding="utf-8")
+    out = lots._build_lots_from_fills_log(fills, fx_map={"VEA": 1.4312},
+                                          lot_match_method="FIFO", seed_path=seed)
+    assert out["Units"].sum() == 44  # double-counted -- the old behaviour
+    assert out.attrs["seed_as_of"] is None
+
+
+def test_watershed_skips_undated_fill(tmp_path):
+    """A fill with no timestamp can't be placed either side of the watershed;
+    with a seed present it must be dropped, not blindly applied."""
+    seed = _seed_file(tmp_path, [{"Security": "VEA", "AcqDate": "2026-07-08T00:00:00",
+                                  "Units": 22, "CostBaseAUD": 100.0,
+                                  "SeedAsOf": "2026-07-17T12:13:50"}])
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text(json.dumps({"ticker": "VEA", "side": "BUY", "qty_filled": 5,
+                                 "avg_fill_price_local": 70.0}) + "\n", encoding="utf-8")
+    out = lots._build_lots_from_fills_log(fills, fx_map={"VEA": 1.4312},
+                                          lot_match_method="FIFO", seed_path=seed)
+    assert out["Units"].sum() == 22
+    assert out.attrs["pre_seed_fills_skipped"] == 1
+
+
+def test_watershed_sell_after_seed_decrements(tmp_path):
+    """A post-watershed SELL must still decrement the seed lot."""
+    seed = _seed_file(tmp_path, [{"Security": "SOXL", "AcqDate": "2026-07-08T00:00:00",
+                                  "Units": 12, "CostBaseAUD": 197.0,
+                                  "SeedAsOf": "2026-07-17T12:13:50"}])
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text(_fill_row("SOXL", "SELL", 12, "2026-07-21T10:00:00"),
+                     encoding="utf-8")
+    out = lots._build_lots_from_fills_log(fills, fx_map={"SOXL": 1.4312},
+                                          lot_match_method="FIFO", seed_path=seed)
+    assert out.empty or out["Units"].sum() == 0
+
+
+def test_watershed_uses_max_across_seed_lots(tmp_path):
+    seed = _seed_file(tmp_path, [
+        {"Security": "VEA", "AcqDate": "2026-07-08T00:00:00", "Units": 22,
+         "CostBaseAUD": 100.0, "SeedAsOf": "2026-07-15T00:00:00"},
+        {"Security": "SMH", "AcqDate": "2026-07-08T00:00:00", "Units": 50,
+         "CostBaseAUD": 867.0, "SeedAsOf": "2026-07-17T12:13:50"},
+    ])
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text(_fill_row("VEA", "BUY", 5, "2026-07-16T09:00:00", px=70.0),
+                     encoding="utf-8")
+    out = lots._build_lots_from_fills_log(fills, fx_map={"VEA": 1.4312},
+                                          lot_match_method="FIFO", seed_path=seed)
+    # 07-16 is before the LATEST watershed (07-17) -> skipped.
+    assert out.attrs["seed_as_of"] == pd.Timestamp("2026-07-17T12:13:50")
+    assert out["Units"].sum() == 72  # 22 + 50, no new lot
+
+
+def test_watershed_tz_aware_seed_does_not_raise(tmp_path):
+    """SeedAsOf written with a tz offset must not blow up against naive
+    exec_timestamps."""
+    seed = _seed_file(tmp_path, [{"Security": "VEA", "AcqDate": "2026-07-08T00:00:00",
+                                  "Units": 22, "CostBaseAUD": 100.0,
+                                  "SeedAsOf": "2026-07-17T12:13:50+10:00"}])
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text(_fill_row("VEA", "BUY", 22, "2026-07-08T11:09:11", px=69.88),
+                     encoding="utf-8")
+    out = lots._build_lots_from_fills_log(fills, fx_map={"VEA": 1.4312},
+                                          lot_match_method="FIFO", seed_path=seed)
+    assert out["Units"].sum() == 22
+    assert out.attrs["seed_as_of"].tzinfo is None
+
+
 def test_reconcile_units_mismatch_suppresses_cost_warning():
     """One break per ticker: if units disagree, the cost comparison is
     meaningless and must not double-report."""

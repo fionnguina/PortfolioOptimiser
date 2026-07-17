@@ -30,6 +30,31 @@ LOT_RECON_UNIT_TOL = 0.5
 LOT_RECON_COST_BPS_TOL = 50.0
 
 
+def _fill_timestamp(r: dict):
+    """Best-effort tz-naive pd.Timestamp for a fills-log row, or None.
+
+    Mirrors the acquisition-date precedence used when building lots
+    (exec_timestamp, else rec_log_run_at). Naive because the fills log writes
+    naive ISO ("2026-06-22T11:53:24") and the seed watershed is naive too;
+    mixing tz-aware and naive raises on comparison.
+    """
+    ts = r.get("exec_timestamp") or r.get("rec_log_run_at")
+    if not ts:
+        return None
+    try:
+        t = pd.Timestamp(ts)
+    except Exception:
+        return None
+    if t is pd.NaT:
+        return None
+    try:
+        if t.tzinfo is not None:
+            t = t.tz_localize(None)
+    except Exception:
+        return None
+    return t
+
+
 def _normalise_fx_map(fx_map) -> dict:
     """Normalise a ticker -> AUD-rate map (Series, dict, or None) to a plain
     dict, dropping missing/non-positive rates."""
@@ -190,6 +215,21 @@ def _build_lots_from_fills_log(
     replayed on top of the seed, so a sell after the seed correctly
     decrements the seed lot.
 
+    SEED WATERSHED (2026-07-17). Each seed lot may carry `SeedAsOf`, the
+    instant the snapshot was TAKEN. When present, fills at or before it are
+    SKIPPED: the seed already reflects them, so replaying one would
+    double-count. This matters because the seed is broker-derived while the
+    fills log is order-derived — back-filling historical fills into the log
+    (see ibkr_paper_exec.py --check-fills --write) would otherwise corrupt a
+    freshly re-seeded book. `SeedAsOf` is deliberately NOT `AcqDate`: the
+    2026-07-17 re-seed carries AcqDate 2026-07-08 (first broker evidence) yet
+    was taken on 07-17. Absent (legacy seeds) -> no filtering, prior behaviour
+    exactly. It is read but not returned — the Lots schema is fixed and
+    nav.py/cgt.py read the same file.
+
+    Diagnostics on the returned frame's `.attrs` (this module stays
+    print-free): `seed_as_of` and `pre_seed_fills_skipped`.
+
     Cost basis AUD priority per BUY row:
       1. `avg_fill_price_local * fx_map[ticker]` if both present
       2. `rec_px_aud` (the engine's planned AUD price) as fallback
@@ -202,6 +242,15 @@ def _build_lots_from_fills_log(
     p = Path(fills_path) if not hasattr(fills_path, "exists") else fills_path
 
     seed_lots: list[dict] = []
+    # SEED WATERSHED: the instant the seed snapshot was TAKEN. Every fill at or
+    # before it is already baked into the seed's units/cost, so re-applying such
+    # a fill would DOUBLE-COUNT. Note this is NOT AcqDate: the 2026-07-17 re-seed
+    # carries AcqDate 2026-07-08 (first broker evidence) but was taken on 07-17,
+    # so filtering on AcqDate would wrongly re-apply anything in between.
+    # Absent (legacy seeds) -> stays None -> no filtering, i.e. exact prior
+    # behaviour. Kept OUT of the returned frame: the Lots schema is fixed and
+    # nav.py/cgt.py read this same file.
+    seed_as_of = None
     if seed_path is not None:
         sp = Path(seed_path) if not hasattr(seed_path, "exists") else seed_path
         if sp.exists():
@@ -213,6 +262,15 @@ def _build_lots_from_fills_log(
                         cb = float(item.get("CostBaseAUD") or 0)
                         if u <= 0 or cb <= 0:
                             continue
+                        _sao = item.get("SeedAsOf")
+                        if _sao:
+                            # tz-naive throughout: exec_timestamp is naive
+                            # ("2026-06-22T11:53:24"), so a tz-aware watershed
+                            # would raise on comparison.
+                            _t = pd.Timestamp(_sao)
+                            if _t.tzinfo is not None:
+                                _t = _t.tz_localize(None)
+                            seed_as_of = _t if seed_as_of is None else max(seed_as_of, _t)
                         seed_lots.append({
                             "Security": str(item.get("Security", "")).strip(),
                             "AcqDate": pd.Timestamp(item.get("AcqDate")),
@@ -230,6 +288,7 @@ def _build_lots_from_fills_log(
     fx_lookup = _normalise_fx_map(fx_map)
 
     rows = []
+    n_pre_seed = 0
     if p.exists():
         try:
             with open(p, "r", encoding="utf-8") as f:
@@ -244,6 +303,15 @@ def _build_lots_from_fills_log(
                     qf = float(r.get("qty_filled") or 0)
                     if qf <= 0:
                         continue
+                    if seed_as_of is not None:
+                        _ts = _fill_timestamp(r)
+                        # Undated fills can't be placed either side of the
+                        # watershed. Drop them: with a seed present, applying an
+                        # unplaceable fill risks double-counting, and silently
+                        # inflating the book is worse than ignoring one row.
+                        if _ts is None or _ts <= seed_as_of:
+                            n_pre_seed += 1
+                            continue
                     rows.append(r)
         except Exception:
             rows = []
@@ -303,9 +371,14 @@ def _build_lots_from_fills_log(
                 remaining -= take
             lots = [lt for lt in lots if lt["Units"] > 0]
 
-    if not lots:
-        return pd.DataFrame(columns=base_cols)
-    return pd.DataFrame(lots, columns=base_cols)
+    out = pd.DataFrame(lots, columns=base_cols) if lots \
+        else pd.DataFrame(columns=base_cols)
+    # Diagnostics ride on .attrs rather than the frame: the Lots schema is fixed
+    # (nav.py/cgt.py/the Excel sheet all read it) and this module stays
+    # print-free. The engine surfaces these on the [lots] line.
+    out.attrs["seed_as_of"] = seed_as_of
+    out.attrs["pre_seed_fills_skipped"] = n_pre_seed
+    return out
 
 
 def _build_lots_from_holdings(

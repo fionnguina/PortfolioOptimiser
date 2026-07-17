@@ -8181,8 +8181,17 @@ if USE_XLWINGS:
                     seed_path=_seed_path,
                 )
                 _seed_note = " (with seed)" if _seed_path.exists() else ""
+                # Surface the seed watershed: fills at/before the seed snapshot
+                # are already baked into it and get skipped rather than replayed
+                # (which would double-count). Silent when there's nothing to say.
+                _skipped = UPDATED_LOTS.attrs.get("pre_seed_fills_skipped", 0)
+                _as_of = UPDATED_LOTS.attrs.get("seed_as_of")
+                _ws_note = ""
+                if _skipped:
+                    _ws_note = (f", {_skipped} pre-seed fill(s) skipped "
+                                f"(watershed {_as_of})")
                 print(f"[lots] rebuilt from {_fills_path.name}{_seed_note} "
-                      f"({len(UPDATED_LOTS)} lots)")
+                      f"({len(UPDATED_LOTS)} lots{_ws_note})")
 
                 # Reconcile the freshly-rebuilt book against broker truth. The
                 # fills log drops any order still PreSubmitted when

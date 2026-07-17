@@ -339,7 +339,88 @@ def _print_reconciliation(trades: list) -> None:
     print()
 
 
-def _run_check_fills_mode() -> int:
+def _append_backfill_rows(corrections: list, log_path) -> int:
+    """Append corrected rows to the fills log. Append-only: the original rows
+    stay for audit, and because _build_lots_from_fills_log skips qty_filled<=0
+    they contribute nothing, so the appended rows do not duplicate them."""
+    n = 0
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            for c in corrections:
+                f.write(json.dumps(c) + "\n")
+                n += 1
+    except Exception as e:
+        print(f"[check-fills][ERR] back-fill write failed: {e}")
+    return n
+
+
+def _build_backfill_row(row: dict, trade, filled: int, now_status: str,
+                        permid: int) -> dict:
+    """Build a corrected fills-log row from IBKR's live view of `trade`.
+
+    Starts from the original logged row so nothing already captured is lost,
+    then overrides what the original got wrong.
+
+    exec_timestamp is the load-bearing field: it becomes the lot's AcqDate AND
+    is what the seed watershed (lots.py) compares against. It MUST be the real
+    execution time, not 'now' -- stamping now would push a historical fill past
+    the watershed and double-count it against a freshly re-seeded book. IBKR
+    serves execution.time in UTC; the fills log is naive local, so convert
+    rather than mix conventions.
+    """
+    fills = list(getattr(trade, "fills", []) or [])
+    avg_px = None
+    if filled > 0 and fills:
+        try:
+            avg_px = sum(float(fl.execution.price) * float(fl.execution.shares)
+                         for fl in fills) / filled
+        except Exception:
+            avg_px = None
+
+    exec_ts = None
+    try:
+        times = [fl.execution.time for fl in fills if getattr(fl, "execution", None)
+                 and getattr(fl.execution, "time", None)]
+        if times:
+            t = min(times)  # first fill = when the position was acquired
+            if getattr(t, "tzinfo", None) is not None:
+                t = t.astimezone().replace(tzinfo=None)
+            exec_ts = t.isoformat(timespec="seconds")
+    except Exception:
+        exec_ts = None
+
+    fees_local = None
+    if fills:
+        try:
+            _sum, _have = 0.0, False
+            for fl in fills:
+                _cr = getattr(fl, "commissionReport", None)
+                _c = getattr(_cr, "commission", None) if _cr is not None else None
+                if _c is not None:
+                    _sum += float(_c)
+                    _have = True
+            fees_local = _sum if _have else None
+        except Exception:
+            fees_local = None
+
+    out = dict(row)
+    out.update({
+        "qty_filled": int(filled),
+        "status_final": now_status,
+        "avg_fill_price_local": avg_px,
+        "perm_id": permid or row.get("perm_id"),
+        "fees_local": fees_local if fees_local is not None else row.get("fees_local"),
+        # Provenance: this row was reconstructed after the fact, not observed
+        # at submission. Kept so a future reader can tell the two apart.
+        "backfilled_at": datetime.now().isoformat(timespec="seconds"),
+        "backfill_source": "check-fills",
+    })
+    if exec_ts:
+        out["exec_timestamp"] = exec_ts
+    return out
+
+
+def _run_check_fills_mode(write: bool = False) -> int:
     """Re-query IBKR for the current status of orders from the most recent
     batch in ibkr_fills_log.jsonl. Useful for:
       - Overnight US orders that were 'pending' when the original run exited
@@ -514,6 +595,7 @@ def _run_check_fills_mode() -> int:
               f"{'-'*8} {'-'*10} {'-'*10}")
         n_changed = 0
         n_filled_now = 0
+        corrections: list[dict] = []
         for row in batch:
             oid = int(row["order_id"])
             logged_status = row.get("status_final") or row.get("status") or "?"
@@ -557,6 +639,19 @@ def _run_check_fills_mode() -> int:
                 print(f"  {row['ticker']:<12} {oid:>7} {permid:>11} "
                       f"{logged_status:<18} {now_status:<18} "
                       f"{filled:>8} {avg_px_str} {match_method:<10}")
+
+                # BACK-FILL CANDIDATE. Narrow by design: only when the log says
+                # NOTHING filled but IBKR says otherwise. That is exactly the
+                # 2026-07-08 SOXL/VEA bug (script exited while PreSubmitted, so
+                # the row froze at qty_filled=0) and the narrowness is what
+                # makes appending safe -- _build_lots_from_fills_log skips rows
+                # with qty_filled <= 0, so the stale row contributes nothing and
+                # the appended row is not a duplicate. Never touch a row that
+                # already claims a fill; correcting THAT needs supersede
+                # semantics the log does not have.
+                if float(row.get("qty_filled") or 0) <= 0 and filled > 0:
+                    corrections.append(_build_backfill_row(row, trade, filled,
+                                                           now_status, permid))
             except Exception as e:
                 print(f"  {row['ticker']:<12} {oid:>7} (read failed: {e})")
         print(f"  {'-'*12} {'-'*7} {'-'*11} {'-'*18} {'-'*18} "
@@ -564,13 +659,36 @@ def _run_check_fills_mode() -> int:
         print()
         print(f"  Status changed since log:  {n_changed:>3}")
         print(f"  Filled now (truth):        {n_filled_now:>3}")
+        print(f"  Missing from fills log:    {len(corrections):>3}")
         print()
+
+        if corrections:
+            print("  These orders FILLED but the log records qty_filled=0:")
+            for c in corrections:
+                print(f"    {c['ticker']:<12} {c['side']:<5} "
+                      f"{c['qty_filled']:>6} @ {c.get('avg_fill_price_local')} "
+                      f"exec={c.get('exec_timestamp')}")
+            if write:
+                n = _append_backfill_rows(corrections, fills_path)
+                print(f"\n  [check-fills] BACK-FILLED {n} corrected row(s) -> "
+                      f"{fills_path.name}")
+                print("  [check-fills] NOTE: if a seed with SeedAsOf covers these "
+                      "fills, lots.py will\n"
+                      "                skip replaying them — the seed already "
+                      "includes them. That is correct.")
+            else:
+                print("\n  [check-fills] NOT written (read-only). Re-run with "
+                      "--write to back-fill them.")
     finally:
         if ib.isConnected():
             ib.disconnect()
 
     print("=" * 96)
-    print("CHECK-FILLS COMPLETE — read-only, no orders placed.")
+    if write:
+        print("CHECK-FILLS COMPLETE — no orders placed; fills log may have been "
+              "back-filled.")
+    else:
+        print("CHECK-FILLS COMPLETE — read-only, no orders placed.")
     print("=" * 96)
     return 0
 
@@ -856,6 +974,17 @@ def main() -> int:
                              "exited (e.g. US orders waiting for overnight US open) "
                              "or to diagnose Cancelled-with-permId=0 rows. Read-only "
                              "— never calls placeOrder.")
+    parser.add_argument("--write", action="store_true",
+                        help="With --check-fills: back-fill the fills log with any "
+                             "order IBKR reports as filled while the log still says "
+                             "qty_filled=0 (the 2026-07-08 SOXL/VEA bug — the exec "
+                             "script exited while the order was PreSubmitted and froze "
+                             "that status). Appends corrected rows stamped with the "
+                             "REAL execution time; originals are kept for audit and "
+                             "contribute nothing (lots.py skips qty_filled<=0). Only "
+                             "recovers what TWS can still see — it serves NO historical "
+                             "executions, so run it the same session/day. Never calls "
+                             "placeOrder.")
     parser.add_argument("--wait-for-funds", type=int, default=0, metavar="SECONDS",
                         help="After submitting sells and whatever buys fit current "
                              "AvailableFunds, poll every 60s for sell proceeds and "
@@ -890,7 +1019,7 @@ def main() -> int:
     # === --check-fills mode: read-only status query for previous orders ===
     # No rec log needed, no orders placed. Returns 0 on success.
     if args.check_fills:
-        return _run_check_fills_mode()
+        return _run_check_fills_mode(write=bool(args.write))
 
     # === --snapshot-nav mode: read-only broker NAV logging ===
     if args.snapshot_nav:
