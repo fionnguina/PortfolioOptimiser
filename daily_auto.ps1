@@ -55,14 +55,32 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # scripts (e.g. ibkr_paper_exec.py --snapshot-nav) don't hit PermissionError.
 Set-Location -LiteralPath $ScriptDir
 $ExePath = Join-Path $ScriptDir "dist\Portfolio Optimiser.exe"
-$PptPath = Join-Path $ScriptDir "dist\Reports\Portfolio_Report.pptx"
+# Repo root, NOT dist\ — the engine's APP_DIR resolves to the repo root even when
+# frozen (_DEV_BASE at Portfolio_Optimiser.py:534 always exists on this machine),
+# so EXPORT_DIR is <repo>\Reports. dist\Reports has never existed; this path
+# silently failed Test-Path, so the deck never auto-opened on a RUN.
+$PptPath = Join-Path $ScriptDir "Reports\Portfolio_Report.pptx"
 if (-not $LogPath) {
     $LogPath = Join-Path $ScriptDir "dist\run.log"
 }
 # Repo root, NOT dist\ — build_helper wipes dist on every rebuild, which was
 # silently destroying the wrapper's evidence trail (discovered 2026-07-06).
 $DailyLogPath = Join-Path $ScriptDir "daily_auto.log"
-$FlagPath = Join-Path $ScriptDir "dist\engine_done.flag"
+# TWO sentinel writers disagree on location (discovered 2026-07-17), so we must
+# check BOTH or we go blind to one outcome:
+#   - clean finish -> Portfolio_Optimiser.py:8878 writes APP_DIR\engine_done.flag.
+#     APP_DIR resolves to the REPO ROOT even when frozen, because _DEV_BASE
+#     (Portfolio_Optimiser.py:534 = ~\Portfolio_Optimiser) always exists here and
+#     short-circuits the frozen branch.
+#   - sanity halt -> Main.py:162-165 writes dist\engine_done.flag (frozen-aware).
+# This file previously pointed at dist\ ONLY: HALT was detected, but a clean run
+# never was — so every good run logged "engine may have crashed", which made a
+# real crash indistinguishable from success. Checking only the repo root would
+# invert the bug and lose HALT detection, which is worse.
+$FlagPaths = @(
+    (Join-Path $ScriptDir "engine_done.flag"),
+    (Join-Path $ScriptDir "dist\engine_done.flag")
+)
 # 1200s: the full pipeline with SCALE_SENSITIVITY (multi-scale OOS) exceeds
 # 10min, which timed out + killed the 2026-07-09 graduation run mid-backtest.
 $EngineTimeoutSec = 1200
@@ -268,8 +286,11 @@ try {
 # timeout we still proceed — partial-log verdict is more useful than a
 # silently-hung wrapper.
 
-# Pre-emptively clear any stale sentinel from a prior run.
-if (Test-Path $FlagPath) { Remove-Item $FlagPath -Force -ErrorAction SilentlyContinue }
+# Pre-emptively clear any stale sentinel from a prior run — both writers'
+# locations, or a leftover halt flag would masquerade as this run's outcome.
+foreach ($fp in $FlagPaths) {
+    if (Test-Path $fp) { Remove-Item $fp -Force -ErrorAction SilentlyContinue }
+}
 
 $EngineStart = Get-Date
 try {
@@ -304,14 +325,16 @@ $deadline = $EngineStart.AddSeconds($EngineTimeoutSec)
 $engineExit = $null
 $sentinelHit = $false
 while ((Get-Date) -lt $deadline) {
-    # Channel 1: sentinel
-    if (Test-Path $FlagPath) {
-        $flagMtime = (Get-Item $FlagPath).LastWriteTime
-        if ($flagMtime -ge $EngineStart) {
-            $sentinelHit = $true
-            break
+    # Channel 1: sentinel (either writer's location — see $FlagPaths)
+    foreach ($fp in $FlagPaths) {
+        if (Test-Path $fp) {
+            if ((Get-Item $fp).LastWriteTime -ge $EngineStart) {
+                $sentinelHit = $true
+                break
+            }
         }
     }
+    if ($sentinelHit) { break }
     # Channel 2: process exit
     if ($engineProc.HasExited) {
         $engineExit = $engineProc.ExitCode
@@ -357,9 +380,23 @@ if ($sentinelHit -and $engineExit -ne $null) {
 # as just a log-parse failure.
 $engineHalted = $false
 $haltReason = ""
-if (Test-Path $FlagPath) {
+# Pick the freshest sentinel from THIS run across both writer locations. The
+# mtime guard matters: without it a stale halt flag from an earlier run would
+# pin every subsequent run to HALTED forever.
+$FreshFlag = $null
+foreach ($fp in $FlagPaths) {
+    if (Test-Path $fp) {
+        $mt = (Get-Item $fp).LastWriteTime
+        if ($mt -ge $EngineStart) {
+            if ((-not $FreshFlag) -or ($mt -gt (Get-Item $FreshFlag).LastWriteTime)) {
+                $FreshFlag = $fp
+            }
+        }
+    }
+}
+if ($FreshFlag) {
     try {
-        $flagJson = Get-Content -Path $FlagPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $flagJson = Get-Content -Path $FreshFlag -Raw -ErrorAction Stop | ConvertFrom-Json
         if ($flagJson.status -eq "halted_by_sanity_violation") {
             $engineHalted = $true
             $haltReason = $flagJson.reason
@@ -523,6 +560,14 @@ switch ($verdict) {
     "HALTED" {
         $mailSubject = "[Portfolio Optimiser] HALTED - sanity violation"
         $mailBody = "ENGINE HALTED BY SANITY LAYER.`nReason: $haltReason`n`nDO NOT execute any pending trade plan. Investigate state (sanity_alerts.jsonl) before re-running."
+    }
+    "UNKNOWN" {
+        # No [rebal-trigger] line reached the log = the engine died before it
+        # could form a verdict (e.g. 2026-07-13, exit=1 after 5.1s). Previously
+        # this fired a desk toast ONLY, so an unattended crash was silent. SKIP
+        # is still deliberately excluded from mail — it is the ~9-in-10 no-op.
+        $mailSubject = "[Portfolio Optimiser] NO VERDICT - engine may have failed"
+        $mailBody = "The engine produced no [rebal-trigger] verdict, so it likely crashed before completing.`nExit code: $engineExit`nSentinel seen: $sentinelHit`nRuntime: $($EngineDuration.TotalSeconds.ToString('F1'))s`n`nNo trade plan should be considered current. Check dist\run.log + daily_auto.log.$simSuffix"
     }
 }
 if ($mailSubject) {

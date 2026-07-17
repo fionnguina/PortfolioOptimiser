@@ -149,6 +149,61 @@ def _load_broker_nav_series(path=None) -> pd.Series:
     return pd.Series(vals).sort_index()
 
 
+def load_broker_positions(path=None) -> dict:
+    """Broker-truth positions from the MOST RECENT snapshot in ibkr_nav_log.jsonl.
+
+    Returns {ticker: {"units": float, "avg_cost_local": float|None,
+                      "currency": str|None}}, plus a "_ts" key holding the
+    snapshot timestamp. Empty dict if there is no log or no usable row.
+
+    Unlike _load_broker_nav_series (which builds a per-day SERIES), this wants
+    a single point-in-time picture, so the LAST parseable row with a positions
+    array wins outright.
+
+    `avg_cost_local` is per-share in the instrument's trading currency and is
+    absent on rows written before 2026-07-17 (the field was added when we
+    discovered the fills log had missed real executions) -> None for those.
+    """
+    p = Path(path) if path is not None else (APP_DIR / "ibkr_nav_log.jsonl")
+    if not p.exists():
+        return {}
+    latest = None
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(r.get("positions"), list):
+                    latest = r  # later rows overwrite = most recent wins
+    except Exception:
+        return {}
+    if latest is None:
+        return {}
+
+    out: dict = {}
+    for item in latest.get("positions") or []:
+        try:
+            tkr = str(item.get("ticker", "")).strip().upper()
+            if not tkr:
+                continue
+            acl = item.get("avg_cost_local")
+            out[tkr] = {
+                "units": float(item.get("units") or 0.0),
+                "avg_cost_local": (float(acl) if acl is not None else None),
+                "currency": item.get("currency"),
+            }
+        except Exception:
+            continue
+    if out:
+        out["_ts"] = latest.get("ts")
+    return out
+
+
 def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
                                       broker_nav_path=None) -> pd.Series:
     """Actual-NAV path: fills-log reconstruction, upgraded to BROKER truth

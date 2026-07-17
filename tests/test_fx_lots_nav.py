@@ -140,3 +140,132 @@ def test_spliced_nav_returns_recon_when_broker_sparse(tmp_path):
     recon = nav.compute_actual_nav_series(prices, fills, seed)
     spliced = nav.compute_actual_nav_series_spliced(prices, fills, seed, broker_nav_path=broker)
     pd.testing.assert_series_equal(spliced, recon)
+
+
+# ============================================================================
+# nav.load_broker_positions + lots.reconcile_lots_vs_broker
+#
+# Regression cover for the 2026-07-08 SOXL/VEA miss: ibkr_paper_exec.py exited
+# while both orders were PreSubmitted, so the fills log froze them at
+# qty_filled=0 and the lot book kept SOXL / never acquired VEA.
+# ============================================================================
+
+def _nav_row(ts, positions, netliq=244439.66):
+    return json.dumps({"ts": ts, "net_liquidation_aud": netliq,
+                       "positions": positions}) + "\n"
+
+
+def test_load_broker_positions_latest_row_wins(tmp_path):
+    p = tmp_path / "ibkr_nav_log.jsonl"
+    p.write_text(
+        _nav_row("2026-07-08T11:09:11", [{"ticker": "SOXL", "units": 12.0,
+                                          "avg_cost_local": 197.0, "currency": "USD"}])
+        + _nav_row("2026-07-17T09:32:54", [{"ticker": "VEA", "units": 22.0,
+                                            "avg_cost_local": 69.885459, "currency": "USD"}]),
+        encoding="utf-8")
+    out = nav.load_broker_positions(p)
+    # Most recent snapshot wins outright (point-in-time, not a per-day series).
+    assert "SOXL" not in out
+    assert out["VEA"]["units"] == pytest.approx(22.0)
+    assert out["VEA"]["avg_cost_local"] == pytest.approx(69.885459)
+    assert out["_ts"] == "2026-07-17T09:32:54"
+
+
+def test_load_broker_positions_missing_avg_cost_is_none(tmp_path):
+    """Rows written before 2026-07-17 have no avg_cost_local field."""
+    p = tmp_path / "ibkr_nav_log.jsonl"
+    p.write_text(_nav_row("2026-07-08T11:09:11",
+                          [{"ticker": "SMH", "units": 50.0}]), encoding="utf-8")
+    out = nav.load_broker_positions(p)
+    assert out["SMH"]["avg_cost_local"] is None
+    assert out["SMH"]["units"] == pytest.approx(50.0)
+
+
+def test_load_broker_positions_missing_file_returns_empty(tmp_path):
+    assert nav.load_broker_positions(tmp_path / "nope.jsonl") == {}
+
+
+def test_load_broker_positions_ignores_rows_without_positions(tmp_path):
+    p = tmp_path / "ibkr_nav_log.jsonl"
+    p.write_text(
+        _nav_row("2026-07-08T11:09:11", [{"ticker": "VEA", "units": 22.0,
+                                          "avg_cost_local": 69.88, "currency": "USD"}])
+        + json.dumps({"ts": "2026-07-09T09:30:00", "net_liquidation_aud": 250000.0}) + "\n",
+        encoding="utf-8")
+    out = nav.load_broker_positions(p)
+    assert out["VEA"]["units"] == pytest.approx(22.0)  # NAV-only row didn't clobber
+
+
+def _book(rows):
+    return pd.DataFrame(rows, columns=["Security", "AcqDate", "Units", "CostBaseAUD"])
+
+
+def test_reconcile_clean_book_no_warnings():
+    book = _book([["VLUE.AX", pd.Timestamp("2026-06-01"), 2657, 37.182692]])
+    broker = {"VLUE.AX": {"units": 2657.0, "avg_cost_local": 37.182692,
+                          "currency": "AUD"}, "_ts": "2026-07-17T09:32:54"}
+    assert lots.reconcile_lots_vs_broker(book, broker, fx_map={}) == []
+
+
+def test_reconcile_catches_the_soxl_vea_miss():
+    """THE regression case: a qty_filled=0 SELL leaves SOXL in the book, and a
+    qty_filled=0 BUY means VEA never enters it."""
+    book = _book([["SOXL", pd.Timestamp("2026-06-01"), 12, 197.0]])
+    broker = {"VEA": {"units": 22.0, "avg_cost_local": 69.885459, "currency": "USD"},
+              "_ts": "2026-07-17T09:32:54"}
+    warns = lots.reconcile_lots_vs_broker(book, broker, fx_map={"VEA": 1.55})
+    joined = " | ".join(warns)
+    assert len(warns) == 2
+    assert "SOXL" in joined and "12" in joined   # book holds what broker sold
+    assert "VEA" in joined and "22" in joined    # broker holds what book missed
+
+
+def test_reconcile_converts_usd_avg_cost_with_same_fx_map():
+    """A US ticker must NOT warn just because the broker quotes USD and the
+    lot book stores AUD."""
+    fx = 1.55
+    book = _book([["SMH", pd.Timestamp("2026-06-01"), 50, 606.073604 * fx]])
+    broker = {"SMH": {"units": 50.0, "avg_cost_local": 606.073604, "currency": "USD"}}
+    assert lots.reconcile_lots_vs_broker(book, broker, fx_map={"SMH": fx}) == []
+
+
+def test_reconcile_flags_cost_basis_divergence():
+    fx = 1.55
+    book = _book([["SMH", pd.Timestamp("2026-06-01"), 50, 606.073604 * fx * 1.02]])
+    broker = {"SMH": {"units": 50.0, "avg_cost_local": 606.073604, "currency": "USD"}}
+    warns = lots.reconcile_lots_vs_broker(book, broker, fx_map={"SMH": fx})
+    assert len(warns) == 1
+    assert "avg cost" in warns[0] and "+200bps" in warns[0]
+
+
+def test_reconcile_units_weighted_average_across_lots():
+    """Two lots of the same ticker average by units, not naively."""
+    book = _book([["IVV.AX", pd.Timestamp("2026-05-01"), 100, 40.0],
+                  ["IVV.AX", pd.Timestamp("2026-06-01"), 300, 60.0]])
+    # units-weighted = (100*40 + 300*60) / 400 = 55.0; naive mean would be 50.0
+    broker = {"IVV.AX": {"units": 400.0, "avg_cost_local": 55.0, "currency": "AUD"}}
+    assert lots.reconcile_lots_vs_broker(book, broker, fx_map={}) == []
+
+
+def test_reconcile_skips_cost_when_avg_cost_absent():
+    """Pre-2026-07-17 snapshots have no avg_cost_local — units still checked,
+    cost silently skipped rather than warned on."""
+    book = _book([["VLUE.AX", pd.Timestamp("2026-06-01"), 2657, 99.0]])
+    broker = {"VLUE.AX": {"units": 2657.0, "avg_cost_local": None, "currency": "AUD"}}
+    assert lots.reconcile_lots_vs_broker(book, broker, fx_map={}) == []
+
+
+def test_reconcile_empty_broker_is_noop():
+    book = _book([["VLUE.AX", pd.Timestamp("2026-06-01"), 2657, 37.18]])
+    assert lots.reconcile_lots_vs_broker(book, {}, fx_map={}) == []
+    assert lots.reconcile_lots_vs_broker(book, None, fx_map={}) == []
+
+
+def test_reconcile_units_mismatch_suppresses_cost_warning():
+    """One break per ticker: if units disagree, the cost comparison is
+    meaningless and must not double-report."""
+    book = _book([["SMH", pd.Timestamp("2026-06-01"), 10, 1.0]])
+    broker = {"SMH": {"units": 50.0, "avg_cost_local": 606.07, "currency": "USD"}}
+    warns = lots.reconcile_lots_vs_broker(book, broker, fx_map={"SMH": 1.55})
+    assert len(warns) == 1
+    assert "units" in warns[0]

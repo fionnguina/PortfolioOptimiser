@@ -21,6 +21,112 @@ import pandas as pd
 # expand_with_lots matches sells to lots using cgt's trade-frame helpers.
 from cgt import _trade_delta_col, _security_from_row
 
+# --- lot-book vs broker reconciliation thresholds -------------------------
+# Units are whole shares, so anything above half a share is a real break, not
+# rounding. 50bps on average cost is deliberately loose: the lot book converts
+# each fill at its fx_map rate, so small FX/rounding differences are expected
+# and we only want to hear about genuine cost-basis corruption.
+LOT_RECON_UNIT_TOL = 0.5
+LOT_RECON_COST_BPS_TOL = 50.0
+
+
+def _normalise_fx_map(fx_map) -> dict:
+    """Normalise a ticker -> AUD-rate map (Series, dict, or None) to a plain
+    dict, dropping missing/non-positive rates."""
+    if isinstance(fx_map, pd.Series):
+        return {str(k).strip(): float(v) for k, v in fx_map.items()
+                if pd.notna(v) and float(v) > 0}
+    if isinstance(fx_map, dict):
+        return {str(k).strip(): float(v) for k, v in fx_map.items()
+                if v is not None and float(v) > 0}
+    return {}
+
+
+def reconcile_lots_vs_broker(lots_df, broker_positions, fx_map=None, *,
+                             unit_tol: float = LOT_RECON_UNIT_TOL,
+                             cost_bps_tol: float = LOT_RECON_COST_BPS_TOL) -> list:
+    """Compare the rebuilt lot book against broker-truth positions.
+
+    Returns a list of human-readable warning strings; empty means reconciled.
+    Pure — prints nothing, raises nothing.
+
+    WHY THIS EXISTS: the lot book is rebuilt from ibkr_fills_log.jsonl on every
+    run, and _build_lots_from_fills_log only counts rows with qty_filled > 0.
+    When ibkr_paper_exec.py exits while an order is still PreSubmitted, the row
+    freezes at qty_filled=0 and a REAL fill is silently dropped — the lot book
+    then keeps a position that was sold and misses one that was bought, so the
+    CGT cost bases are wrong and the 6W cadence anchor never sees the fill.
+    That is precisely what happened to the 2026-07-08 SOXL/VEA pair. TWS serves
+    no historical executions (reqExecutions returns 0 even with a 30d filter,
+    verified 2026-07-17), so the broker's avg_cost_local is the ONLY after-the-
+    fact cost anchor available — hence checking against it every run.
+
+    Units are compared first and directly: that is currency-free and catches a
+    missed fill outright. Average cost is compared in AUD, converting the
+    broker's LOCAL-currency avg_cost_local with the SAME fx_map used to build
+    the lot book — so an FX error cancels on both sides instead of firing false
+    warnings on every US ticker.
+    """
+    warnings: list = []
+    if not broker_positions:
+        return warnings
+
+    fx_lookup = _normalise_fx_map(fx_map)
+    # "_ts" and any future metadata keys are not tickers.
+    broker = {str(k).strip().upper(): v
+              for k, v in broker_positions.items()
+              if not str(k).startswith("_") and isinstance(v, dict)}
+
+    lot_units: dict = {}
+    lot_avg: dict = {}
+    if lots_df is not None and len(lots_df) > 0:
+        df = lots_df.copy()
+        df["Security"] = df["Security"].astype(str).str.strip().str.upper()
+        df["Units"] = pd.to_numeric(df["Units"], errors="coerce").fillna(0.0)
+        df["CostBaseAUD"] = pd.to_numeric(df["CostBaseAUD"], errors="coerce")
+        for sec, g in df.groupby("Security"):
+            lot_units[sec] = float(g["Units"].sum())
+            # CostBaseAUD is PER UNIT (see _build_lots_from_fills_log), so the
+            # book-level average is units-weighted across that ticker's lots.
+            valid = g[g["CostBaseAUD"].notna() & (g["Units"] > 0)]
+            tot = float(valid["Units"].sum())
+            if tot > 0:
+                lot_avg[sec] = float(
+                    (valid["Units"] * valid["CostBaseAUD"]).sum() / tot)
+
+    for tkr in sorted(set(lot_units) | set(broker)):
+        b = broker.get(tkr)
+        b_units = float(b.get("units") or 0.0) if b else 0.0
+        l_units = float(lot_units.get(tkr, 0.0))
+
+        if abs(l_units - b_units) > unit_tol:
+            warnings.append(
+                f"{tkr}: lot book has {l_units:g} units, broker has {b_units:g} "
+                f"— a fill the log missed (qty_filled=0) is the usual cause")
+            # Cost basis is meaningless while the units disagree.
+            continue
+
+        if b is None:
+            continue
+        b_avg_local = b.get("avg_cost_local")
+        l_avg_aud = lot_avg.get(tkr)
+        # avg_cost_local is absent on rows written before 2026-07-17.
+        if b_avg_local is None or l_avg_aud is None or b_units <= 0:
+            continue
+        fx = fx_lookup.get(tkr, 1.0 if tkr.endswith(".AX") else None)
+        if not fx or fx <= 0:
+            continue
+        b_avg_aud = float(b_avg_local) * float(fx)
+        if b_avg_aud <= 0:
+            continue
+        bps = (l_avg_aud - b_avg_aud) / b_avg_aud * 1e4
+        if abs(bps) > cost_bps_tol:
+            warnings.append(
+                f"{tkr}: lot-book avg cost A${l_avg_aud:,.4f} vs broker "
+                f"A${b_avg_aud:,.4f} ({bps:+.0f}bps) — CGT cost base may be wrong")
+
+    return warnings
+
 
 def _read_lots_from_path(xl_path, sheet="Lots") -> pd.DataFrame:
     """
@@ -121,14 +227,7 @@ def _build_lots_from_fills_log(
     if not p.exists() and not seed_lots:
         return pd.DataFrame(columns=base_cols)
 
-    if isinstance(fx_map, pd.Series):
-        fx_lookup = {str(k).strip(): float(v) for k, v in fx_map.items()
-                     if pd.notna(v) and float(v) > 0}
-    elif isinstance(fx_map, dict):
-        fx_lookup = {str(k).strip(): float(v) for k, v in fx_map.items()
-                     if v is not None and float(v) > 0}
-    else:
-        fx_lookup = {}
+    fx_lookup = _normalise_fx_map(fx_map)
 
     rows = []
     if p.exists():

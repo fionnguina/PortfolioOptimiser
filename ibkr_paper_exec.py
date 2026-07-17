@@ -616,11 +616,27 @@ def _run_snapshot_nav_mode() -> int:
             if (str(getattr(c, "currency", "")).upper() == "AUD"
                     or str(getattr(c, "primaryExchange", "")).upper() == "ASX"):
                 sym = f"{sym}.AX"
+            # avg_cost_local is BROKER-TRUTH cost basis, per share, in the
+            # instrument's trading currency (same units as mark_local). It is
+            # the only cost-basis anchor the API will give us after the fact:
+            # TWS serves NO historical executions (verified 2026-07-17 —
+            # reqExecutions returns 0 even with a 30d ExecutionFilter), so once
+            # the session that placed an order ends, its fills are gone. When
+            # ibkr_fills_log.jsonl misses a fill (as it did for the 2026-07-08
+            # SOXL/VEA pair), this is what catches the resulting lot-book drift.
+            # Verified exact: units * (mark_local - avg_cost_local) reproduces
+            # unrealized_pnl to the cent for every position.
+            try:
+                avg_cost_local = float(p.averageCost)
+            except (TypeError, ValueError):
+                avg_cost_local = None
             positions.append({
                 "ticker": sym, "units": float(p.position),
                 "mark_local": float(p.marketPrice),
                 "mkt_value_base": float(p.marketValue),
                 "unrealized_pnl": float(p.unrealizedPNL),
+                "avg_cost_local": avg_cost_local,
+                "currency": str(getattr(c, "currency", "") or "").upper() or None,
             })
     finally:
         ib.disconnect()

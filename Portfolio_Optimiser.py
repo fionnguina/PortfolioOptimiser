@@ -164,6 +164,7 @@ from lots import (
     _build_lots_from_fills_log,
     _build_lots_from_holdings,
     expand_with_lots,
+    reconcile_lots_vs_broker,
 )
 
 # Actual (broker-truth) NAV series (module split #18, 2026-07-09). Engine syncs
@@ -8182,6 +8183,32 @@ if USE_XLWINGS:
                 _seed_note = " (with seed)" if _seed_path.exists() else ""
                 print(f"[lots] rebuilt from {_fills_path.name}{_seed_note} "
                       f"({len(UPDATED_LOTS)} lots)")
+
+                # Reconcile the freshly-rebuilt book against broker truth. The
+                # fills log drops any order still PreSubmitted when
+                # ibkr_paper_exec.py exits (qty_filled=0), which silently
+                # corrupts cost bases — the 2026-07-08 SOXL/VEA pair did exactly
+                # this and went unnoticed for 9 days. avg_cost_local is the only
+                # after-the-fact anchor: TWS serves no historical executions.
+                # WARN, not HALT: this is a data-quality signal like the drift
+                # tracker's, not a structurally-absurd trade plan.
+                try:
+                    _broker_pos = _nav.load_broker_positions()
+                    if _broker_pos:
+                        _lot_warns = reconcile_lots_vs_broker(
+                            UPDATED_LOTS, _broker_pos, fx_map=fx_map_all)
+                        for _w in _lot_warns:
+                            print(f"[lots][WARN] {_w}")
+                        _n_pos = sum(1 for _k in _broker_pos if not _k.startswith("_"))
+                        print(f"[lots] broker reconciliation: "
+                              f"{_n_pos} position(s) checked vs snapshot "
+                              f"{_broker_pos.get('_ts', '?')}, {len(_lot_warns)} warning(s)")
+                    else:
+                        print("[lots] broker reconciliation skipped — no positions "
+                              "in ibkr_nav_log.jsonl")
+                except Exception as _e_recon:
+                    # Never let a reconciliation read break the run.
+                    print(f"[lots][WARN] broker reconciliation failed: {_e_recon}")
 
             sht_lots = get_or_clear_sheet(wb, 'Lots')
             sht_lots.range("A1").value = [["Security","AcqDate","Units","CostBaseAUD"]]
