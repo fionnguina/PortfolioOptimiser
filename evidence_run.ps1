@@ -23,7 +23,17 @@
 $ErrorActionPreference = "Continue"
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ExePath    = Join-Path $ScriptDir "dist\Portfolio Optimiser.exe"
-$FlagPath   = Join-Path $ScriptDir "dist\engine_done.flag"
+# Both sentinel locations, mirroring daily_auto.ps1's $FlagPaths (2026-07-18):
+# a CLEAN finish writes APP_DIR\engine_done.flag = the REPO ROOT (APP_DIR's
+# _DEV_BASE short-circuits the frozen branch), while a sanity HALT writes
+# dist\engine_done.flag. Polling dist\ only meant this wrapper's sentinel never
+# fired on a clean run and it silently fell back to WaitForExit alone (documented
+# hang-prone under scheduled-task conditions), and its log always read
+# sentinel=False even on success.
+$FlagPaths  = @(
+    (Join-Path $ScriptDir "engine_done.flag"),
+    (Join-Path $ScriptDir "dist\engine_done.flag")
+)
 $LogPath    = Join-Path $ScriptDir "evidence_run.log"
 $TimeoutSec = 2400   # 40min — generous; the sweep runs ~25min and nothing waits
 
@@ -40,7 +50,9 @@ if (-not (Test-Path $ExePath)) {
 }
 
 Write-Log "Starting evening evidence run (SCALE_SENSITIVITY=1)."
-if (Test-Path $FlagPath) { Remove-Item $FlagPath -Force -ErrorAction SilentlyContinue }
+foreach ($fp in $FlagPaths) {
+    if (Test-Path $fp) { Remove-Item $fp -Force -ErrorAction SilentlyContinue }
+}
 
 $start = Get-Date
 try {
@@ -61,7 +73,10 @@ Write-Log "Engine launched (PID=$($proc.Id)); awaiting sentinel or exit (timeout
 $deadline = $start.AddSeconds($TimeoutSec)
 $sentinel = $false
 while ((Get-Date) -lt $deadline) {
-    if ((Test-Path $FlagPath) -and ((Get-Item $FlagPath).LastWriteTime -ge $start)) { $sentinel = $true; break }
+    foreach ($fp in $FlagPaths) {
+        if ((Test-Path $fp) -and ((Get-Item $fp).LastWriteTime -ge $start)) { $sentinel = $true; break }
+    }
+    if ($sentinel) { break }
     if ($proc.HasExited) { break }
     Start-Sleep -Seconds 5
 }

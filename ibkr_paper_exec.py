@@ -420,6 +420,34 @@ def _build_backfill_row(row: dict, trade, filled: int, now_status: str,
     return out
 
 
+def _plan_check_fills_batch(rows: list) -> tuple:
+    """Pure planning step for --check-fills. From all fills-log rows, return
+    (latest_ts, batch, already_backfilled).
+
+    - batch = the most recent SUBMISSION batch. Back-fill correction rows
+      (stamped backfill_source) are EXCLUDED from batch selection: their
+      exec_timestamp is the real historical fill time, which can post-date the
+      submission and would otherwise collapse the batch to a single correction
+      row, dropping every other outstanding order from the check.
+    - already_backfilled = identity set (ticker, side, qty_requested) of orders
+      that already have a correction row, so a second --write never appends a
+      duplicate (the original qty_filled=0 row stays for audit).
+
+    No IB, no I/O — unit-testable.
+    """
+    submission_rows = [r for r in rows if not r.get("backfill_source")]
+    if not submission_rows:
+        return (None, [], set())
+    latest_ts = max(r["exec_timestamp"] for r in submission_rows)
+    batch = [r for r in submission_rows if r["exec_timestamp"] == latest_ts]
+    already_backfilled = {
+        (str(r.get("ticker")), str(r.get("side")).upper(),
+         int(float(r.get("qty_requested") or 0)))
+        for r in rows if r.get("backfill_source")
+    }
+    return (latest_ts, batch, already_backfilled)
+
+
 def _run_check_fills_mode(write: bool = False) -> int:
     """Re-query IBKR for the current status of orders from the most recent
     batch in ibkr_fills_log.jsonl. Useful for:
@@ -447,9 +475,17 @@ def _run_check_fills_mode(write: bool = False) -> int:
         print(f"[check-fills] {fills_path} is empty.")
         return 0
 
-    # Most recent batch = highest exec_timestamp value
-    latest_ts = max(r["exec_timestamp"] for r in rows)
-    batch = [r for r in rows if r["exec_timestamp"] == latest_ts]
+    # Most recent batch = highest exec_timestamp value AMONG SUBMISSION ROWS.
+    # Back-fill rows (written by --write) carry the REAL historical fill time in
+    # exec_timestamp (lots.py needs it for AcqDate), which can post-date the
+    # submission and, if included here, would collapse "the latest batch" to the
+    # single correction row — silently dropping every other outstanding order
+    # from the check. Corrections are not submissions; exclude them from batch
+    # selection. (Identified by the backfill_source stamp _build_backfill_row adds.)
+    latest_ts, batch, _already_backfilled = _plan_check_fills_batch(rows)
+    if not batch:
+        print(f"[check-fills] {fills_path} has only back-fill rows, no submissions to check.")
+        return 0
     print(f"[check-fills] checking {len(batch)} order(s) from batch "
           f"exec_timestamp={latest_ts}")
 
@@ -650,8 +686,16 @@ def _run_check_fills_mode(write: bool = False) -> int:
                 # already claims a fill; correcting THAT needs supersede
                 # semantics the log does not have.
                 if float(row.get("qty_filled") or 0) <= 0 and filled > 0:
-                    corrections.append(_build_backfill_row(row, trade, filled,
-                                                           now_status, permid))
+                    _ident = (str(row.get("ticker")), str(row.get("side")).upper(),
+                              int(float(row.get("qty_requested") or 0)))
+                    if _ident in _already_backfilled:
+                        # Corrected on a prior --write run; the original
+                        # qty_filled=0 row is still here for audit. Don't append
+                        # a second correction (would double-count the lot).
+                        print(f"    (already back-filled on a prior run — skipping)")
+                    else:
+                        corrections.append(_build_backfill_row(row, trade, filled,
+                                                               now_status, permid))
             except Exception as e:
                 print(f"  {row['ticker']:<12} {oid:>7} (read failed: {e})")
         print(f"  {'-'*12} {'-'*7} {'-'*11} {'-'*18} {'-'*18} "

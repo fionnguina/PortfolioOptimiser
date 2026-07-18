@@ -408,6 +408,46 @@ if ($FreshFlag) {
     }
 }
 
+# --- Post-run fault scan (2026-07-17) ---
+# The engine's own health summary CANNOT see these: `Windows fatal exception:`
+# lines are emitted by faulthandler during interpreter/COM teardown, i.e. AFTER
+# the health block has already printed. On 2026-07-17 a clean-looking run
+# reported "Errors in log: 0" while the log ended with 26 of them (0x800706ba =
+# RPC server unavailable, the Excel COM teardown that also strands an orphaned
+# EXCEL.EXE). The wrapper reads the log after the process has exited, so this is
+# the only place that sees the whole file. Informational, NOT a verdict change:
+# the teardown faults are currently benign and turning them into a HALT would
+# cry wolf. We report the count so a NEW class of fault can't hide behind them.
+# MUST read the TIMESTAMPED log, not run.log. faulthandler needs a real file
+# descriptor and the tee wrapper has none, so Main.py:116-118 points it at
+# run_<ts>.log directly — run.log is only the tee copy and can therefore NEVER
+# contain a fatal exception or a hard-crash traceback. Verified 2026-07-17:
+# run_..._15-35-23.log = 451 lines / 26 faults; run.log = 347 lines / 0.
+# So for CRASHES the timestamped log is authoritative, even though run.log is
+# what this wrapper parses the verdict from (the verdict precedes teardown, so
+# that stays fine).
+$faultCount = 0
+$errCount = 0
+$scanPath = $null
+try {
+    $newest = Get-ChildItem -Path (Join-Path $ScriptDir "dist") -Filter "run_*.log" -ErrorAction Stop |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newest) { $scanPath = $newest.FullName }
+} catch { }
+if (-not $scanPath -and (Test-Path $LogPath)) { $scanPath = $LogPath }
+if ($scanPath) {
+    try {
+        $logLines = Get-Content -Path $scanPath -ErrorAction Stop
+        $faultCount = @($logLines | Where-Object { $_ -match '(?i)fatal exception' }).Count
+        $errCount = @($logLines | Where-Object { $_ -match '\[ERROR' -or $_ -match 'Traceback' }).Count
+        if ($faultCount -gt 0 -or $errCount -gt 0) {
+            Write-Log "Post-run log scan ($([System.IO.Path]::GetFileName($scanPath))): $errCount error line(s), $faultCount fatal-exception line(s). Faults are emitted at COM teardown, AFTER the engine's health summary — the engine cannot count them, and they never reach run.log."
+        }
+    } catch {
+        Write-Log "Post-run log scan failed: $($_.Exception.Message)"
+    }
+}
+
 # --- Parse [rebal-trigger] verdict from run.log ---
 $verdict = "UNKNOWN"
 $summedDw = "?"
@@ -519,9 +559,26 @@ switch ($verdict) {
     "RUN" {
         $body = "Rebalance ready. summed|Δw|=$summedDw (>= $('{0:F2}' -f (0.03))). Portfolio $portfolioAud AUD. Open PPT to review, then run ibkr_paper_exec.py --execute.$simSuffix"
         Show-Toast -Title "Portfolio Optimiser — REBALANCE READY" -Body $body -Verdict "RUN" | Out-Null
-        if ($OpenPptOnRun -and (Test-Path $PptPath)) {
-            Start-Process $PptPath
-            Write-Log "Opened $PptPath."
+        if ($OpenPptOnRun) {
+            # Open the deck THIS run wrote, not the fixed name. When PowerPoint
+            # holds Portfolio_Report.pptx open, ppt_export.py saves to a
+            # timestamped sibling instead (WinError 5 fallback) and logs
+            # "Deck saved instead to: <path>". Blindly opening the fixed name
+            # then pops the STALE previous deck on a RUN — the user reviews last
+            # run's weights believing they're today's. Resolve the real path
+            # from the engine's own log line; fall back to the fixed name.
+            $pptToOpen = $null
+            if ($scanPath -and (Test-Path $scanPath)) {
+                $savedLine = Select-String -Path $scanPath -Pattern 'saved (?:instead )?to:\s*(.+\.pptx)\s*$' -ErrorAction SilentlyContinue | Select-Object -Last 1
+                if ($savedLine) { $pptToOpen = $savedLine.Matches[0].Groups[1].Value.Trim() }
+            }
+            if ((-not $pptToOpen) -or (-not (Test-Path $pptToOpen))) { $pptToOpen = $PptPath }
+            if (Test-Path $pptToOpen) {
+                Start-Process $pptToOpen
+                Write-Log "Opened $pptToOpen."
+            } else {
+                Write-Log "PPT to open not found ($pptToOpen) — skipping."
+            }
         }
     }
     "SKIP" {
@@ -571,6 +628,16 @@ switch ($verdict) {
     }
 }
 if ($mailSubject) {
+    # Fold in real error lines. Fatal-exception (faulthandler) lines are
+    # DELIBERATELY not mentioned unless there are errors too: ~25 benign COM
+    # teardown faults fire on every run, so reporting them every time would
+    # train the reader to ignore the channel — the same failure the whole
+    # 2026-07-17 audit was about. They ARE in daily_auto.log for triage.
+    if ($errCount -gt 0) {
+        $mailBody = "$mailBody`n`nERRORS: $errCount error line(s) in run.log"
+        if ($faultCount -gt 0) { $mailBody = "$mailBody (+$faultCount fatal-exception line(s))" }
+        $mailBody = "$mailBody — check dist\run.log."
+    }
     # Fold in the engine-vs-broker mark drift warning if this run emitted one.
     try {
         if (Test-Path $LogPath) {
