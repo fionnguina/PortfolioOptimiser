@@ -6206,6 +6206,37 @@ try:
                 _wvl = w_ensemble_live.reindex(_cvl).fillna(0.0).values
                 _Sl = _Sigma_live.reindex(index=_cvl, columns=_cvl).fillna(0.0).values
                 _sig_l = float(np.sqrt(max(float(_wvl @ _Sl @ _wvl), 0.0) * 252.0))
+                # MEASUREMENT (review #4, env-gated, print-only — no behaviour
+                # change). Live Σ keeps a STALE full-history sample-cov entry for
+                # any held ticker below 80% coverage over the trailing 504d
+                # (df_cov_wide window at :6138), where the backtest EXCLUDES such
+                # ragged tickers. Quantify whether that patchwork materially moves
+                # the vol-target scale, or whether ragged names carry trivial
+                # weight and it's cosmetic. Run: PORTOPT_SIGMA_DIAG=1.
+                if os.environ.get("PORTOPT_SIGMA_DIAG"):
+                    try:
+                        _cov504 = df_cov_wide.tail(504).notna().mean()
+                        _ragged = [c for c in _cvl if float(_cov504.get(c, 1.0)) < 0.8]
+                        _wr = {c: float(w_ensemble_live.get(c, 0.0)) for c in _ragged}
+                        _ragged_wt = float(sum(_wr.values()))
+                        _clean = [c for c in _cvl if c not in _ragged]
+                        _sig_clean = float("nan")
+                        if len(_clean) >= 2:
+                            _wc = w_ensemble_live.reindex(_clean).fillna(0.0)
+                            if float(_wc.sum()) > 0:
+                                _wc = _wc / float(_wc.sum())
+                            _Sc = _Sigma_live.reindex(index=_clean, columns=_clean).fillna(0.0).values
+                            _sig_clean = float(np.sqrt(max(float(_wc.values @ _Sc @ _wc.values), 0.0) * 252.0))
+                        _sc_p = (_vt_live / _sig_l) if _sig_l > 0 else 1.0
+                        _sc_c = (_vt_live / _sig_clean) if (_sig_clean == _sig_clean and _sig_clean > 0) else 1.0
+                        _top = sorted(_wr, key=_wr.get, reverse=True)[:6]
+                        print(f"[sigma-diag] held={len(_cvl)} ragged(<80%/504d)={len(_ragged)} "
+                              f"ragged_weight={_ragged_wt*100:.2f}% top_ragged={_top}")
+                        print(f"[sigma-diag] ex-ante vol: patchwork={_sig_l*100:.2f}% "
+                              f"ragged-excluded={_sig_clean*100:.2f}% | vol-target scale: "
+                              f"patchwork={_sc_p:.4f} clean={_sc_c:.4f} Δ={(_sc_p-_sc_c)*1e4:+.0f}bps")
+                    except Exception as _e_sd:
+                        print(f"[sigma-diag] failed: {_e_sd}")
                 if _sig_l > _vt_live > 0:
                     _sc = _vt_live / _sig_l
                     w_ensemble_live = w_ensemble_live * _sc

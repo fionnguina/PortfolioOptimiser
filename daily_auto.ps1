@@ -542,7 +542,16 @@ try {
     $navScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
     if ((Test-Path $navPy) -and (Test-Path $navScript)) {
         $navOut = & $navPy $navScript --snapshot-nav 2>&1 | Select-Object -Last 1
-        Write-Log "NAV snapshot: $navOut"
+        $navExit = $LASTEXITCODE
+        # Exit-code check (same class as the email fix): a failed snapshot
+        # silently froze ibkr_nav_log.jsonl on 2026-07-10/13 (System32-CWD
+        # PermissionError), which starved the drift tracker. Log the failure
+        # loudly so a broken NAV record can't accumulate unnoticed again.
+        if ($navExit -ne 0) {
+            Write-Log "NAV snapshot FAILED (exit=$navExit): $navOut"
+        } else {
+            Write-Log "NAV snapshot: $navOut"
+        }
     }
 } catch {
     Write-Log "NAV snapshot failed (non-fatal): $($_.Exception.Message)"
