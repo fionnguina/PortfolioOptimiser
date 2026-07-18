@@ -15,9 +15,46 @@ import pandas as pd
 from brokerage import BROKER_CONFIG
 from cgt import CGT_CONFIG, LotBook, _effective_cgt_rate
 from tlh import TLH_ENABLED, _run_tlh_pass
-from solvers import _ledoit_wolf_cc, solve_candidate_portfolios, estimate_covariance
+from solvers import (_ledoit_wolf_cc, solve_candidate_portfolios, estimate_covariance,
+                     max_sharpe_long_only, solve_frontier_point_cvxpy_with_tilts)
 from factors import auto_recommend_factor_tilts
 from ensemble import softmax_ensemble_weights
+
+
+# --- Pluggable portfolio constructors for the tilt-variant backtest ---------
+# Each takes the walk-forward's trailing mu/Sigma (+ optional factor tilts) and
+# returns a weight Series, to run through the SAME machinery as the ensemble.
+# See reference_tilt_variant_backtest_prereg. The SAME Ledoit-Wolf Σ the ensemble
+# uses is passed to both — so any variant underperformance is the OBJECTIVE
+# (concentration/error-max), not a handicapped cov estimator; this also GIVES the
+# variants the ensemble's Σ-side edge, making it a harder test for them to lose.
+
+def max_sharpe_constructor(mu, Sigma, **_kw):
+    """no_tilts / 'optimised': the long-only max-Sharpe (tangency) portfolio."""
+    return max_sharpe_long_only(mu, Sigma, rf=0.0)
+
+
+def max_sharpe_tilted_constructor(mu, Sigma, factor_betas=None, tilt_targets=None,
+                                  tilt_bands=None, use_mask=None, **_kw):
+    """with_tilts: max-Sharpe at the tangency expected return, WITH the factor
+    tilts the walk-forward computed for this rebalance. Falls back to the
+    untilted tangency portfolio when factor data / tilts are unavailable."""
+    w_t = max_sharpe_long_only(mu, Sigma, rf=0.0)
+    if (w_t is None or w_t.empty or factor_betas is None
+            or tilt_targets is None or tilt_bands is None):
+        return w_t
+    r_star = float((mu.reindex(w_t.index).fillna(0.0) * w_t).sum())
+    try:
+        w_arr, ok, _note = solve_frontier_point_cvxpy_with_tilts(
+            mu, Sigma, r_star, factor_betas, tilt_targets, tilt_bands, use_mask)
+        if ok and w_arr is not None:
+            w = pd.Series(np.asarray(w_arr, dtype=float).reshape(-1)[:len(Sigma.index)],
+                          index=Sigma.index).fillna(0.0)
+            if w.sum() > 0:
+                return w
+    except Exception:
+        pass
+    return w_t
 
 # Config injected by the engine's _sync_oos_engine() after config is defined.
 COV_SHRINKAGE = None
@@ -356,6 +393,7 @@ def run_oos_ensemble_walk_forward(
     factor_betas: pd.DataFrame | None = None,
     factor_tilt_lookback_days: int | None = None,
     factor_tilt_band: float = 0.10,
+    portfolio_constructor=None,
 ) -> dict:
     """Ensemble walk-forward: solve 5 candidates per rebalance, softmax-blend
     by rolling 12M Sortino, hold the blended portfolio for 1 month.
@@ -765,6 +803,37 @@ def run_oos_ensemble_walk_forward(
         if w_blend.empty or w_blend.sum() <= 0:
             continue
         w_blend = w_blend / w_blend.sum()
+
+        # PLUGGABLE PORTFOLIO CONSTRUCTOR (2026-07-18, tilt-variant backtest).
+        # When set, REPLACE the ensemble blend with a caller-supplied weight
+        # vector built from the SAME trailing mu/Sigma/tilts — so the variant
+        # (max-Sharpe "no_tilts", factor-tilted "with_tilts") flows through the
+        # IDENTICAL downstream: vol-target, crash hedge, 3%/6W rebalance gate,
+        # CGT/brokerage/TLH. The only difference between strategies is this one
+        # weight-construction step; everything else is byte-identical, which is
+        # what makes the comparison fair. Candidates above are still solved
+        # (wasted compute) but that keeps the machinery + skip conditions
+        # unchanged. See reference_tilt_variant_backtest_prereg.
+        if portfolio_constructor is not None:
+            try:
+                _w_c = portfolio_constructor(
+                    mu=mu, Sigma=Sigma, spy_mu=spy_mu,
+                    w_prev=(_prev_blend_w if not _prev_blend_w.empty else None),
+                    factor_betas=factor_betas,
+                    tilt_targets=_live_tilt_targets, tilt_bands=_live_tilt_bands,
+                    use_mask=_live_use_mask, t=t,
+                )
+            except Exception as _e_ctor:
+                print(f"[variant][WARN] constructor failed at {t}: "
+                      f"{type(_e_ctor).__name__}: {_e_ctor}")
+                _w_c = None
+            if _w_c is None or len(_w_c) == 0:
+                continue
+            _w_c = pd.Series(_w_c).astype(float)
+            _w_c = _w_c[_w_c > 1e-6]
+            if _w_c.empty or _w_c.sum() <= 0:
+                continue
+            w_blend = _w_c / _w_c.sum()
 
         # Trend-following sleeve (core-satellite): blend a long-only inverse-vol
         # TSMOM sleeve with the ensemble. If nothing trends the sleeve is CASH,

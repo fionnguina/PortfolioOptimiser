@@ -32,7 +32,8 @@ from factors import (
     FACTOR_TILT_SHARPE_TO_MAG,
     compute_ff5_betas,
 )
-from oos_engine import run_oos_ensemble_walk_forward
+from oos_engine import (run_oos_ensemble_walk_forward,
+                        max_sharpe_constructor, max_sharpe_tilted_constructor)
 
 # Injected by the engine's _sync_research_modes() before the first dispatch.
 _apply_data_lockbox = None
@@ -3374,4 +3375,161 @@ def _run_tilted_ensemble_test() -> int:
     print("\n" + "=" * 88)
     print("TILTED ENSEMBLE TEST COMPLETE")
     print("=" * 88)
+    return 0
+
+
+def _run_variant_comparison() -> int:
+    """Fair 3-way walk-forward: ENSEMBLE vs NO_TILTS (max-Sharpe/tangency) vs
+    WITH_TILTS (factor-tilted max-Sharpe), all through the IDENTICAL machinery
+    (vol-target, crash hedge, 6W/3% rebalance gate, CGT/brokerage/TLH). The only
+    difference between the three is the per-rebalance weight-construction step
+    (injected via portfolio_constructor) — so this settles review #7 with real
+    evidence instead of the live trailing-Sharpe peek. All three get the SAME
+    Ledoit-Wolf Sigma the ensemble uses, so any variant underperformance is the
+    OBJECTIVE (max-Sharpe error-max / concentration), not a handicapped cov — and
+    it GIVES the variants the Sigma-side edge, a harder test for them to lose.
+    Registered hypothesis (before results): ensemble wins; tilts lose on
+    net-of-CGT return and MaxDD. See reference_tilt_variant_backtest_prereg.
+    """
+    print("\n" + "=" * 88)
+    print("VARIANT COMPARISON - ensemble vs no_tilts vs with_tilts (identical machinery)")
+    print("=" * 88)
+
+    _tk = [c for c in prices.columns if c != "PortfolioValue"]
+    print(f"[variant] universe: {len(_tk)} tickers; downloading 12y history...")
+    t0 = time.perf_counter()
+    raw = yf.download(_tk, period="12y", interval="1d",
+                      auto_adjust=True, threads=False, progress=False)
+    px = _normalize_yfinance_close(raw)
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill().bfill()
+    fx_raw = yf.download("USDAUD=X", period="12y", interval="1d",
+                         auto_adjust=True, threads=False, progress=False)
+    fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
+    if isinstance(fx, pd.DataFrame):
+        fx = fx.iloc[:, 0]
+    fx = pd.to_numeric(fx, errors="coerce").reindex(px.index).ffill().bfill()
+    usd_cols = [c for c in px.columns
+                if not str(c).endswith(".AX") and not str(c).startswith("^")]
+    px_aud = px.copy()
+    if usd_cols:
+        px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
+    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    spy_ret = (px_aud["SPY"].pct_change().dropna()
+               if "SPY" in px_aud.columns else pd.Series(dtype=float))
+    print(f"[variant] data ready ({px_aud.shape[0]}d x {px_aud.shape[1]}t) "
+          f"in {time.perf_counter()-t0:.1f}s")
+
+    # Factor data for with_tilts (graceful degrade — the constructor falls back
+    # to the untilted tangency portfolio if B/ff are None).
+    B = None
+    ff = None
+    try:
+        print("[variant] loading FF5+MOM + computing Dimson betas (~30s)...")
+        ff = _apply_data_lockbox(get_ff5_mom_daily(region="US"))
+        ff.index = pd.to_datetime(ff.index).tz_localize(None)
+        _ret_wide = px_aud.pct_change().dropna(how="all")
+        B, _a, _r = compute_ff5_betas(df_returns_wide=_ret_wide, ff5_returns=ff,
+                                      min_obs=120, n_lags=1)
+        B = B.dropna(how="all") if B is not None else None
+        if B is None or B.empty:
+            print("[variant] beta matrix empty; with_tilts -> no_tilts fallback.")
+            B = None
+    except Exception as e:
+        print(f"[variant] factor data unavailable ({e}); with_tilts -> no_tilts fallback.")
+        B = None
+
+    _NAV = 250_000.0  # production-frame ballpark; identical across all 3
+    _common = dict(train_window_months=24, rebalance=REBALANCE_FREQ,
+                   benchmark_ticker="SPY", score_lookback_days=252,
+                   lambda_temp=float(ENSEMBLE_LAMBDA_TEMP),
+                   sortino_halflife_days=int(ENSEMBLE_HALFLIFE_DAYS),
+                   starting_nav_aud=_NAV)
+
+    def _metrics(out, label):
+        rets = out.get("blended_returns", pd.Series(dtype=float))
+        if rets is None or rets.empty:
+            return None
+        days = len(rets)
+        years = max(days / ANNUAL_TRADING_DAYS, 1e-6)
+        nav = (1.0 + rets).cumprod()
+        total = float(nav.iloc[-1] - 1.0)
+        ann = float((1.0 + total) ** (1.0 / years) - 1.0)
+        vol = float(rets.std() * np.sqrt(ANNUAL_TRADING_DAYS))
+        sharpe = ann / vol if vol > 0 else 0.0
+        dd_full = float((nav / nav.cummax() - 1.0).min())  # FULL-PERIOD peak-to-trough
+        cost = out.get("rebalance_costs", pd.Series(dtype=float))
+        tax = out.get("rebalance_taxes", pd.Series(dtype=float))
+        brok_bps = float(cost.sum() / years * 1e4) if not cost.empty else 0.0
+        cgt_bps = float(tax.sum() / years * 1e4) if not tax.empty else 0.0
+        spy_w = spy_ret.reindex(rets.index).fillna(0.0)
+        spy_ann = float((1.0 + spy_w).cumprod().iloc[-1] ** (1.0 / years) - 1.0)
+        return {"label": label, "years": round(years, 2), "ann_return": ann,
+                "sharpe": sharpe, "max_drawdown": dd_full, "vol": vol,
+                "brokerage_bps": brok_bps, "cgt_bps": cgt_bps,
+                "alpha_vs_spy": ann - spy_ann,
+                "n_executed": int(out.get("n_executed", 0))}
+
+    runs = [
+        ("ensemble",   dict(_common)),
+        ("no_tilts",   dict(_common, portfolio_constructor=max_sharpe_constructor)),
+        ("with_tilts", dict(_common, portfolio_constructor=max_sharpe_tilted_constructor,
+                            auto_factor_tilts=(B is not None), ff_factors=ff, factor_betas=B)),
+    ]
+    results = []
+    for label, kw in runs:
+        print(f"\n[variant] running {label}...")
+        t1 = time.perf_counter()
+        out = run_oos_ensemble_walk_forward(px_aud, **kw)
+        m = _metrics(out, label)
+        if m is None:
+            print(f"[variant] {label}: empty returns, skipping")
+            continue
+        m["elapsed_sec"] = round(time.perf_counter() - t1, 1)
+        results.append(m)
+        print(f"[variant] {label}: ann {m['ann_return']*100:+.2f}%  "
+              f"Sharpe {m['sharpe']:.2f}  MaxDD {m['max_drawdown']*100:+.2f}%  "
+              f"CGT {m['cgt_bps']:.0f}bps/y  a(SPY) {m['alpha_vs_spy']*100:+.2f}%  "
+              f"({m['elapsed_sec']:.0f}s)")
+
+    if not results:
+        print("[variant] no results.")
+        return 1
+
+    print("\n" + "=" * 92)
+    print("VARIANT COMPARISON - net of brokerage + AU CGT; FULL-PERIOD MaxDD")
+    print("=" * 92)
+    print(f"  {'Variant':<12} {'AnnRet':>8} {'Vol':>7} {'Sharpe':>7} {'MaxDD':>8} "
+          f"{'Brok':>8} {'CGT':>8} {'a(SPY)':>8} {'Rebals':>7}")
+    print(f"  {'-'*12} {'-'*8} {'-'*7} {'-'*7} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*7}")
+    for r in results:
+        print(f"  {r['label']:<12} {r['ann_return']*100:>7.2f}% {r['vol']*100:>6.1f}% "
+              f"{r['sharpe']:>7.2f} {r['max_drawdown']*100:>7.2f}% "
+              f"{r['brokerage_bps']:>7.0f} {r['cgt_bps']:>7.0f} "
+              f"{r['alpha_vs_spy']*100:>7.2f}% {r['n_executed']:>7}")
+
+    by = {r["label"]: r for r in results}
+    ens = by.get("ensemble")
+    if ens:
+        print("\n  vs pre-registered hypothesis (ensemble wins; tilts lose net-of-CGT):")
+        for lab in ("no_tilts", "with_tilts"):
+            v = by.get(lab)
+            if not v:
+                continue
+            d_sh = v["sharpe"] - ens["sharpe"]
+            d_dd = v["max_drawdown"] - ens["max_drawdown"]  # +ve = shallower = better
+            d_ret = (v["ann_return"] - ens["ann_return"]) * 1e4
+            beats = (d_sh > 0.02 and d_dd >= -0.005)
+            print(f"    {lab:<11} dSharpe {d_sh:+.2f}  dMaxDD {d_dd*100:+.1f}pp  "
+                  f"dAnnRet {d_ret:+.0f}bps  -> "
+                  f"{'BEATS ensemble (SURPRISE - reopen #7)' if beats else 'confirms hypothesis'}")
+        print("\n  NOTE: CV-frame read. Gate on dev/val split + noise floor before any decision.")
+
+    try:
+        import json as _json
+        _p = _research_out("variant_comparison_summary.json")
+        _p.write_text(_json.dumps(results, indent=2, default=str), encoding="utf-8")
+        print(f"\n[variant] summary -> {_p}")
+    except Exception as _e:
+        print(f"[variant] summary write failed: {_e}")
     return 0

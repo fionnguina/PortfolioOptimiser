@@ -319,6 +319,7 @@ from research_modes import (
     _run_stretch_only_test,
     _run_stretch_hedge_sweep,
     _run_tilted_ensemble_test,
+    _run_variant_comparison,
 )
 _RESEARCH_INJECT = (
     "_apply_data_lockbox", "_evaluate_sweep_result", "_normalize_yfinance_close",
@@ -487,6 +488,11 @@ if _AUTO_PIPELINE_MODE:
 _TILTED_ENSEMBLE_TEST_MODE = "--tilted-ensemble-test" in sys.argv
 if _TILTED_ENSEMBLE_TEST_MODE:
     print("[tilted-ens] --tilted-ensemble-test detected; will skip dialog + live pipeline")
+# `--variant-comparison`: fair 3-way walk-forward (ensemble vs no_tilts vs
+# with_tilts) through identical machinery — settles review #7.
+_VARIANT_COMPARISON_MODE = "--variant-comparison" in sys.argv
+if _VARIANT_COMPARISON_MODE:
+    print("[variant] --variant-comparison detected; will skip dialog + live pipeline")
 # OOS kernel mode (Phase 3b, 2026-06-29) — workers spawned by the parallel
 # scale-sensitivity loop set OOS_KERNEL_MODE=1 so this re-exec only loads
 # imports + function defs, then sys.exits at the sentinel near the OOS
@@ -506,6 +512,7 @@ _SKIP_LIVE_PIPELINE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                        or _SHOW_METRICS_HISTORY_MODE
                        or _FACTOR_RECS_MODE
                        or _TILTED_ENSEMBLE_TEST_MODE
+                       or _VARIANT_COMPARISON_MODE
                        or _META_OPT_MIXING_MODE
                        or _MIXING_DIAG_MODE
                        or _PREFLIGHT_MODE
@@ -2505,6 +2512,7 @@ _DATA_LOCKBOX_RESEARCH_MODE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                                or _STRETCH_ONLY_TEST_MODE
                                or _STRETCH_HEDGE_SWEEP_MODE
                                or _TILTED_ENSEMBLE_TEST_MODE
+                               or _VARIANT_COMPARISON_MODE
                                or _META_OPT_MIXING_MODE
                                or _MIXING_DIAG_MODE)
 _lockbox_env = os.environ.get("DATA_LOCKBOX_DATE")
@@ -5685,6 +5693,15 @@ if "--stretch-hedge-sweep" in sys.argv:
 # full-period peak-to-trough MaxDD (per the 2026-06-19 measurement lesson).
 if "--tilted-ensemble-test" in sys.argv:
     _exit_code = _run_tilted_ensemble_test()
+    sys.exit(_exit_code)
+
+# === Variant comparison (--variant-comparison) ==============================
+# Fair 3-way walk-forward: ensemble vs no_tilts (max-Sharpe) vs with_tilts
+# (factor-tilted), ALL through identical machinery (vol-target, hedge, 6W/3%
+# gate, CGT/brokerage/TLH). Settles review #7 with real evidence instead of the
+# live trailing-Sharpe peek. Pre-reg: reference_tilt_variant_backtest_prereg.
+if "--variant-comparison" in sys.argv:
+    _exit_code = _run_variant_comparison()
     sys.exit(_exit_code)
 
 

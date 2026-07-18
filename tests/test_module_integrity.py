@@ -146,6 +146,7 @@ _EXPECTED_DRIVERS = {
     "_run_rebal_skip_sweep", "_run_turnover_penalty_sweep", "_run_walk_forward_cv",
     "_run_attribution", "_run_crash_hedge_test", "_run_crash_hedge_release_sweep",
     "_run_stretch_only_test", "_run_stretch_hedge_sweep", "_run_tilted_ensemble_test",
+    "_run_variant_comparison",
 }
 
 
