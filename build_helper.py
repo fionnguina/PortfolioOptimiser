@@ -103,9 +103,13 @@ def _write_version_file(root: Path) -> tuple[str, str]:
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=str(root), stderr=subprocess.DEVNULL
         ).decode("utf-8").strip()
-        # Mark dirty if working tree differs from HEAD
+        # Mark dirty if the tree differs from HEAD. Use `diff --quiet HEAD`, NOT
+        # bare `diff --quiet`: the latter compares tree-vs-INDEX only, so a
+        # `git add`-ed-but-uncommitted change reports clean and the exe gets
+        # stamped as matching a clean sha while actually containing staged,
+        # never-committed edits — silently defeating the [build] drift check.
         dirty = subprocess.call(
-            ["git", "diff", "--quiet"], cwd=str(root)
+            ["git", "diff", "--quiet", "HEAD"], cwd=str(root)
         ) != 0
         if dirty:
             sha += "-dirty"

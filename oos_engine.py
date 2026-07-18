@@ -1019,8 +1019,17 @@ def run_oos_ensemble_walk_forward(
                         )
                         for k in _fy_buckets:
                             _fy_buckets[k] += out[k]
-            except Exception:
-                pass
+            except Exception as _e_lot:
+                # This block IS the backtest's CGT simulation — the validation
+                # protocol gates on it (CGT is ~92% of measured drag). Silently
+                # swallowing an exception here would skip tax accrual for the
+                # period and quietly bias the backtest. Behaviour unchanged (we
+                # still continue so one bad period can't abort a multi-year run),
+                # but now it's LOUD: the [WARN] tag is picked up by the run
+                # health counter, so it can't hide. Fires zero times in normal
+                # operation. (Contrast the deliberately-swallowed TLH pass below.)
+                print(f"[oos][WARN] lot-book/FY-bucket update failed at {t}: "
+                      f"{type(_e_lot).__name__}: {_e_lot}")
 
         # TLH pass: scan current lots for unrealised losses, swap to substitute
         # (sells loss lot, buys substitute at same dollar value). Runs even on

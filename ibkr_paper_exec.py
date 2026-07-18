@@ -456,7 +456,7 @@ def _run_check_fills_mode(write: bool = False) -> int:
         despite our log saying otherwise?)
 
     Read-only — does not place orders, does not append to the fills log."""
-    fills_path = Path(FILLS_LOG_FILENAME)
+    fills_path = _SCRIPT_DIR / FILLS_LOG_FILENAME  # anchored: scheduled-task CWD=System32
     if not fills_path.exists():
         print(f"[check-fills] {fills_path} not found. Nothing to check.")
         return 0
@@ -999,8 +999,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="IBKR Phase 3 — paper-account execution with safety gates."
     )
-    parser.add_argument("--rec-log", type=str, default=REC_LOG_FILENAME,
-                        help=f"Recommendation log path (default: {REC_LOG_FILENAME})")
+    parser.add_argument("--rec-log", type=str, default=str(_SCRIPT_DIR / REC_LOG_FILENAME),
+                        help=f"Recommendation log path (default: {REC_LOG_FILENAME} beside the script)")
     parser.add_argument("--execute", action="store_true",
                         help="REQUIRED to actually place orders. Without this, "
                              "behaves as Phase 2 dry-run (preview only).")
@@ -1047,9 +1047,9 @@ def main() -> int:
                              "manual TWS trades that never touch the fills log. "
                              "Preview by default; add --execute (+ typed YES) to "
                              "write the sheet.")
-    parser.add_argument("--workbook", type=str, default="Stock Analysis.xlsm",
+    parser.add_argument("--workbook", type=str, default=str(_SCRIPT_DIR / "Stock Analysis.xlsm"),
                         help="Workbook path for --sync-holdings "
-                             "(default: Stock Analysis.xlsm)")
+                             "(default: Stock Analysis.xlsm beside the script)")
     parser.add_argument("--only-tickers", type=str, default="",
                         help="Comma-separated list of tickers to keep from the "
                              "latest rec log. Use to retry specific orders after "
@@ -1268,7 +1268,7 @@ def main() -> int:
 
         # === Reconcile + log ===
         _print_reconciliation(trades)
-        fills_path = Path(FILLS_LOG_FILENAME)
+        fills_path = _SCRIPT_DIR / FILLS_LOG_FILENAME  # anchored: scheduled-task CWD=System32
         n_written = _write_fills_log(rec_entry, trades, fills_path)
         print(f"[exec] {n_written} row(s) appended to {fills_path}")
 

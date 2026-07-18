@@ -143,6 +143,39 @@ def test_spliced_nav_returns_recon_when_broker_sparse(tmp_path):
 
 
 # ============================================================================
+# fx.price_local_to_aud — the live-TLH currency conversion (extracted from the
+# monolith closure so it's testable). Was the AUD-cost-vs-LOCAL-price bug.
+# ============================================================================
+
+def test_price_local_to_aud_us_ticker_converts():
+    # SMH quoted in USD → multiply by the USD→AUD rate.
+    assert fx.price_local_to_aud("SMH", 606.073604, {"SMH": 1.4312}) == pytest.approx(
+        606.073604 * 1.4312)
+
+
+def test_price_local_to_aud_ax_is_identity():
+    # .AX already AUD → rate 1.0 even if fx_map has no entry.
+    assert fx.price_local_to_aud("VLUE.AX", 36.63, {}) == pytest.approx(36.63)
+
+
+def test_price_local_to_aud_index_caret_is_identity():
+    assert fx.price_local_to_aud("^AORD", 8000.0, {}) == pytest.approx(8000.0)
+
+
+def test_price_local_to_aud_unknown_us_rate_returns_none():
+    # The load-bearing guard: unknown rate for a NON-AUD ticker → None
+    # (exclude from TLH) rather than mis-pricing and fabricating a loss.
+    assert fx.price_local_to_aud("SMH", 606.0, {}) is None
+    assert fx.price_local_to_aud("SMH", 606.0, {"SMH": 0.0}) is None      # non-positive
+    assert fx.price_local_to_aud("SMH", 606.0, {"SMH": float("nan")}) is None
+    assert fx.price_local_to_aud("SMH", 606.0, {"SMH": float("inf")}) is None
+
+
+def test_price_local_to_aud_bad_price_returns_none():
+    assert fx.price_local_to_aud("SMH", None, {"SMH": 1.43}) is None
+
+
+# ============================================================================
 # nav.load_broker_positions + lots.reconcile_lots_vs_broker
 #
 # Regression cover for the 2026-07-08 SOXL/VEA miss: ibkr_paper_exec.py exited

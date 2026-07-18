@@ -58,3 +58,31 @@ def fx_to_aud_for_tickers(tickers, usd_aud_rate: float) -> pd.Series:
     for t in map(str, tickers):
         out[t] = 1.0 if t.startswith("^") or t.endswith(".AX") else usd_aud_rate
     return pd.Series(out, name="FX to AUD")
+
+
+def price_local_to_aud(ticker, price_local, fx_map):
+    """Convert a LOCAL-currency price to AUD using `fx_map` (ticker -> AUD rate).
+
+    Returns None when the rate is unknown for a NON-AUD ticker — refusing to
+    price it is safer than pricing it wrong, which is exactly the bug that made
+    live TLH compare an AUD cost base against a USD price and fabricate a ~30%
+    loss (2026-07-17). `.AX` (and `^` index) tickers fall back to 1.0 since
+    local IS AUD for them. Pure — used by the live TLH price snapshot and
+    unit-tested; keep it in sync with fx_to_aud_for_tickers' AUD rule.
+    """
+    try:
+        rate = pd.Series(fx_map).get(str(ticker))
+        rate = float(rate) if rate is not None else None
+    except (TypeError, ValueError):
+        rate = None
+    # None / NaN (rate != rate) / ±inf / non-positive → unusable rate.
+    if (rate is None or rate != rate or rate in (float("inf"), float("-inf"))
+            or rate <= 0):
+        if str(ticker).endswith(".AX") or str(ticker).startswith("^"):
+            rate = 1.0
+        else:
+            return None
+    try:
+        return float(price_local) * float(rate)
+    except (TypeError, ValueError):
+        return None

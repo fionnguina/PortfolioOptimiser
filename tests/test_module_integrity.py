@@ -66,6 +66,45 @@ def test_cache_fingerprint_globals_all_bind():
         f"so that input NEVER invalidates the cache): {dead}")
 
 
+def test_all_engine_globals_get_names_bind():
+    """EVERY globals().get("NAME", ...) in the engine must name a real binding,
+    not just the ones in the cache fingerprint. The narrow fingerprint-only guard
+    missed `globals().get("BUILD_STAMP")` (the sentinel write), which serialised
+    "?" every run — the exact dead-lookup class it was meant to catch. This is
+    the file-wide version.
+
+    A name counts as bound if it's assigned/annotated at any indentation
+    (`NAME =` / `NAME:`), set dynamically via `globals()["NAME"] =`, or imported.
+    """
+    # KNOWN-DEAD, tracked separately (found by this guard 2026-07-18). Both read
+    # a global nothing ever sets, but degrade gracefully: DRIFT_LAST_SUMMARY just
+    # skips a health-summary line; TRADEPLAN_VALIDATION_DIAG falls back to other
+    # globals. Left as-is here (wiring their producers is feature work, not
+    # review-scope); allowlisted so this guard still flags any NEW dead lookup.
+    _KNOWN_DEAD = {"DRIFT_LAST_SUMMARY", "TRADEPLAN_VALIDATION_DIAG"}
+
+    names = re.findall(r"globals\(\)\.get\(['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]",
+                       _ENGINE_SRC)
+    assert names, "no globals().get lookups found — did the scan break?"
+    dead = []
+    for n in sorted(set(names)):
+        if n in _KNOWN_DEAD:
+            continue
+        esc = re.escape(n)
+        bound = (re.search(rf"^\s*{esc}\s*[:=]", _ENGINE_SRC, re.M)              # NAME = / NAME:
+                 or re.search(rf"^\s*[\w\s,()]*\b{esc}\b\s*,[\w\s,()]*=(?!=)",    # tuple unpack: a, NAME, b = ...
+                              _ENGINE_SRC, re.M)
+                 or re.search(rf"^\s*[\w\s,()]*,\s*{esc}\s*=(?!=)", _ENGINE_SRC, re.M)  # ...,NAME = ...
+                 or re.search(rf"globals\(\)\[['\"]{esc}['\"]\]\s*=", _ENGINE_SRC)  # dynamic
+                 or re.search(rf"import .*\b{esc}\b", _ENGINE_SRC))              # imported
+        if not bound:
+            dead.append(n)
+    assert not dead, (
+        f"globals().get names never bound anywhere in the engine (silently return "
+        f"their default forever — dead diagnostics or dead cache inputs): {dead}. "
+        f"If genuinely dead-but-graceful, add to _KNOWN_DEAD with a note.")
+
+
 def test_cache_fingerprint_includes_build_sha():
     """The git-sha catch-all must be present and spelled correctly — it is the
     only thing invalidating on code changes that aren't behind a knob."""

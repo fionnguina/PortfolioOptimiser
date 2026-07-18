@@ -432,7 +432,11 @@ $scanPath = $null
 try {
     $newest = Get-ChildItem -Path (Join-Path $ScriptDir "dist") -Filter "run_*.log" -ErrorAction Stop |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($newest) { $scanPath = $newest.FullName }
+    # Staleness guard (mirrors the sentinel poll's -ge $EngineStart check): if the
+    # engine crashed before _setup_logging() created THIS run's timestamped log,
+    # the newest file is a PRIOR run's, and attributing its faults/errors to the
+    # current run's alert would be wrong. Require the log to be from this run.
+    if ($newest -and $newest.LastWriteTime -ge $EngineStart) { $scanPath = $newest.FullName }
 } catch { }
 if (-not $scanPath -and (Test-Path $LogPath)) { $scanPath = $LogPath }
 if ($scanPath) {
@@ -652,7 +656,18 @@ if ($mailSubject) {
         $mailScript = Join-Path $ScriptDir "send_alert.py"
         if ((Test-Path $mailPy) -and (Test-Path $mailScript)) {
             $mailOut = & $mailPy $mailScript --subject $mailSubject --body-file $bodyFile 2>&1 | Select-Object -Last 1
-            Write-Log "Email alert ($verdict): $mailOut"
+            $mailExit = $LASTEXITCODE
+            # send_alert.py returns 1 on SMTP failure (0 if unconfigured). This
+            # is the ONLY channel that reaches the user away from the desk, so a
+            # silent failure on the one day a RUN/HALTED verdict fires is the
+            # worst case. Surface a loud toast so a dead mailer can't hide in
+            # daily_auto.log (which nobody watches proactively).
+            if ($mailExit -ne 0) {
+                Write-Log "Email alert ($verdict) FAILED (exit=$mailExit): $mailOut"
+                Show-Toast -Title "Portfolio Optimiser — EMAIL FAILED" -Body "The $verdict alert email did NOT send (exit=$mailExit). Check dist\daily_auto.log; verdict still in run.log." -Verdict "ERROR" | Out-Null
+            } else {
+                Write-Log "Email alert ($verdict): $mailOut"
+            }
         }
     } catch {
         Write-Log "Email alert failed (non-fatal): $($_.Exception.Message)"

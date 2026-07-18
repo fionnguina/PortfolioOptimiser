@@ -199,6 +199,7 @@ from fx import (
     _last_numeric,
     get_usd_aud_fx,
     fx_to_aud_for_tickers,
+    price_local_to_aud,
 )
 
 # PPT/report formatting + date-window primitives (module split #18, 2026-07-10).
@@ -5306,6 +5307,20 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"crisis_hedge:{float(globals().get('CRISIS_HEDGE_WEIGHT', 0.0) or 0.0)}".encode())
         h.update(f"crisis_ma:{int(globals().get('CRISIS_HEDGE_MA_DAYS', 200))}".encode())
         h.update(f"crisis_band:{float(globals().get('CRISIS_HEDGE_BAND_SD', 0.0) or 0.0)}".encode())
+        # These 8 are consumed by run_oos_ensemble_walk_forward (via
+        # _sync_oos_engine) but were absent from the fingerprint — editing any in
+        # source and re-running --walk-forward-cv returned a stale HIT with
+        # silently wrong numbers. The git-sha catch-all does NOT cover it: from
+        # source _BUILD_GIT_SHA=="dev" (a literal), so the sha never moves in the
+        # dev-mode runs the validation protocol prescribes. Hash them explicitly.
+        h.update(f"outlier_thresh:{float(globals().get('RETURN_OUTLIER_THRESHOLD', 0.30))}".encode())
+        h.update(f"skip_delta:{float(globals().get('SKIP_REBAL_DELTA', 0.03))}".encode())
+        h.update(f"early_dd:{float(globals().get('EARLY_TRIGGER_DD_DEEPEN', 0.0) or 0.0)}".encode())
+        h.update(f"early_days:{int(globals().get('EARLY_TRIGGER_MIN_DAYS', 0) or 0)}".encode())
+        h.update(f"ch_look:{int(globals().get('CRASH_HEDGE_LOOKBACK_DAYS', 252))}".encode())
+        h.update(f"ch_trig:{float(globals().get('CRASH_HEDGE_DD_TRIGGER', 0.0) or 0.0)}".encode())
+        h.update(f"ch_rel:{float(globals().get('CRASH_HEDGE_DD_RELEASE', 0.0) or 0.0)}".encode())
+        h.update(f"ch_basket:{json.dumps(globals().get('CRASH_HEDGE_BASKET', {}), sort_keys=True)}".encode())
     except Exception:
         h.update(b"caps_hash_failed")
     try:
@@ -5732,6 +5747,11 @@ if bool(CFG.get("oos_validation", True)):
             benchmark_ticker="SPY",
             score_lookback_days=252,
             lambda_temp=ENSEMBLE_LAMBDA_TEMP,
+            # Forward the live halflife so the backtest can't silently use its
+            # hardcoded default (60) while live uses a swept value — a change
+            # would then move live but not the validated metrics. No-op today
+            # (ENSEMBLE_HALFLIFE_DAYS == 60); armed for any future sweep.
+            sortino_halflife_days=ENSEMBLE_HALFLIFE_DAYS,
             starting_nav_aud=_oos_nav,
             # PRODUCTION CONFIG: the metrics shown in PPT/Excel must match
             # what the live trade plan actually trades. See PRODUCTION_*
@@ -6965,20 +6985,11 @@ if USE_XLWINGS:
                     # engine immediately reported a $14,925 loss on SMH whose
                     # real loss was $3,001 — AUD cost 867.41 vs the USD price
                     # 568.91 instead of the A$807 mark.
+                    # Local -> AUD via the shared, unit-tested fx.price_local_to_aud
+                    # (returns None for an unknown non-AUD rate so we exclude
+                    # rather than mis-price). See tests/test_fx_lots_nav.py.
                     def _px_to_aud(_tk, _v):
-                        """Local -> AUD. Returns None when the rate is unknown
-                        for a non-AUD ticker: refusing to price it is safer than
-                        pricing it wrong, which fabricates a harvestable loss."""
-                        try:
-                            _rate = pd.Series(fx_map_all).get(str(_tk))
-                        except Exception:
-                            _rate = None
-                        if _rate is None or not np.isfinite(float(_rate)) or float(_rate) <= 0:
-                            if str(_tk).endswith(".AX"):
-                                _rate = 1.0
-                            else:
-                                return None
-                        return float(_v) * float(_rate)
+                        return price_local_to_aud(_tk, _v, fx_map_all)
 
                     _px_snap = {}
                     _px_unpriced = []
@@ -8408,6 +8419,22 @@ if USE_XLWINGS:
             # --- Label which portfolio this trade plan represents (used later by PPT) ---
             globals()["TRADE_PLAN_PORTFOLIO_LABEL"] = str(globals().get("choice_label", globals().get("TRADE_PLAN_MODE", "unknown")))
             globals()["TRADE_PLAN_SOURCE"] = "trade_rec"
+            # GUARD (2026-07-18, quant-validator #7): the walk-forward validates
+            # ONLY the ensemble path. The no_tilts/with_tilts variants are solved
+            # against a factor-implied cov with NO vol-target and NO crash hedge —
+            # the two shipped Σ-side edges — so an EXECUTED non-ensemble plan is a
+            # portfolio no backtest has ever seen, selected on trailing Sharpe
+            # (which favours the un-vol-targeted variant in calm markets, dropping
+            # drawdown protection right before it's wanted). The user executes
+            # ONLY ensemble; warn loudly (health-counter-visible) if the plan
+            # about to be presented for execution is anything else. No weights
+            # change here — visibility only, so no re-validation needed.
+            _exec_label = str(globals().get("TRADE_PLAN_PORTFOLIO_LABEL", "")).strip().lower()
+            if _exec_label and _exec_label not in ("ensemble", "unknown"):
+                print(f"[tradeplan][WARN] executable plan is '{_exec_label}', NOT the "
+                      f"validated ensemble — it has no vol-target/hedge and no backtest "
+                      f"support. Do NOT execute unless this is deliberate (TRADE_PLAN_MODE="
+                      f"{globals().get('TRADE_PLAN_MODE','?')}).")
            
             charts = dict(globals().get("charts", {}) or {})
             if ("tilts_comparison_rows" not in charts) or (not charts.get("tilts_comparison_rows")):
@@ -9010,7 +9037,10 @@ try:
     _flag_path = APP_DIR / "engine_done.flag"
     _flag_path.write_text(_json_done.dumps({
         "finished_at": _dt_done.now().isoformat(timespec="seconds"),
-        "build_stamp": str(globals().get("BUILD_STAMP", "?")),
+        # _BUILD_GIT_SHA (leading underscore) is the real binding; "BUILD_STAMP"
+        # was never defined so this serialised "?" every run — same dead-lookup
+        # class as the OOS-cache git-sha typo.
+        "build_stamp": str(globals().get("_BUILD_GIT_SHA", "?")),
     }))
 except Exception as _e_flag:
     print(f"[sentinel] engine_done.flag write failed: {_e_flag}")

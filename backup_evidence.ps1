@@ -37,6 +37,8 @@ $files = @(
     "portfolio_state.json",            # NAV / net-invested state
     "tlh_cooldown_state.json",         # TLH wash-swap protection
     "sanity_alerts.jsonl",             # halt/violation audit
+    "cash_ledger.jsonl",               # per-run brokerage/CGT/loss-carry = TAX record
+    "live_nav_history.jsonl",          # daily live NAV series (drift tracker input)
     "Stock Analysis.xlsm"              # holdings sheet = ticker universe
 )
 
