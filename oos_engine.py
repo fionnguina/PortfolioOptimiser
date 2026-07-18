@@ -9,6 +9,7 @@ not change mid-run. Validated by walk-forward-CV byte-diff (MaxDD/Sharpe/return)
 """
 from __future__ import annotations
 
+import os
 import numpy as np
 import pandas as pd
 
@@ -575,6 +576,15 @@ def run_oos_ensemble_walk_forward(
     # Conditional rebalancing diagnostics
     n_skipped = 0
     n_executed = 0
+    # Review #1 measurement: count rebalances the gate SKIPS (allocation drift
+    # < threshold) but where TLH fires. In the backtest a skip just does the
+    # targeted TLH swap; LIVE folds TLH into `units` before the gate, so those
+    # same rebalances would tip the live gate to RUN and execute a FULL re-trim
+    # to target — realising CGT the backtest avoided. This tallies how often
+    # that spurious RUN would occur and the mean drift (= the extra turnover).
+    _n_skip_tlh = 0
+    _skip_tlh_drift_sum = 0.0
+    _last_delta_sum = float("nan")
     # Lot book for CGT modelling — tracks acquisition dates + cost basis FIFO.
     _lot_book = LotBook()
     # FY accumulators: AU financial year runs 1 Jul – 30 Jun. Gains/losses
@@ -941,6 +951,7 @@ def run_oos_ensemble_walk_forward(
                 (w_blend.reindex(union_idx).fillna(0.0)
                  - _prev_blend_w.reindex(union_idx).fillna(0.0)).abs().sum()
             )
+            _last_delta_sum = delta_sum
             if delta_sum < _skip_delta_eff:
                 skip_rebal = True
                 w_blend = _prev_blend_w.copy()
@@ -1119,6 +1130,11 @@ def run_oos_ensemble_walk_forward(
                     _fy_buckets[k] += tlh_out["realised"][k]
                 if tlh_out["n_events"]:
                     _tlh_events_all.extend(tlh_out["events"])
+                    # #1 measurement: a skip where TLH fired = a spurious live RUN.
+                    if skip_rebal:
+                        _n_skip_tlh += 1
+                        if _last_delta_sum == _last_delta_sum:  # not NaN
+                            _skip_tlh_drift_sum += float(_last_delta_sum)
             except Exception as _e:
                 # TLH is non-essential — never break the backtest on it.
                 pass
@@ -1196,7 +1212,17 @@ def run_oos_ensemble_walk_forward(
               f"~${_defer_value_total:,.0f} of sells deferred past the 12mo "
               f"discount boundary (window={int(globals().get('LT_DEFER_WINDOW_DAYS', 0))}d); "
               f"shield released at {_defer_released_rebals} rebal(s)")
+    # Review #1 measurement (env-gated print; count always returned).
+    _n_total = n_skipped + n_executed
+    _skip_tlh_mean = (_skip_tlh_drift_sum / _n_skip_tlh) if _n_skip_tlh else 0.0
+    if os.environ.get("PORTOPT_TLH_GATE_DIAG"):
+        print(f"[tlh-gate-diag] spurious-RUN candidates: {_n_skip_tlh} of {_n_total} "
+              f"rebalances SKIP-but-TLH-fired ({(_n_skip_tlh/_n_total*100 if _n_total else 0):.1f}%); "
+              f"mean drift on those = {_skip_tlh_mean*100:.2f}% (= extra turnover a live "
+              f"full re-trim would execute; CGT cost ~ that x gain-frac x MTR)")
     return {
+        "n_skip_with_tlh": _n_skip_tlh,
+        "skip_tlh_mean_drift": _skip_tlh_mean,
         "blended_returns": blended_returns,
         "per_candidate_returns": per_cand_rets_df,
         "softmax_history": softmax_history,
