@@ -282,7 +282,7 @@ _OOS_ENGINE_INJECT = (
     "CRASH_HEDGE_DD_TRIGGER", "CRASH_HEDGE_LOOKBACK_DAYS", "CRISIS_HEDGE_BAND_SD",
     "CRISIS_HEDGE_MA_DAYS", "CRISIS_HEDGE_TICKER", "CRISIS_HEDGE_WEIGHT",
     "EARLY_TRIGGER_DD_DEEPEN", "EARLY_TRIGGER_MIN_DAYS", "ENSEMBLE_SLOT_NAMES",
-    "LT_DEFER_DD_CONDITIONAL", "LT_DEFER_RELEASE_DD", "LT_DEFER_WINDOW_DAYS",
+    "LT_DEFER_DD_CONDITIONAL", "LT_DEFER_RELEASE_DD", "LT_DEFER_WINDOW_DAYS", "LOT_MATCH_METHOD",
     "MU_SHRINKAGE_LAMBDA", "MU_PRIOR_METHOD", "PER_ASSET_WEIGHT_CAPS", "RETURN_OUTLIER_THRESHOLD",
     "SKIP_REBAL_DELTA", "SKIP_REBAL_DELTA_CALM", "STRETCH_FLOOR_CALM",
     "STRETCH_FLOOR_PREDICTIVE", "TLH_PAIRS", "TREND_SLEEVE_WEIGHT", "VOL_TARGET_ANNUAL",
@@ -1016,6 +1016,24 @@ if _mu_prior_env:
         print(f"[config-override] bad PORTOPT_MU_PRIOR_METHOD '{_mu_prior_env}' ignored "
               f"(want median|bl|ff5)")
 
+# CGT parcel-matching method for the sim's LotBook (and any LotBook-based sell):
+#   'FIFO' — oldest parcels first (legacy default; matches a FIFO broker account)
+#   'HIFO' — highest cost-basis first (minimises raw realised gain; more ST though)
+# The reported Tax_Ledger + trade-plan CGT estimate default HIFO (compute_cgt_tax/
+# compute_fy_tax_ledger); this knob lets the SIM match, and lets us measure the gap.
+# Tax-accounting axis (same trades, only realised tax differs). Sweep via env:
+# PORTOPT_LOT_METHOD=HIFO. Default FIFO → backtest byte-identical.
+LOT_MATCH_METHOD = "FIFO"
+_lot_method_env = os.environ.get("PORTOPT_LOT_METHOD")
+if _lot_method_env:
+    _lm = _lot_method_env.strip().upper()
+    if _lm in ("FIFO", "HIFO"):
+        LOT_MATCH_METHOD = _lm
+        print(f"[config-override] LOT_MATCH_METHOD={LOT_MATCH_METHOD} via env")
+    else:
+        print(f"[config-override] bad PORTOPT_LOT_METHOD '{_lot_method_env}' ignored "
+              f"(want FIFO|HIFO)")
+
 
 # ============================================================================
 # LT-DISCOUNT-AWARE SELL DEFERRAL (tax-code arbitrage, task 2026-07-02)
@@ -1490,7 +1508,8 @@ def _log_config_snapshot() -> None:
     print(f"[config]                       US live: min ${BROKER_CONFIG['live_us_min_fee']:.2f} + {BROKER_CONFIG['live_us_rate']*100:.3f}%")
     print(f"[config] CGT                   profile={ACTIVE_CGT_PROFILE}  MTR={CGT_CONFIG['marginal_tax_rate']*100:.0f}%  "
           f"LT discount={float(CGT_CONFIG['lt_discount_rate'])*100:.0f}%  "
-          f"medicare={'on' if CGT_CONFIG.get('include_medicare', True) else 'off'}")
+          f"medicare={'on' if CGT_CONFIG.get('include_medicare', True) else 'off'}  "
+          f"sim-lots={LOT_MATCH_METHOD}")
     print(f"[config] REBAL                 freq={REBALANCE_FREQ} (~{REBALANCES_PER_YEAR:.1f}/yr)  "
           f"skip<{SKIP_REBAL_DELTA*100:.0f}%Δw  early-trigger>{EARLY_TRIGGER_DD_DEEPEN*100:.0f}% DD "
           f"(min {EARLY_TRIGGER_MIN_DAYS}d)")
@@ -5321,6 +5340,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"gcaps:{json.dumps(globals().get('SECTOR_GROUP_CAPS', {}), sort_keys=True)}".encode())
         h.update(f"mu_shrink:{float(globals().get('MU_SHRINKAGE_LAMBDA', 0.0) or 0.0)}".encode())
         h.update(f"mu_prior:{str(globals().get('MU_PRIOR_METHOD', 'median')).lower()}".encode())
+        h.update(f"lot_method:{str(globals().get('LOT_MATCH_METHOD', 'FIFO')).upper()}".encode())
         h.update(f"lt_defer:{int(globals().get('LT_DEFER_WINDOW_DAYS', 0) or 0)}".encode())
         h.update(f"lt_defer_cond:{int(bool(globals().get('LT_DEFER_DD_CONDITIONAL', False)))}".encode())
         h.update(f"lt_defer_reldd:{float(globals().get('LT_DEFER_RELEASE_DD', 0.0) or 0.0)}".encode())

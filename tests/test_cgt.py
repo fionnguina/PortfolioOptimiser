@@ -165,3 +165,55 @@ def test_zero_trade_safe(cgt):
     )
     assert tax == 0.0
     assert bkd["taxable"] == 0.0
+
+
+# ============================================================================
+# LotBook.sell — FIFO (legacy default) vs HIFO parcel matching
+# ============================================================================
+
+def _two_lot_book():
+    """Old cheap lot (LT-eligible) + recent expensive lot (short-term)."""
+    lb = _cgt_mod.LotBook()
+    lb.buy("A", 100, pd.Timestamp("2024-01-01"), 10.0)  # old, low cost basis
+    lb.buy("A", 100, pd.Timestamp("2025-06-01"), 20.0)  # recent, high cost basis
+    return lb
+
+def test_lotbook_sell_defaults_to_fifo():
+    """Default (no method) sells the OLDEST parcel first (back-compat)."""
+    lb = _two_lot_book()
+    out = lb.sell("A", 100, pd.Timestamp("2025-07-01"), 25.0)
+    # FIFO consumes the 2024 @10 lot → gain (25-10)*100=1500, held ~1.5y → LT
+    assert out["lt_gain"] == pytest.approx(1500.0)
+    assert out["st_gain"] == pytest.approx(0.0)
+    # survivor is the recent 20.0 lot, 100 units
+    assert lb.units("A") == pytest.approx(100.0)
+    assert lb.lots["A"][0]["cost_basis_per_unit"] == pytest.approx(20.0)
+
+def test_lotbook_sell_hifo_takes_highest_cost_basis():
+    """HIFO sells the highest cost-basis parcel first → smaller raw gain,
+    but here that parcel is recent → SHORT-term (the discount interaction)."""
+    lb = _two_lot_book()
+    out = lb.sell("A", 100, pd.Timestamp("2025-07-01"), 25.0, method="HIFO")
+    # HIFO consumes the 2025 @20 lot → gain (25-20)*100=500, held ~1mo → ST
+    assert out["st_gain"] == pytest.approx(500.0)
+    assert out["lt_gain"] == pytest.approx(0.0)
+    # survivor is the old 10.0 lot, 100 units, chronological order preserved
+    assert lb.units("A") == pytest.approx(100.0)
+    assert lb.lots["A"][0]["cost_basis_per_unit"] == pytest.approx(10.0)
+
+def test_lotbook_sell_hifo_partial_across_two_lots():
+    """Selling more than the top lot spills into the next-highest cost basis."""
+    lb = _two_lot_book()
+    out = lb.sell("A", 150, pd.Timestamp("2025-07-01"), 25.0, method="HIFO")
+    # 100 from @20 (ST gain 500) + 50 from @10 (LT gain (25-10)*50=750)
+    assert out["st_gain"] == pytest.approx(500.0)
+    assert out["lt_gain"] == pytest.approx(750.0)
+    assert lb.units("A") == pytest.approx(50.0)  # 50 left in the old lot
+
+def test_lotbook_sell_fifo_hifo_agree_when_single_lot():
+    for m in ("FIFO", "HIFO"):
+        lb = _cgt_mod.LotBook()
+        lb.buy("A", 100, pd.Timestamp("2024-01-01"), 10.0)
+        out = lb.sell("A", 40, pd.Timestamp("2025-07-01"), 15.0, method=m)
+        assert out["lt_gain"] == pytest.approx(200.0)  # (15-10)*40
+        assert lb.units("A") == pytest.approx(60.0)

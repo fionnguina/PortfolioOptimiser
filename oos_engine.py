@@ -74,6 +74,7 @@ ENSEMBLE_SLOT_NAMES = ()
 LT_DEFER_DD_CONDITIONAL = None
 LT_DEFER_RELEASE_DD = None
 LT_DEFER_WINDOW_DAYS = None
+LOT_MATCH_METHOD = "FIFO"     # 'FIFO'(legacy) | 'HIFO' — CGT parcel-matching order in the sim
 MU_SHRINKAGE_LAMBDA = None
 MU_PRIOR_METHOD = "median"   # 'median'(legacy) | 'bl' | 'ff5' — structured-prior shrinkage selector
 MU_FF5_PRIOR = None          # optional pd.Series (FF5 μ) for method='ff5'; set per-run by the caller
@@ -1145,6 +1146,7 @@ def run_oos_ensemble_walk_forward(
                         out = _lot_book.sell(
                             tkr, -delta_units, t, p,
                             protect=(_protect_fn(p) if _protect_fn else None),
+                            method=str(globals().get("LOT_MATCH_METHOD", "FIFO")),
                         )
                         for k in _fy_buckets:
                             _fy_buckets[k] += out[k]

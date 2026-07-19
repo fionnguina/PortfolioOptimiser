@@ -508,14 +508,20 @@ class LotBook:
         })
 
     def sell(self, ticker: str, units: float, date, price: float,
-             cfg: dict | None = None, protect=None) -> dict:
-        """FIFO sale. Returns dict with ST/LT realised gain & loss components.
+             cfg: dict | None = None, protect=None, method: str = "FIFO") -> dict:
+        """Parcel sale. Returns dict with ST/LT realised gain & loss components.
+
+        `method`: parcel-matching order — "FIFO" (default; oldest lots first,
+        the historical behaviour) or "HIFO" (highest cost-basis first, which
+        minimises the raw realised gain per sale but tends to realise more
+        SHORT-TERM gains — the 50% LT discount interaction makes the net tax
+        effect empirical, hence the knob). AU ATO permits specific parcel
+        identification, so HIFO is broker-realisable.
 
         `protect`: optional callable(lot: dict, hold_days: int) -> bool.
-        Lots for which it returns True are SKIPPED by the allocation
-        (left intact, FIFO continues to the next lot). Used by the
-        LT-discount deferral rule to shield near-long-term gain lots
-        from short-term realisation.
+        Lots for which it returns True are SKIPPED by the allocation (left
+        intact). Used by the LT-discount deferral rule to shield near-long-term
+        gain lots from short-term realisation.
         """
         if cfg is None:
             cfg = CGT_CONFIG
@@ -525,17 +531,26 @@ class LotBook:
             return out
 
         sale_date = pd.Timestamp(date)
+        lots = self.lots[ticker]
+        # Matching order. FIFO = insertion (chronological) order; HIFO = highest
+        # cost-basis first (date asc as a deterministic tiebreak). Order only
+        # affects WHICH parcels are consumed; survivors are rebuilt in original
+        # chronological order so future matches stay stable.
+        order = list(range(len(lots)))
+        if str(method).upper() == "HIFO":
+            order.sort(key=lambda i: (-float(lots[i]["cost_basis_per_unit"]),
+                                      lots[i]["date"]))
+
         remaining = float(units)
-        new_lots = []
-        for lot in self.lots[ticker]:
+        sold_units = [0.0] * len(lots)
+        for i in order:
             if remaining <= 1e-9:
-                new_lots.append(lot)
-                continue
+                break
+            lot = lots[i]
             if protect is not None:
                 try:
                     _hd = (sale_date - lot["date"]).days
                     if protect(lot, _hd):
-                        new_lots.append(lot)
                         continue
                 except Exception:
                     pass
@@ -558,14 +573,15 @@ class LotBook:
                     out["st_loss"] += -gain
 
             remaining -= qty
-            if qty < lot["units"]:
-                new_lots.append({
-                    "date": lot["date"],
-                    "units": lot["units"] - qty,
-                    "cost_basis_per_unit": lot["cost_basis_per_unit"],
-                })
+            sold_units[i] += qty
 
-        self.lots[ticker] = new_lots
+        self.lots[ticker] = [
+            {"date": lot["date"],
+             "units": lot["units"] - sold_units[i],
+             "cost_basis_per_unit": lot["cost_basis_per_unit"]}
+            for i, lot in enumerate(lots)
+            if (lot["units"] - sold_units[i]) > 1e-9
+        ]
         return out
 
     def units(self, ticker: str) -> float:
