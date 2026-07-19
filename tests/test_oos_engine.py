@@ -92,6 +92,51 @@ def test_mu_shrinkage_partial_pulls_toward_median(_mu_lambda):
     assert out["C"] == pytest.approx(0.06)  # 0.5*0.02 + 0.5*0.10
 
 
+# --- structured-prior shrinkage (MU_PRIOR_METHOD: median | bl | ff5) ---------
+
+@pytest.fixture
+def _mu_prior():
+    saved_m = oos_engine.MU_PRIOR_METHOD
+    saved_f = oos_engine.MU_FF5_PRIOR
+    yield lambda m=None, f=None: (setattr(oos_engine, "MU_PRIOR_METHOD", m),
+                                  setattr(oos_engine, "MU_FF5_PRIOR", f))
+    oos_engine.MU_PRIOR_METHOD = saved_m
+    oos_engine.MU_FF5_PRIOR = saved_f
+
+def test_mu_prior_default_is_median_backcompat(_mu_lambda, _mu_prior):
+    # method unset/None → legacy median behaviour (Sigma ignored)
+    _mu_lambda(0.5); _mu_prior(m=None)
+    mu = pd.Series([0.20, 0.10, 0.02], index=["A", "B", "C"])
+    out = oos_engine._apply_mu_shrinkage(mu, Sigma=None)
+    assert out["A"] == pytest.approx(0.15)
+
+def test_mu_prior_bl_preserves_mean_and_blends(_mu_lambda, _mu_prior):
+    _mu_lambda(0.4); _mu_prior(m="bl")
+    idx = ["A", "B", "C"]
+    mu = pd.Series([0.30, 0.10, 0.05], index=idx)  # mean ~0.15
+    # low-vol A, high-vol C → BL Π rewards the high-covariance name
+    Sigma = pd.DataFrame(np.diag([0.01, 0.04, 0.09]), index=idx, columns=idx)
+    out = oos_engine._apply_mu_shrinkage(mu, Sigma=Sigma)
+    assert isinstance(out, pd.Series)
+    # blend keeps the cross-sectional mean (Π rescaled to μ's mean, λ is a blend)
+    assert float(out.mean()) == pytest.approx(float(mu.mean()), rel=1e-6)
+    # C's prior (high var) exceeds its μ → shrinkage lifts C toward it
+    assert out["C"] > mu["C"]
+
+def test_mu_prior_bl_degenerate_sigma_falls_back_to_median(_mu_lambda, _mu_prior):
+    _mu_lambda(1.0); _mu_prior(m="bl")
+    mu = pd.Series([0.20, 0.10, 0.02], index=["A", "B", "C"])
+    out = oos_engine._apply_mu_shrinkage(mu, Sigma=None)  # no Σ → median fallback
+    assert np.allclose(out.values, 0.10)
+
+def test_mu_prior_ff5_uses_supplied_prior(_mu_lambda, _mu_prior):
+    prior = pd.Series([0.05, 0.05, 0.05], index=["A", "B", "C"])
+    _mu_lambda(1.0); _mu_prior(m="ff5", f=prior)
+    mu = pd.Series([0.20, 0.10, 0.02], index=["A", "B", "C"])
+    out = oos_engine._apply_mu_shrinkage(mu, Sigma=None)
+    assert np.allclose(out.values, 0.05)  # λ=1 → fully the FF5 prior
+
+
 # ============================================================================
 # _check_crash_trigger (hysteresis)
 # ============================================================================

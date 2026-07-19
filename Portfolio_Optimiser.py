@@ -283,7 +283,7 @@ _OOS_ENGINE_INJECT = (
     "CRISIS_HEDGE_MA_DAYS", "CRISIS_HEDGE_TICKER", "CRISIS_HEDGE_WEIGHT",
     "EARLY_TRIGGER_DD_DEEPEN", "EARLY_TRIGGER_MIN_DAYS", "ENSEMBLE_SLOT_NAMES",
     "LT_DEFER_DD_CONDITIONAL", "LT_DEFER_RELEASE_DD", "LT_DEFER_WINDOW_DAYS",
-    "MU_SHRINKAGE_LAMBDA", "PER_ASSET_WEIGHT_CAPS", "RETURN_OUTLIER_THRESHOLD",
+    "MU_SHRINKAGE_LAMBDA", "MU_PRIOR_METHOD", "PER_ASSET_WEIGHT_CAPS", "RETURN_OUTLIER_THRESHOLD",
     "SKIP_REBAL_DELTA", "SKIP_REBAL_DELTA_CALM", "STRETCH_FLOOR_CALM",
     "STRETCH_FLOOR_PREDICTIVE", "TLH_PAIRS", "TREND_SLEEVE_WEIGHT", "VOL_TARGET_ANNUAL",
 )
@@ -999,6 +999,23 @@ if _mu_shrink_env:
     except Exception as _e_mu_env:
         print(f"[config-override] bad PORTOPT_MU_SHRINKAGE ignored: {_e_mu_env}")
 
+# Which PRIOR the μ-shrinkage blends toward (only active when λ>0):
+#   'median' — cross-sectional median scalar (legacy; FAILED dev/val 2026-07-02)
+#   'bl'     — Black-Litterman Σ-implied equilibrium (structured; needs Σ)
+#   'ff5'    — FF5 factor-model μ (mu_vec_opt) as the prior
+# Structured-prior experiment (2026-07-19, reference-mu-structured-prior-prereg).
+# Sweep via env: PORTOPT_MU_PRIOR_METHOD=bl PORTOPT_MU_SHRINKAGE=0.5
+MU_PRIOR_METHOD = "median"
+_mu_prior_env = os.environ.get("PORTOPT_MU_PRIOR_METHOD")
+if _mu_prior_env:
+    _mp = _mu_prior_env.strip().lower()
+    if _mp in ("median", "bl", "ff5"):
+        MU_PRIOR_METHOD = _mp
+        print(f"[config-override] MU_PRIOR_METHOD={MU_PRIOR_METHOD} via env")
+    else:
+        print(f"[config-override] bad PORTOPT_MU_PRIOR_METHOD '{_mu_prior_env}' ignored "
+              f"(want median|bl|ff5)")
+
 
 # ============================================================================
 # LT-DISCOUNT-AWARE SELL DEFERRAL (tax-code arbitrage, task 2026-07-02)
@@ -1487,7 +1504,11 @@ def _log_config_snapshot() -> None:
         )
         print(f"[config] SECTOR CAPS           {_gcaps_str}")
     if MU_SHRINKAGE_LAMBDA > 0:
-        print(f"[config] MU SHRINKAGE          λ={MU_SHRINKAGE_LAMBDA:.2f} toward cross-sectional median")
+        _prior_desc = {"median": "cross-sectional median",
+                       "bl": "Black-Litterman Σ-implied equilibrium",
+                       "ff5": "FF5 factor-model μ"}.get(
+                           str(MU_PRIOR_METHOD).lower(), MU_PRIOR_METHOD)
+        print(f"[config] MU SHRINKAGE          λ={MU_SHRINKAGE_LAMBDA:.2f} toward {_prior_desc}")
     if LT_DEFER_WINDOW_DAYS > 0:
         if LT_DEFER_RELEASE_DD < 0:
             _cond_str = f"released when SPY 252d DD ≤ {LT_DEFER_RELEASE_DD*100:.0f}%"
@@ -5299,6 +5320,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         h.update(f"caps:{json.dumps(globals().get('PER_ASSET_WEIGHT_CAPS', {}), sort_keys=True)}".encode())
         h.update(f"gcaps:{json.dumps(globals().get('SECTOR_GROUP_CAPS', {}), sort_keys=True)}".encode())
         h.update(f"mu_shrink:{float(globals().get('MU_SHRINKAGE_LAMBDA', 0.0) or 0.0)}".encode())
+        h.update(f"mu_prior:{str(globals().get('MU_PRIOR_METHOD', 'median')).lower()}".encode())
         h.update(f"lt_defer:{int(globals().get('LT_DEFER_WINDOW_DAYS', 0) or 0)}".encode())
         h.update(f"lt_defer_cond:{int(bool(globals().get('LT_DEFER_DD_CONDITIONAL', False)))}".encode())
         h.update(f"lt_defer_reldd:{float(globals().get('LT_DEFER_RELEASE_DD', 0.0) or 0.0)}".encode())
@@ -6125,7 +6147,7 @@ globals()["oos_prices_aud_long"] = oos_prices_aud_long
 w_ensemble_live = pd.Series(dtype=float)
 ensemble_mix_live = pd.Series(dtype=float)
 try:
-    _mu_live = _apply_mu_shrinkage(pd.Series(mu_ann_geo).astype(float).dropna())
+    _mu_live_raw = pd.Series(mu_ann_geo).astype(float).dropna()
     _Sigma_live = Sigma_daily.copy()
     # Ship-consistency: the live solve must use the SAME covariance estimator
     # as the shipped backtest. Overlay Ledoit-Wolf on the good-coverage recent
@@ -6144,6 +6166,12 @@ try:
         except Exception as _e_lwlive:
             print(f"[cov-shrink] live {_cov_method_live} failed ({_e_lwlive}); using sample cov")
             _Sigma_live = Sigma_daily.copy()
+    # μ-shrinkage AFTER Σ is finalised so method='bl' sees the same LW Σ the
+    # solver uses (parity with the backtest, which now also shrinks post-Σ).
+    # For method='ff5', publish the FF5 μ (mu_vec_opt) as the prior first.
+    if str(globals().get("MU_PRIOR_METHOD", "median")).lower() == "ff5":
+        _oos_engine.MU_FF5_PRIOR = pd.Series(globals().get("mu_vec_opt", pd.Series(dtype=float)))
+    _mu_live = _apply_mu_shrinkage(_mu_live_raw, _Sigma_live)
     _spy_mu_live = float(_mu_live["SPY"]) if "SPY" in _mu_live.index else None
     _cand_live = solve_candidate_portfolios(_mu_live, _Sigma_live, _spy_mu_live)
     # Publish the live slot weights so downstream consumers (EF chart, TLH,

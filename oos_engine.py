@@ -75,6 +75,8 @@ LT_DEFER_DD_CONDITIONAL = None
 LT_DEFER_RELEASE_DD = None
 LT_DEFER_WINDOW_DAYS = None
 MU_SHRINKAGE_LAMBDA = None
+MU_PRIOR_METHOD = "median"   # 'median'(legacy) | 'bl' | 'ff5' — structured-prior shrinkage selector
+MU_FF5_PRIOR = None          # optional pd.Series (FF5 μ) for method='ff5'; set per-run by the caller
 PER_ASSET_WEIGHT_CAPS = None
 RETURN_OUTLIER_THRESHOLD = None
 SKIP_REBAL_DELTA = None
@@ -136,12 +138,57 @@ def estimate_rebalance_cost_fraction(
     return float(fixed_cost + spread_cost + fx_cost)
 
 
-def _apply_mu_shrinkage(mu: "pd.Series") -> "pd.Series":
-    """Shrink expected returns toward the cross-sectional median (see above)."""
+def _bl_equilibrium_prior(mu: "pd.Series", Sigma) -> "pd.Series | float":
+    """Black-Litterman Σ-implied equilibrium prior for μ-shrinkage.
+
+    Π = Σ_annual · w_ref (reverse-optimisation FOC μ = δ·Σ·w), then rescaled so
+    its cross-sectional MEAN equals μ's — which cancels the δ/risk-aversion scale
+    and makes λ a pure blend toward the covariance-implied RELATIVE return
+    structure rather than a level shift. w_ref = equal-weight (neutral; no
+    market-cap data available). Σ is the DAILY covariance, annualised ×252 so the
+    prior lands in μ's annual units. Returns a Series aligned to mu.index, or the
+    scalar median as a safe fallback when Σ is unusable (degenerate → never break
+    the plan)."""
+    try:
+        idx = mu.index
+        S = Sigma.reindex(index=idx, columns=idx)
+        if len(idx) < 2 or S.isna().any().any():
+            return float(pd.to_numeric(mu, errors="coerce").median())
+        n = len(idx)
+        w_ref = np.full(n, 1.0 / n)
+        pi = pd.Series((S.to_numpy(dtype=float) * 252.0) @ w_ref, index=idx)
+        mu_num = pd.to_numeric(mu, errors="coerce")
+        m_mu, m_pi = float(mu_num.mean()), float(pi.mean())
+        if not np.isfinite(m_pi) or abs(m_pi) < 1e-12:
+            return float(mu_num.median())
+        return pi * (m_mu / m_pi)
+    except Exception:
+        return float(pd.to_numeric(mu, errors="coerce").median())
+
+
+def _apply_mu_shrinkage(mu: "pd.Series", Sigma=None) -> "pd.Series":
+    """Shrink expected returns toward a prior. MU_PRIOR_METHOD selects the prior:
+      'median' (legacy, default) — cross-sectional median scalar (FAILED dev/val
+                                   2026-07-02; kept for back-compat);
+      'bl'                       — Black-Litterman Σ-implied equilibrium (needs Σ);
+      'ff5'                      — factor-model μ (passed via MU_FF5_PRIOR global,
+                                   aligned to mu.index; median-fill for gaps).
+    Intensity = MU_SHRINKAGE_LAMBDA. λ=0 → no-op (production default → byte-identical)."""
     lam = float(globals().get("MU_SHRINKAGE_LAMBDA", 0.0) or 0.0)
     if lam <= 0.0 or mu is None or len(mu) == 0:
         return mu
-    prior = float(pd.to_numeric(mu, errors="coerce").median())
+    method = str(globals().get("MU_PRIOR_METHOD", "median") or "median").lower()
+    if method == "bl" and Sigma is not None:
+        prior = _bl_equilibrium_prior(mu, Sigma)
+    elif method == "ff5":
+        _ff5 = globals().get("MU_FF5_PRIOR", None)
+        if isinstance(_ff5, pd.Series) and not _ff5.empty:
+            prior = pd.to_numeric(_ff5, errors="coerce").reindex(mu.index)
+            prior = prior.fillna(float(pd.to_numeric(mu, errors="coerce").median()))
+        else:
+            prior = float(pd.to_numeric(mu, errors="coerce").median())
+    else:  # 'median' or any unknown → legacy behaviour
+        prior = float(pd.to_numeric(mu, errors="coerce").median())
     return (1.0 - lam) * mu + lam * prior
 
 
@@ -656,13 +703,15 @@ def run_oos_ensemble_walk_forward(
 
         log_ret = np.log1p(train_rets)
         mu = pd.Series(np.expm1(log_ret.mean() * 252.0), index=train_rets.columns)
-        mu = _apply_mu_shrinkage(mu)
+        # Σ first: structured-prior μ-shrinkage (method='bl') needs it. Order-only
+        # change; sample/LW selection and downstream use are unchanged.
         if _cov_method != "sample":
             Sigma, _lw_delta = estimate_covariance(train_rets, method=_cov_method)
             _lw_delta_sum += _lw_delta
             _lw_delta_n += 1
         else:
             Sigma = train_rets.cov()
+        mu = _apply_mu_shrinkage(mu, Sigma)
         spy_mu = float(mu[benchmark_ticker]) if benchmark_ticker in mu.index else None
 
         # If auto factor tilts enabled, compute the trailing-N-day factor
