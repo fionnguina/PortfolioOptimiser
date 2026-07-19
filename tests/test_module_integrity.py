@@ -76,12 +76,14 @@ def test_all_engine_globals_get_names_bind():
     A name counts as bound if it's assigned/annotated at any indentation
     (`NAME =` / `NAME:`), set dynamically via `globals()["NAME"] =`, or imported.
     """
-    # KNOWN-DEAD, tracked separately (found by this guard 2026-07-18). Both read
-    # a global nothing ever sets, but degrade gracefully: DRIFT_LAST_SUMMARY just
-    # skips a health-summary line; TRADEPLAN_VALIDATION_DIAG falls back to other
-    # globals. Left as-is here (wiring their producers is feature work, not
-    # review-scope); allowlisted so this guard still flags any NEW dead lookup.
-    _KNOWN_DEAD = {"DRIFT_LAST_SUMMARY", "TRADEPLAN_VALIDATION_DIAG"}
+    # KNOWN-DEAD allowlist. Empty as of 2026-07-19: DRIFT_LAST_SUMMARY and
+    # TRADEPLAN_VALIDATION_DIAG (found dead by this guard 2026-07-18) now have
+    # producers wired via `globals()["NAME"] =` — the drift tracker publishes the
+    # health-summary recap, the auto trade-plan branch publishes the Sharpe diag.
+    # Their consumers keep the graceful fallback for runs where the producer
+    # branch doesn't execute. Add a name here (with a note) only if it's genuinely
+    # dead-but-graceful and wiring the producer is out of scope.
+    _KNOWN_DEAD = set()
 
     names = re.findall(r"globals\(\)\.get\(['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]",
                        _ENGINE_SRC)

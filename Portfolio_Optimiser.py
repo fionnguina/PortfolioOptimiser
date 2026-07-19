@@ -6968,6 +6968,16 @@ if USE_XLWINGS:
                               f"(Sharpe — ens:{diag.get('sharpe_ensemble', np.nan):.2f}, "
                               f"with:{diag.get('sharpe_with_tilts', np.nan):.2f}, "
                               f"no:{diag.get('sharpe_no_tilts', np.nan):.2f})")
+                        # Publish the validation diag so the OPT-sheet writer
+                        # (~8697) shows real Sharpe numbers instead of NaN. The
+                        # Sharpes only exist on the auto branch; forced modes
+                        # keep the graceful fallback (mode/selected/lookback).
+                        globals()["TRADEPLAN_VALIDATION_DIAG"] = {
+                            **diag,
+                            "mode": "auto",
+                            "selected": choice_label,
+                            "lookback_days": int(globals().get("VALIDATION_LOOKBACK_DAYS", 252)),
+                        }
                     except Exception as _e_choose:
                         print(f"[tradeplan] choose_portfolio_for_tradeplan FAILED: {_e_choose!r}")
                         _tp_mode = "no_tilts"
@@ -7456,6 +7466,13 @@ if USE_XLWINGS:
                       f"current DD {_live_dd*100:+.2f}%, "
                       f"fills {_adherent}/{_total_fills} adherent, "
                       f"warnings={_n_warn}")
+                # Publish a one-line recap for the end-of-run health summary
+                # (~9014), which otherwise prints nothing for the drift tracker.
+                globals()["DRIFT_LAST_SUMMARY"] = (
+                    f"NAV {int(_live_nav.size)} samples ({_nav_uniq} distinct) "
+                    f"src={_nav_src}, DD {_live_dd*100:+.2f}%, "
+                    f"fills {_adherent}/{_total_fills} adherent, warnings={_n_warn}"
+                )
                 if _live_nav.size >= 2 and _nav_uniq < 2:
                     print("[drift][WARN] live NAV series is CONSTANT — the drawdown "
                           "alert cannot fire. NAV source is not tracking the "
