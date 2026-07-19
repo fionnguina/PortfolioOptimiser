@@ -13,6 +13,7 @@ values via _sync_research_modes() before dispatch. Validated by running the mode
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import json
@@ -1386,6 +1387,22 @@ def _run_walk_forward_cv() -> int:
     print(f"[wf-cv] engine done ({len(strat_rets)} OOS days, "
           f"{strat_rets.index.min().date()} → {strat_rets.index.max().date()}) "
           f"in {time.perf_counter()-t1:.1f}s")
+
+    # Env-gated per-ticker usage audit over the FULL 10y walk-forward (spans
+    # 2020/2022 crises where diversifiers activate) — for the universe-pruning
+    # question. Diagnostic only; PORTOPT_UNIV_AUDIT=1.
+    if os.environ.get("PORTOPT_UNIV_AUDIT"):
+        _bw = out.get("blended_weights")
+        if isinstance(_bw, pd.DataFrame) and not _bw.empty:
+            _mx = _bw.abs().max().sort_values(ascending=False)
+            _mn = _bw.abs().mean()
+            print(f"[univ-audit] {_bw.shape[0]} rebalances × {_bw.shape[1]} tickers, "
+                  f"{_bw.index.min().date()} → {_bw.index.max().date()}")
+            print(f"[univ-audit] {'ticker':10} {'maxW':>7} {'meanW':>7}")
+            for _t in _mx.index:
+                print(f"[univ-audit] {str(_t):10} {_mx[_t]*100:6.2f}% {_mn.get(_t,0)*100:6.3f}%")
+            _dead = sorted(_t for _t in _mx.index if _mx[_t] <= 0.01)
+            print(f"[univ-audit] NEVER >1% over 10y ({len(_dead)}): {_dead}")
 
     spy_ret_full = (px_aud["SPY"].pct_change().dropna()
                     if "SPY" in px_aud.columns else pd.Series(dtype=float))
