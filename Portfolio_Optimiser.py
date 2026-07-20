@@ -105,6 +105,9 @@ from cgt import (
     compute_cgt_for_rebalance,
     au_financial_year,
     compute_fy_tax_ledger,
+    load_tax_settlements,
+    tax_provision_from_ledger,
+    TAX_SETTLEMENTS_FILENAME,
 )
 from drift import (
     DRIFT_MONTHLY_THRESH,
@@ -857,6 +860,18 @@ CASH_RESERVE_PCT       = 0.005   # 0.5% of investable
 CASH_RESERVE_MIN_AUD   = 300.0   # never reserve less than this
 # Imported at top of file.
 
+# CGT tax provision (2026-07-20): hold BACK the accrued-but-unpaid CGT as
+# un-investable cash so tax time never forces a sale. Provision = Σ over FYs of
+# (CGT owed − already settled), from the live Tax_Ledger + tax_settlements.json.
+# Realised-only. Reduces the cash the cash-fit can deploy (added on top of the
+# transaction reserve). Default ON; disable via PORTOPT_TAX_PROVISION=0. Record
+# an ATO payment (releases the reserve) via ibkr_paper_exec.py --record-tax-payment.
+TAX_PROVISION_ENABLED = True
+_tax_prov_env = os.environ.get("PORTOPT_TAX_PROVISION")
+if _tax_prov_env is not None and _tax_prov_env.strip() != "":
+    TAX_PROVISION_ENABLED = _tax_prov_env.strip() not in ("0", "false", "False", "no")
+    print(f"[config-override] TAX_PROVISION_ENABLED={TAX_PROVISION_ENABLED} via env")
+
 
 # ============================================================================
 # REBALANCE FREQUENCY
@@ -1509,7 +1524,8 @@ def _log_config_snapshot() -> None:
     print(f"[config] CGT                   profile={ACTIVE_CGT_PROFILE}  MTR={CGT_CONFIG['marginal_tax_rate']*100:.0f}%  "
           f"LT discount={float(CGT_CONFIG['lt_discount_rate'])*100:.0f}%  "
           f"medicare={'on' if CGT_CONFIG.get('include_medicare', True) else 'off'}  "
-          f"sim-lots={LOT_MATCH_METHOD}")
+          f"sim-lots={LOT_MATCH_METHOD}  "
+          f"tax-provision={'ON' if TAX_PROVISION_ENABLED else 'OFF'}")
     print(f"[config] REBAL                 freq={REBALANCE_FREQ} (~{REBALANCES_PER_YEAR:.1f}/yr)  "
           f"skip<{SKIP_REBAL_DELTA*100:.0f}%Δw  early-trigger>{EARLY_TRIGGER_DD_DEEPEN*100:.0f}% DD "
           f"(min {EARLY_TRIGGER_MIN_DAYS}d)")
@@ -7196,20 +7212,51 @@ if USE_XLWINGS:
                       f"${_avail_cash_aud:,.0f} cash − reserve "
                       f"(was NAV ${(portfolio_value_override or 0):,.0f})")
 
+            # === CGT tax provision (hold back accrued-but-unpaid tax as cash) ===
+            # Computed BEFORE the trade plans so the reserve reduces investable
+            # cash. Provision = Σ (CGT owed − settled) across FYs from the live
+            # ledger + tax_settlements.json. On failure → $0 (never blocks a plan).
+            _tax_provision = 0.0
+            if TAX_PROVISION_ENABLED:
+                try:
+                    _prov_ledger = compute_fy_tax_ledger(
+                        APP_DIR / "ibkr_fills_log.jsonl",
+                        seed_path=APP_DIR / "lots_seed.json",
+                        fx_map=fx_map_all, lot_match_method=LOT_MATCH_METHOD,
+                    )
+                    _settlements = load_tax_settlements(APP_DIR / TAX_SETTLEMENTS_FILENAME)
+                    _tax_provision = float(tax_provision_from_ledger(_prov_ledger, _settlements))
+                    globals()["TAX_PROVISION_AUD"] = _tax_provision
+                    if _tax_provision > 0:
+                        print(f"[tax-provision] reserving ${_tax_provision:,.2f} AUD accrued CGT "
+                              f"(un-investable; releases when you record ATO payment)")
+                    if (_avail_cash_aud is not None and np.isfinite(_avail_cash_aud)
+                            and _tax_provision > float(_avail_cash_aud)):
+                        print(f"[tax-provision][WARN] accrued CGT ${_tax_provision:,.0f} EXCEEDS "
+                              f"available cash ${float(_avail_cash_aud):,.0f} — the fund is "
+                              f"UNDER-PROVISIONED; a top-up or sale will be needed at lodgement.")
+                except Exception as _e_prov:
+                    print(f"[tax-provision] skipped ({_e_prov}); no reserve applied this run")
+            # Cash the plans may actually deploy = broker cash − tax provision.
+            _investable_cash_aud = (None if _avail_cash_aud is None
+                                    else max(0.0, float(_avail_cash_aud) - _tax_provision))
+            globals()["_avail_cash_aud"] = _avail_cash_aud          # raw (reporting/NAV)
+            globals()["_investable_cash_aud"] = _investable_cash_aud  # after tax provision
+
             # Build ALL three trade plans up-front; downstream code can compare
             # what each one implies, and the "active" one is picked below.
             trade_no, resid_no = make_trade_plan(
                 units, last_px_hold, fx_map_all, w_star,
                 include_zero_lines=True, include_flags=include_flags,
                 portfolio_value_override=portfolio_value_override,
-                available_cash_aud=_avail_cash_aud
+                available_cash_aud=_investable_cash_aud
             )
 
             trade_with, resid_with = make_trade_plan(
                 units, last_px_hold, fx_map_all, w_star_with_tilts,
                 include_zero_lines=True, include_flags=include_flags,
                 portfolio_value_override=portfolio_value_override,
-                available_cash_aud=_avail_cash_aud
+                available_cash_aud=_investable_cash_aud
             )
 
             trade_ens, resid_ens = None, None
@@ -7236,7 +7283,7 @@ if USE_XLWINGS:
                         units, last_px_hold, fx_map_all, _w_ens_full,
                         include_zero_lines=True, include_flags=include_flags,
                         portfolio_value_override=portfolio_value_override,
-                        available_cash_aud=_avail_cash_aud
+                        available_cash_aud=_investable_cash_aud
                     )
                 except Exception as _e_ens:
                     print(f"[tradeplan] ensemble plan build failed: {_e_ens}")
@@ -8212,10 +8259,13 @@ if USE_XLWINGS:
                 _tax_sht = get_or_clear_sheet(wb, 'Tax_Ledger')
                 _tax_sht.range("A1").value = ("FY Tax Ledger — ACTUAL fills (broker truth), "
                                               f"profile={ACTIVE_CGT_PROFILE}")
-                _tax_sht.range("A2").value = ("At lodgement: contribute any refund back into the "
-                                              "portfolio (or fund the bill externally) so live NAV "
-                                              "stays comparable to the backtest, which models tax "
-                                              "flows inside the portfolio.")
+                _tax_prov_now = float(globals().get("TAX_PROVISION_AUD", 0.0) or 0.0)
+                _tax_sht.range("A2").value = (
+                    f"Tax provision: {'ON' if TAX_PROVISION_ENABLED else 'OFF'} — "
+                    f"${_tax_prov_now:,.2f} AUD of unpaid CGT is held BACK as un-investable cash "
+                    f"(so lodgement never forces a sale). At lodgement, pay the ATO from that "
+                    f"reserve then run ibkr_paper_exec.py --record-tax-payment --fy <FY> --amount <$> "
+                    f"to RELEASE it. 'Carry-Fwd Out' chains losses across FYs.")
                 if not _fy_ledger_df.empty:
                     _tax_sht.range("A4").options(pd.DataFrame, index=False, header=True).value = _fy_ledger_df
                     print(f"[excel] Tax_Ledger: {len(_fy_ledger_df)} FY row(s) written "
@@ -8423,7 +8473,8 @@ if USE_XLWINGS:
             tgt_units_full = compute_target_units_for_holdings(
                 units, last_px_hold, fx_map_all, w_star, include_flags,
                 portfolio_value_override=portfolio_value_override,
-                available_cash_aud=globals().get("_avail_cash_aud"))
+                available_cash_aud=globals().get("_investable_cash_aud",
+                                                 globals().get("_avail_cash_aud")))
 
             # Holdings reconciliation fix (2026-06-27): pass the engine's
             # CURRENT units, NOT the new target. Writing target back to

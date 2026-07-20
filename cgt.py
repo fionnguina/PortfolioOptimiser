@@ -470,6 +470,68 @@ def compute_fy_tax_ledger(
     return pd.DataFrame(out_rows, columns=cols)
 
 
+# === CGT provision / tax reserve (live, 2026-07-20) ==========================
+# The live book runs fully invested, but realised CGT is a real liability owed
+# to the ATO at lodgement. Without a reserve, tax time forces a sale (which
+# triggers MORE CGT) or an external top-up. These helpers compute how much cash
+# to hold BACK as an un-investable tax provision = accrued CGT still owed
+# (across all FYs in the ledger) MINUS what's already been settled. Stateless
+# ledger + a tiny settlements file (so the reserve RELEASES once you pay).
+
+TAX_SETTLEMENTS_FILENAME = "tax_settlements.json"
+
+
+def load_tax_settlements(path) -> dict:
+    """Load {FY-label: amount_settled_aud} from the settlements file. Missing /
+    unreadable → empty (reserve everything owed, the safe default)."""
+    import json as _json
+    from pathlib import Path as _Path
+    p = _Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = _json.loads(p.read_text(encoding="utf-8")) or {}
+        out = {}
+        for fy, amt in (data.get("settlements", data) or {}).items():
+            try:
+                out[str(fy)] = float(amt)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except Exception:
+        return {}
+
+
+def record_tax_settlement(path, fy: str, amount: float) -> dict:
+    """Record an ATO payment (ADDITIVE per FY, so partial/instalment payments
+    accumulate) and rewrite the settlements file. Returns the updated map."""
+    import json as _json
+    from pathlib import Path as _Path
+    p = _Path(path)
+    settlements = load_tax_settlements(p)
+    settlements[str(fy)] = settlements.get(str(fy), 0.0) + float(amount)
+    p.write_text(_json.dumps({"settlements": settlements}, indent=2), encoding="utf-8")
+    return settlements
+
+
+def tax_provision_from_ledger(ledger_df, settlements: dict | None = None) -> float:
+    """The cash to reserve = Σ over FYs of max(0, CGT owed − already settled).
+    Realised-only (the ledger is realised gains from actual fills). Never
+    negative. A robust no-op ($0) on an empty/malformed ledger."""
+    settlements = settlements or {}
+    try:
+        if ledger_df is None or len(ledger_df) == 0:
+            return 0.0
+        total = 0.0
+        for _, row in ledger_df.iterrows():
+            owed = float(row.get("CGT at Lodgement (AUD)", 0.0) or 0.0)
+            paid = float(settlements.get(str(row.get("FY", "")), 0.0) or 0.0)
+            total += max(0.0, owed - paid)
+        return round(total, 2)
+    except Exception:
+        return 0.0
+
+
 # === Stateful CGT (live + OOS walk-forward) ==================================
 
 def _effective_cgt_rate(short_term: bool = True, cfg: dict | None = None) -> float:

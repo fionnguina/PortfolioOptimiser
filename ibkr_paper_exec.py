@@ -1358,7 +1358,30 @@ def main() -> int:
                         help=f"--complete-deferred: abort a buy deferred longer ago "
                              f"than this (default {DEFERRED_MAX_AGE_HOURS_DEFAULT}h) — "
                              f"a stale plan needs a fresh run.")
+    parser.add_argument("--record-tax-payment", action="store_true",
+                        help="Record an ATO CGT payment so the tax provision RELEASES "
+                             "that cash back to investable. Requires --fy and --amount. "
+                             "Additive per FY (instalments accumulate). Writes "
+                             "tax_settlements.json.")
+    parser.add_argument("--fy", type=str, default="",
+                        help="With --record-tax-payment: the AU FY label, e.g. FY2025-26.")
+    parser.add_argument("--amount", type=float, default=0.0,
+                        help="With --record-tax-payment: AUD paid to the ATO for that FY.")
     args = parser.parse_args()
+
+    # === --record-tax-payment: release the CGT provision for a settled FY ===
+    if args.record_tax_payment:
+        from cgt import record_tax_settlement, TAX_SETTLEMENTS_FILENAME
+        fy = str(args.fy).strip()
+        amt = float(args.amount or 0.0)
+        if not fy or amt <= 0:
+            print("[tax-payment] need --fy FY2025-26 and --amount > 0.")
+            return 1
+        path = _SCRIPT_DIR / TAX_SETTLEMENTS_FILENAME
+        s = record_tax_settlement(path, fy, amt)
+        print(f"[tax-payment] recorded ${amt:,.2f} for {fy}. Settlements now: {s}")
+        print(f"[tax-payment] the tax provision will drop by this at the next run.")
+        return 0
 
     # === --complete-deferred mode: guarded finish of prior deferred buys ===
     if args.complete_deferred:

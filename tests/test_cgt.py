@@ -217,3 +217,50 @@ def test_lotbook_sell_fifo_hifo_agree_when_single_lot():
         out = lb.sell("A", 40, pd.Timestamp("2025-07-01"), 15.0, method=m)
         assert out["lt_gain"] == pytest.approx(200.0)  # (15-10)*40
         assert lb.units("A") == pytest.approx(60.0)
+
+
+# ============================================================================
+# CGT provision / tax reserve (real-money reserve math — pin every branch)
+# ============================================================================
+
+def _ledger(*rows):
+    """Build a minimal FY ledger DataFrame (only the columns the provision reads)."""
+    return pd.DataFrame(
+        [{"FY": fy, "CGT at Lodgement (AUD)": tax} for fy, tax in rows],
+        columns=["FY", "CGT at Lodgement (AUD)"],
+    )
+
+def test_provision_sums_unsettled_across_fys():
+    led = _ledger(("FY2025-26", 1000.0), ("FY2026-27", 500.0))
+    assert _cgt_mod.tax_provision_from_ledger(led, {}) == pytest.approx(1500.0)
+
+def test_provision_releases_settled_fy():
+    led = _ledger(("FY2025-26", 1000.0), ("FY2026-27", 500.0))
+    # paid FY2025-26 in full → only the open FY remains reserved
+    assert _cgt_mod.tax_provision_from_ledger(led, {"FY2025-26": 1000.0}) == pytest.approx(500.0)
+
+def test_provision_partial_settlement():
+    led = _ledger(("FY2025-26", 1000.0))
+    assert _cgt_mod.tax_provision_from_ledger(led, {"FY2025-26": 400.0}) == pytest.approx(600.0)
+
+def test_provision_overpaid_fy_never_negative():
+    led = _ledger(("FY2025-26", 1000.0))
+    assert _cgt_mod.tax_provision_from_ledger(led, {"FY2025-26": 1500.0}) == pytest.approx(0.0)
+
+def test_provision_empty_ledger_is_zero():
+    assert _cgt_mod.tax_provision_from_ledger(_ledger(), {}) == 0.0
+    assert _cgt_mod.tax_provision_from_ledger(None, {}) == 0.0
+
+def test_settlements_roundtrip_additive(tmp_path):
+    p = tmp_path / "tax_settlements.json"
+    assert _cgt_mod.load_tax_settlements(p) == {}          # missing → empty
+    _cgt_mod.record_tax_settlement(p, "FY2025-26", 400.0)
+    _cgt_mod.record_tax_settlement(p, "FY2025-26", 600.0)  # additive (instalments)
+    assert _cgt_mod.load_tax_settlements(p) == {"FY2025-26": pytest.approx(1000.0)}
+
+def test_settlements_release_end_to_end(tmp_path):
+    p = tmp_path / "tax_settlements.json"
+    led = _ledger(("FY2025-26", 1000.0))
+    assert _cgt_mod.tax_provision_from_ledger(led, _cgt_mod.load_tax_settlements(p)) == pytest.approx(1000.0)
+    _cgt_mod.record_tax_settlement(p, "FY2025-26", 1000.0)
+    assert _cgt_mod.tax_provision_from_ledger(led, _cgt_mod.load_tax_settlements(p)) == pytest.approx(0.0)

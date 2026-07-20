@@ -70,3 +70,4 @@ engine_done.flag
 *.bak
 *.bak-*
 deferred_orders.json
+tax_settlements.json
