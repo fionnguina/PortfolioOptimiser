@@ -1605,7 +1605,42 @@ def _run_walk_forward_cv() -> int:
                   f"(Sharpe) in {_fr.get('sharpe_beats_bench',0)*100:.0f}%")
             print("  Reading: a TIGHT band with p5 Sharpe still solid = robust; a wide band "
                   "straddling 0 = the headline is one-path luck. (Samples the SAME returns —\n"
-                  "  does NOT invent unseen regimes; that needs Monte-Carlo / longer history.)")
+                  "  does NOT invent unseen regimes; that needs the crisis-stress MC below.)")
+
+            # --- Crisis-stress Monte-Carlo (unseen-regime tail) ---------------
+            # PORTOPT_CRISIS_SEVERITY=1.5 → inject a crisis 1.5x the worst
+            # in-sample window into PORTOPT_CRISIS_PROB (default 0.20) of paths.
+            _sev = 0.0
+            try:
+                _sev = float(os.environ.get("PORTOPT_CRISIS_SEVERITY", "0") or 0)
+            except Exception:
+                _sev = 0.0
+            if _sev > 0:
+                try:
+                    _cprob = float(os.environ.get("PORTOPT_CRISIS_PROB", "0.20") or 0.20)
+                except Exception:
+                    _cprob = 0.20
+                _sdf = _bootstrap.crisis_stressed_bootstrap_metrics(
+                    strat_modern, n_sim=_n_boot, crisis_prob=_cprob,
+                    crisis_severity=_sev, mean_block=_mean_block)
+                _ss = _bootstrap.summarize_distribution(_sdf)
+                _spc = _ss.get("percentiles", {})
+                _dd = _spc.get("max_drawdown", {})
+                _sh = _spc.get("sharpe", {})
+                _base_dd_p5 = _pc.get("max_drawdown", {}).get("p5")
+                print("\n" + "-" * 88)
+                print(f"CRISIS-STRESS MC ({_n_boot} paths, {_sev:.1f}x worst-window crisis "
+                      f"injected in {_cprob*100:.0f}% of paths) — UNSEEN-regime tail")
+                print("-" * 88)
+                if _dd:
+                    print(f"  MaxDD            p5 {_dd['p5']*100:+7.2f}%   p50 {_dd['p50']*100:+7.2f}%"
+                          f"   (vanilla bootstrap p5 was {(_base_dd_p5 or 0)*100:+.2f}%)")
+                if _sh:
+                    print(f"  Sharpe           p5 {_sh['p5']:+7.2f}    p50 {_sh['p50']:+7.2f}")
+                print("  Reading: this is the honest 'a crisis worse than 2016-2026 hits' tail. "
+                      "The gap\n  to the vanilla p5 is what the sample's benign window was hiding.")
+                _boot_summary = {**(_boot_summary or {}), "crisis_stress": {
+                    "severity": _sev, "crisis_prob": _cprob, **_ss}}
         except Exception as _e_boot:
             print(f"[wf-cv] bootstrap skipped: {_e_boot}")
 

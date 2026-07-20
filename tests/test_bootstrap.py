@@ -80,3 +80,42 @@ def test_summarize_distribution_structure():
 
 def test_summarize_empty_is_empty():
     assert bs.summarize_distribution(pd.DataFrame()) == {}
+
+
+# --- crisis-stressed Monte-Carlo (unseen-regime tail probe) ------------------
+
+def test_worst_window_finds_the_crash():
+    r = np.concatenate([np.full(100, 0.001), np.full(20, -0.05), np.full(100, 0.001)])
+    s, e = bs._worst_window(r, 20)
+    assert s == 100 and e == 120   # the -5%/day block
+
+
+def test_crisis_injection_deepens_the_tail():
+    rng = _rng(12)
+    r = pd.Series(rng.normal(0.0005, 0.008, 1500))
+    vanilla = bs.block_bootstrap_metrics(r, n_boot=600, seed=1)
+    stressed = bs.crisis_stressed_bootstrap_metrics(
+        r, n_sim=600, crisis_prob=0.5, crisis_severity=1.5, seed=1)
+    # a worse-than-sample crisis in half the paths must worsen the p5 drawdown
+    assert np.percentile(stressed["max_drawdown"], 5) < np.percentile(vanilla["max_drawdown"], 5)
+
+
+def test_crisis_prob_controls_injection_rate():
+    r = pd.Series(_rng(13).normal(0.0005, 0.008, 1200))
+    df = bs.crisis_stressed_bootstrap_metrics(r, n_sim=800, crisis_prob=0.3, seed=2)
+    frac = df["had_crisis"].mean()
+    assert 0.22 < frac < 0.38   # ~0.30 within sampling noise
+
+
+def test_crisis_prob_zero_injects_nothing():
+    r = pd.Series(_rng(14).normal(0.0005, 0.008, 1000))
+    df = bs.crisis_stressed_bootstrap_metrics(r, n_sim=300, crisis_prob=0.0, seed=3)
+    assert df["had_crisis"].sum() == 0
+
+
+def test_summarize_handles_bool_column_regression():
+    # crisis df carries a bool had_crisis column; percentile must not choke on it
+    r = pd.Series(_rng(15).normal(0.0005, 0.008, 1000))
+    df = bs.crisis_stressed_bootstrap_metrics(r, n_sim=200, crisis_prob=0.3, seed=4)
+    summ = bs.summarize_distribution(df)   # must not raise
+    assert "max_drawdown" in summ["percentiles"]
