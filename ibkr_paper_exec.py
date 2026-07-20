@@ -448,7 +448,38 @@ def _plan_check_fills_batch(rows: list) -> tuple:
     return (latest_ts, batch, already_backfilled)
 
 
-def _run_check_fills_mode(write: bool = False) -> int:
+def _send_fill_confirmation_email(corrections: list, still_pending: list) -> None:
+    """Email a fill confirmation for newly-Filled orders (used by --check-fills
+    --email). Reuses send_alert.send(); non-fatal + silent if the mailer is
+    unconfigured or unavailable. Only called when `corrections` is non-empty, so
+    it never spams on a no-change re-check."""
+    try:
+        from send_alert import send
+    except Exception as _e:
+        print(f"  [check-fills] --email: send_alert unavailable ({_e}); skipping.")
+        return
+    lines = ["The following order(s) reached Filled since the fills log was last updated:", ""]
+    for c in corrections:
+        _px = c.get("avg_fill_price_local")
+        _px_s = f"{float(_px):.4f}" if _px not in (None, "", "—") else "—"
+        lines.append(f"  {c.get('ticker'):<10} {str(c.get('side')).upper():<4} "
+                     f"{c.get('qty_filled'):>6} @ {_px_s}  "
+                     f"exec={c.get('exec_timestamp')}")
+    lines.append("")
+    if still_pending:
+        lines.append(f"Still pending ({len(still_pending)}): {', '.join(still_pending)}")
+        lines.append("Re-run --check-fills --email later to confirm the rest.")
+    else:
+        lines.append("All orders in this batch are now Filled — rebalance complete.")
+    subject = f"[Portfolio Optimiser] FILLS CONFIRMED — {len(corrections)} order(s) filled"
+    try:
+        rc = send(subject, "\n".join(lines))
+        print(f"  [check-fills] --email: confirmation sent (rc={rc}).")
+    except Exception as _e:
+        print(f"  [check-fills] --email: send failed ({_e}); non-fatal.")
+
+
+def _run_check_fills_mode(write: bool = False, email: bool = False) -> int:
     """Re-query IBKR for the current status of orders from the most recent
     batch in ibkr_fills_log.jsonl. Useful for:
       - Overnight US orders that were 'pending' when the original run exited
@@ -632,6 +663,7 @@ def _run_check_fills_mode(write: bool = False) -> int:
         n_changed = 0
         n_filled_now = 0
         corrections: list[dict] = []
+        still_pending: list[str] = []   # tickers not yet Filled (for --email note)
         for row in batch:
             oid = int(row["order_id"])
             logged_status = row.get("status_final") or row.get("status") or "?"
@@ -672,6 +704,8 @@ def _run_check_fills_mode(write: bool = False) -> int:
                     n_changed += 1
                 if now_status == "Filled":
                     n_filled_now += 1
+                elif now_status not in ("Cancelled", "ApiCancelled", "Inactive"):
+                    still_pending.append(str(row["ticker"]))
                 print(f"  {row['ticker']:<12} {oid:>7} {permid:>11} "
                       f"{logged_status:<18} {now_status:<18} "
                       f"{filled:>8} {avg_px_str} {match_method:<10}")
@@ -723,6 +757,10 @@ def _run_check_fills_mode(write: bool = False) -> int:
             else:
                 print("\n  [check-fills] NOT written (read-only). Re-run with "
                       "--write to back-fill them.")
+            if email:
+                _send_fill_confirmation_email(corrections, still_pending)
+        elif email:
+            print("  [check-fills] --email: no newly-filled orders — no email sent.")
     finally:
         if ib.isConnected():
             ib.disconnect()
@@ -1029,6 +1067,13 @@ def main() -> int:
                              "recovers what TWS can still see — it serves NO historical "
                              "executions, so run it the same session/day. Never calls "
                              "placeOrder.")
+    parser.add_argument("--email", action="store_true",
+                        help="With --check-fills: send a confirmation email listing "
+                             "any orders that reached Filled since the log was last "
+                             "updated (reuses send_alert.py). Silent when nothing new "
+                             "filled — safe to run on a schedule after the US session "
+                             "to confirm the offshore legs went through. No-op if the "
+                             "mailer is unconfigured.")
     parser.add_argument("--wait-for-funds", type=int, default=0, metavar="SECONDS",
                         help="After submitting sells and whatever buys fit current "
                              "AvailableFunds, poll every 60s for sell proceeds and "
@@ -1063,7 +1108,7 @@ def main() -> int:
     # === --check-fills mode: read-only status query for previous orders ===
     # No rec log needed, no orders placed. Returns 0 on success.
     if args.check_fills:
-        return _run_check_fills_mode(write=bool(args.write))
+        return _run_check_fills_mode(write=bool(args.write), email=bool(args.email))
 
     # === --snapshot-nav mode: read-only broker NAV logging ===
     if args.snapshot_nav:
@@ -1124,6 +1169,12 @@ def main() -> int:
             continue
         side = "BUY" if delta > 0 else "SELL"
         order = MarketOrder(side, abs(delta))
+        # Set TIF explicitly so IBKR doesn't apply the account order preset and
+        # fire the noisy Error 10349 ("Order TIF was set to DAY based on order
+        # preset") on every order — it prints a scary-looking "Canceled order"
+        # line even though the order proceeds. DAY is what the preset resolves
+        # to anyway (fills at the next session open for orders placed off-hours).
+        order.tif = "DAY"
         plan.append((rec, contract, order))
 
     # === Always-on preview (Phase 2 behaviour) ===
