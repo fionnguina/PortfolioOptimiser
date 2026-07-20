@@ -1368,6 +1368,9 @@ def _run_walk_forward_cv() -> int:
     # which is the whole point of walk-forward.
     print(f"\n[wf-cv] running engine on full history (single walk-forward)...")
     t1 = time.perf_counter()
+    # Env hook to A/B the crash hedge through the SAME harness (PORTOPT_CRASH_HEDGE=1).
+    # Off by default → production/normal CV unchanged. Used to bootstrap hedge on-vs-off.
+    _ch_on = str(os.environ.get("PORTOPT_CRASH_HEDGE", "")).strip() in ("1", "true", "True", "on")
     out = run_oos_ensemble_walk_forward(
         px_aud,
         train_window_months=TRAIN_MONTHS,
@@ -1377,9 +1380,10 @@ def _run_walk_forward_cv() -> int:
         lambda_temp=ENSEMBLE_LAMBDA_TEMP,
         sortino_halflife_days=ENSEMBLE_HALFLIFE_DAYS,
         starting_nav_aud=1_000_000.0,
+        crash_hedge=_ch_on,
     )
     print(f"[wf-cv] ensemble mixing: λ={ENSEMBLE_LAMBDA_TEMP} "
-          f"halflife={ENSEMBLE_HALFLIFE_DAYS}d")
+          f"halflife={ENSEMBLE_HALFLIFE_DAYS}d  crash_hedge={'ON' if _ch_on else 'off'}")
     strat_rets = out["blended_returns"]
     if strat_rets.empty:
         print("[wf-cv] engine returned empty series; aborting.")
