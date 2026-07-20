@@ -1557,6 +1557,54 @@ def _run_walk_forward_cv() -> int:
     print(f"  Use this as baseline. For parameter sweeps via walk-forward CV, "
           f"a candidate must improve MEAN sharpe across folds — not just the best single year.")
 
+    # === Block-bootstrap CIs (validation breadth) — env-gated PORTOPT_BOOTSTRAP ===
+    # Resamples the modern OOS path (same window as the FULL-PERIOD gate) into N
+    # synthetic paths to show how much of the headline is signal vs one-path luck.
+    _boot_summary = None
+    _n_boot = 0
+    try:
+        _n_boot = int(os.environ.get("PORTOPT_BOOTSTRAP", "0") or 0)
+    except Exception:
+        _n_boot = 0
+    if _n_boot > 0:
+        if _n_boot == 1:
+            _n_boot = 2000   # bare flag → sensible default
+        try:
+            _mean_block = float(os.environ.get("PORTOPT_BOOTSTRAP_BLOCK", "20") or 20)
+        except Exception:
+            _mean_block = 20.0
+        try:
+            import bootstrap as _bootstrap
+            print("\n" + "=" * 88)
+            print(f"BLOCK-BOOTSTRAP ({_n_boot} paths, mean block {_mean_block:.0f}d, "
+                  f"stationary) — how much is luck vs signal")
+            print("=" * 88)
+            _bdf = _bootstrap.block_bootstrap_metrics(
+                strat_modern, n_boot=_n_boot, mean_block=_mean_block,
+                bench=_spy_modern)
+            _boot_summary = _bootstrap.summarize_distribution(_bdf)
+            _pc = _boot_summary.get("percentiles", {})
+            _fr = _boot_summary.get("robustness_fractions", {})
+            def _row(lbl, key, scale=1.0, suf=""):
+                d = _pc.get(key, {})
+                if not d:
+                    return
+                print(f"  {lbl:16} p5 {d['p5']*scale:+7.2f}{suf}   p50 {d['p50']*scale:+7.2f}{suf}"
+                      f"   p95 {d['p95']*scale:+7.2f}{suf}   mean {d['mean']*scale:+7.2f}{suf}")
+            _row("Ann return", "ann_return", 100, "%")
+            _row("Sharpe", "sharpe", 1.0, "")
+            _row("MaxDD", "max_drawdown", 100, "%")
+            _row("Alpha vs SPY", "alpha_vs_bench", 100, "%")
+            print(f"  Robustness:      Sharpe>0 in {_fr.get('sharpe_gt_0',0)*100:.0f}% of paths, "
+                  f">0.5 in {_fr.get('sharpe_gt_0p5',0)*100:.0f}%; "
+                  f"beats SPY (return) in {_fr.get('beats_bench',0)*100:.0f}%, "
+                  f"(Sharpe) in {_fr.get('sharpe_beats_bench',0)*100:.0f}%")
+            print("  Reading: a TIGHT band with p5 Sharpe still solid = robust; a wide band "
+                  "straddling 0 = the headline is one-path luck. (Samples the SAME returns —\n"
+                  "  does NOT invent unseen regimes; that needs Monte-Carlo / longer history.)")
+        except Exception as _e_boot:
+            print(f"[wf-cv] bootstrap skipped: {_e_boot}")
+
     # Save JSON
     try:
         summary = {
@@ -1588,6 +1636,8 @@ def _run_walk_forward_cv() -> int:
                 "alpha_vs_spy": round(full_ann - _spy_fp_ann, 6),
             },
         }
+        if _boot_summary:
+            summary["bootstrap"] = {"n_boot": _n_boot, **_boot_summary}
         json_path = _research_out("walk_forward_cv_summary.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
