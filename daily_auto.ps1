@@ -705,6 +705,25 @@ if ($mailSubject) {
     }
 }
 
+# --- Overnight-fill confirmation (2026-07-20, user directive) ---
+# The morning run fires at 09:30 AEST, AFTER the US close (06:00 AEST), so any
+# offshore legs from a prior rebalance (e.g. SOXX/VEA/PDBC placed pre-open while
+# the US was shut) have filled by now. Run check-fills to (a) back-fill the log
+# so the 6W cadence anchors on the REAL fill, and (b) email a confirmation of
+# anything newly filled. Silent when nothing new filled — no spam on the ~9-in-10
+# no-trade mornings. READ-ONLY re trading: --write only touches the local fills
+# log, --email only reports; NO order is ever placed here. Non-fatal.
+try {
+    $cfPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $cfScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
+    if ((Test-Path $cfPy) -and (Test-Path $cfScript)) {
+        $cfOut = & $cfPy $cfScript --check-fills --write --email 2>&1 | Select-Object -Last 3
+        Write-Log "Fill-confirmation (check-fills --write --email): $cfOut"
+    }
+} catch {
+    Write-Log "Fill-confirmation failed (non-fatal): $($_.Exception.Message)"
+}
+
 # --- Evidence backup to OneDrive (2026-07-09) ---
 # The real-money track record + lot book live in gitignored local-only
 # files; mirror them to OneDrive each run so a disk failure can't erase the
