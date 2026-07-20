@@ -69,3 +69,4 @@ engine_done.flag
 # which plain *.bak misses because the suffix trails the extension.
 *.bak
 *.bak-*
+deferred_orders.json
