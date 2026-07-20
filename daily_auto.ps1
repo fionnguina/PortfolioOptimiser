@@ -625,7 +625,29 @@ $mailBody = $null
 switch ($verdict) {
     "RUN" {
         $mailSubject = "[Portfolio Optimiser] RUN - rebalance ready"
-        $mailBody = "Verdict: RUN`nsummed|dw| = $summedDw  (>= 0.03 threshold)`nPortfolio: $portfolioAud AUD`nMode: $mode`n`nReview the PPT, then execute via ibkr_paper_exec.py.$simSuffix"
+        $mailBody = "Verdict: RUN`nsummed|dw| = $summedDw  (>= 0.03 threshold)`nPortfolio: $portfolioAud AUD`nMode: $mode$simSuffix"
+        # Fold in the ACTUAL proposed rebalance so the email carries the plan,
+        # not just a 'go look' prompt (2026-07-20, user directive). Uses the
+        # read-only preview (--no-qualify): NO IBKR connection, NO orders placed
+        # — it just reprints the latest rec-log trade plan. Non-fatal: on any
+        # failure the summary above still sends. We deliberately do NOT add a
+        # one-click execute (email is not a safe action channel); the email
+        # carries the exact commands to run at the terminal instead.
+        try {
+            $planPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+            $planScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
+            if ((Test-Path $planPy) -and (Test-Path $planScript)) {
+                $planOut = & $planPy $planScript --no-qualify 2>&1 | Out-String
+                if ($planOut -and $planOut.Trim().Length -gt 0) {
+                    $mailBody = "$mailBody`n`n===== PROPOSED REBALANCE (preview - nothing placed) =====`n$($planOut.Trim())"
+                } else {
+                    Write-Log "RUN email: plan preview produced no output; sending summary only."
+                }
+            }
+        } catch {
+            Write-Log "RUN email: plan preview failed ($($_.Exception.Message)); sending summary only."
+        }
+        $mailBody = "$mailBody`n`n===== TO EXECUTE (run these at your terminal) =====`ncd `"$ScriptDir`"`n& `".\.venv\Scripts\python.exe`" ibkr_paper_exec.py --execute      # type YES to confirm`n`n# then, after fills settle:`n& `".\.venv\Scripts\python.exe`" ibkr_paper_exec.py --check-fills --write"
     }
     "HALTED" {
         $mailSubject = "[Portfolio Optimiser] HALTED - sanity violation"
