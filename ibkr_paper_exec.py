@@ -68,6 +68,21 @@ CONNECT_TIMEOUT = 12
 FILL_WAIT_SECONDS = 60   # how long to wait for orders to settle before summarising
 FILLS_LOG_FILENAME = "ibkr_fills_log.jsonl"
 REC_LOG_FILENAME = "trade_recommendation_log.jsonl"
+DEFERRED_ORDERS_FILENAME = "deferred_orders.json"  # cash-deferred buys awaiting completion
+
+# --- Guarded auto-completion of cash-deferred buys (2026-07-20) --------------
+# When a rebalance defers a buy (e.g. a US buy funded by US-sell proceeds while
+# the US market is shut), the morning wrapper can auto-complete it — but ONLY
+# behind these guards, because it is unattended trade execution:
+#   * price-drift: skip if the price moved more than this since the plan was
+#     approved (the approved dollar-exposure is then stale);
+#   * staleness: skip if the deferral is older than this (the plan is no longer
+#     current — a regime may have turned);
+#   * funds: skip if the sells still haven't freed enough cash.
+# Fail-safe: if the price can't be verified at all, REFUSE (never auto-trade
+# blind). All defaults overridable via CLI flags.
+DEFERRED_DRIFT_PCT_DEFAULT = 3.0      # abort if |Δprice| > 3% vs approved
+DEFERRED_MAX_AGE_HOURS_DEFAULT = 48   # abort if the deferral is older than 48h
 
 # Anchor log writes to this script's directory, NOT the process CWD. The daily
 # scheduled task runs with WorkingDir unset (CWD = C:\Windows\System32), so a
@@ -188,6 +203,229 @@ def _submit_orders(ib, plan: list, *, wait: bool) -> list:
     # Final 2s flush to catch any straggler fill events before the log write.
     ib.sleep(2)
     return trades
+
+
+# ============================================================================
+# Guarded auto-completion of cash-deferred buys
+# ============================================================================
+
+def _current_local_price(ib, contract) -> "float | None":
+    """Best-effort current local-ccy price via IBKR market data. Returns None on
+    any failure (no subscription, NaN) so callers can fail-safe."""
+    try:
+        tks = ib.reqTickers(contract)
+        if tks:
+            t = tks[0]
+            for v in (t.marketPrice(), getattr(t, "last", None),
+                      getattr(t, "close", None)):
+                try:
+                    fv = float(v)
+                    if fv == fv and fv > 0:   # not NaN, positive
+                        return fv
+                except (TypeError, ValueError):
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def _deferred_completion_decision(*, approved_price_local, current_price_local,
+                                  need_aud, funds_aud, deferred_at_iso, now,
+                                  drift_pct, max_age_hours):
+    """PURE guard for auto-completing one deferred buy. No I/O — unit-tested.
+
+    Returns (action, reason) where action is one of:
+      submit          — all guards pass, safe to place the order
+      abort_stale     — the deferral is older than max_age_hours (plan too old)
+      abort_drift     — price moved more than drift_pct since approval
+      abort_no_price  — price can't be verified → refuse to auto-trade blind
+      defer_funds     — sells still haven't freed enough cash → try again later
+    Order of checks is deliberate: staleness → price → funds. Fail-safe: any
+    missing price is a REFUSAL, never a silent proceed."""
+    # 1) staleness
+    if deferred_at_iso:
+        try:
+            age_h = (now - datetime.fromisoformat(deferred_at_iso)).total_seconds() / 3600.0
+            if age_h > max_age_hours:
+                return "abort_stale", (f"deferred {age_h:.0f}h ago > {max_age_hours}h "
+                                       f"guard — plan too old, complete manually")
+        except Exception:
+            pass
+    # 2) price drift — BOTH prices required; missing either = refuse
+    if not approved_price_local or not current_price_local:
+        return "abort_no_price", ("could not verify current vs approved price — "
+                                  "refusing to auto-execute blind, complete manually")
+    drift = abs(current_price_local - approved_price_local) / approved_price_local
+    if drift > drift_pct / 100.0:
+        return "abort_drift", (f"price moved {drift*100:+.1f}% "
+                               f"({approved_price_local:.2f} -> {current_price_local:.2f}) "
+                               f"> {drift_pct:.1f}% guard — review manually")
+    # 3) funds
+    if funds_aud is not None and need_aud is not None and need_aud > funds_aud:
+        return "defer_funds", (f"still insufficient (need ${need_aud:,.0f} > "
+                               f"${funds_aud:,.0f}) — will retry next run")
+    return "submit", (f"drift {drift*100:+.1f}% within {drift_pct:.1f}%, funds OK")
+
+
+def _write_deferred_orders(deferred: list, ib, rec_entry: dict, path: Path) -> int:
+    """Persist cash-deferred buys so the guarded auto-completer can finish them.
+    Captures the approved LOCAL price now (via IBKR) so completion can drift-check
+    in local ccy without needing FX. Best-effort per order."""
+    records = []
+    _now = datetime.now().isoformat(timespec="seconds")
+    _run_at = rec_entry.get("run_at") if isinstance(rec_entry, dict) else None
+    for r, c, o in deferred:
+        try:
+            du = abs(int(r["delta_units"]))
+            approved_aud = abs(float(r["delta_value_aud"])) / du if du else None
+        except Exception:
+            approved_aud = None
+        records.append({
+            "ticker": r["ticker"],
+            "side": str(o.action),
+            "qty": int(o.totalQuantity),
+            "need_aud": abs(float(r.get("delta_value_aud") or 0.0)) * 1.01,
+            "approved_price_aud": approved_aud,
+            "approved_price_local": _current_local_price(ib, c),
+            "ccy": getattr(c, "currency", None),
+            "rec_log_run_at": _run_at,
+            "deferred_at": _now,
+        })
+    try:
+        path.write_text(json.dumps({"deferred": records}, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[exec][WARN] could not persist deferred orders ({e}); "
+              f"auto-completion won't run.")
+        return 0
+    return len(records)
+
+
+def _run_complete_deferred_mode(drift_pct: float, max_age_hours: float,
+                                email: bool = False) -> int:
+    """Guarded auto-completion of previously cash-deferred buys. Reads
+    deferred_orders.json, re-checks each behind the price-drift / staleness /
+    funds guards, submits only those that pass, emails the outcome, and rewrites
+    the file (completed + drift/stale aborts removed; funds-deferred kept)."""
+    path = _SCRIPT_DIR / DEFERRED_ORDERS_FILENAME
+    if not path.exists():
+        print("[complete-deferred] no deferred_orders.json — nothing to complete.")
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        pending = list(data.get("deferred", []) or [])
+    except Exception as e:
+        print(f"[complete-deferred][ERR] unreadable deferred file ({e}).")
+        return 1
+    if not pending:
+        print("[complete-deferred] deferred file is empty — nothing to complete.")
+        return 0
+
+    try:
+        from ib_insync import IB, MarketOrder
+    except ImportError:
+        print("[complete-deferred] ib_insync not installed.")
+        return 1
+
+    print(f"[complete-deferred] {len(pending)} deferred order(s); guards: "
+          f"drift<={drift_pct:.1f}%, age<={max_age_hours:.0f}h")
+    ib = IB()
+    try:
+        ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[complete-deferred][ERR] connect failed ({e}); TWS/Gateway up?")
+        return 2
+
+    submitted, aborted, kept = [], [], []
+    now = datetime.now()
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed:
+            print("[complete-deferred][SAFETY] no managed account. Aborting.")
+            return 3
+        _refuse_if_live(managed[0])
+        funds = _available_funds_aud(ib)
+        print(f"[complete-deferred] paper {managed[0]}, available ${funds if funds is None else f'{funds:,.2f}'} AUD")
+        for od in pending:
+            contract = _ticker_to_contract(od["ticker"])
+            if contract is None:
+                aborted.append((od, "abort_no_contract", "could not build contract"))
+                continue
+            ib.qualifyContracts(contract)
+            cur_local = _current_local_price(ib, contract)
+            action, reason = _deferred_completion_decision(
+                approved_price_local=od.get("approved_price_local"),
+                current_price_local=cur_local,
+                need_aud=od.get("need_aud"),
+                funds_aud=funds,
+                deferred_at_iso=od.get("deferred_at"),
+                now=now, drift_pct=drift_pct, max_age_hours=max_age_hours,
+            )
+            print(f"[complete-deferred] {od['ticker']}: {action} — {reason}")
+            if action == "submit":
+                order = MarketOrder(od["side"], int(od["qty"]))
+                order.tif = "DAY"
+                _submit_orders(ib, [({"ticker": od["ticker"]}, contract, order)],
+                               wait=True)
+                submitted.append((od, reason))
+                if funds is not None and od.get("need_aud"):
+                    funds -= float(od["need_aud"])
+            elif action == "defer_funds":
+                kept.append((od, reason))
+            else:  # abort_* (drift / stale / no_price / no_contract)
+                aborted.append((od, action, reason))
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+    # Rewrite the file: keep only funds-deferred (retry next run). Completed and
+    # aborted-on-guard are removed — aborts need human eyes, not auto-retries.
+    try:
+        path.write_text(json.dumps({"deferred": [od for od, _ in kept]}, indent=2),
+                        encoding="utf-8")
+    except Exception as e:
+        print(f"[complete-deferred][WARN] could not rewrite deferred file ({e}).")
+
+    print(f"[complete-deferred] submitted={len(submitted)} "
+          f"aborted={len(aborted)} kept-for-retry={len(kept)}")
+    if email and (submitted or aborted):
+        _send_deferred_outcome_email(submitted, aborted, kept)
+    return 0
+
+
+def _send_deferred_outcome_email(submitted: list, aborted: list, kept: list) -> None:
+    """Email the outcome of a guarded auto-completion run. Non-fatal/silent if
+    the mailer is unavailable. Only called when something was submitted or a
+    guard aborted (funds-only deferrals stay quiet)."""
+    try:
+        from send_alert import send
+    except Exception as _e:
+        print(f"  [complete-deferred] --email: send_alert unavailable ({_e}).")
+        return
+    lines = []
+    if submitted:
+        lines.append("AUTO-COMPLETED (guards passed, orders placed):")
+        for od, reason in submitted:
+            lines.append(f"  {od['ticker']:<10} {od['side']} {od['qty']}  ({reason})")
+        lines.append("")
+    if aborted:
+        lines.append("NOT completed — needs your review:")
+        for od, action, reason in aborted:
+            lines.append(f"  {od['ticker']:<10} {od['side']} {od['qty']}  [{action}] {reason}")
+        lines.append("")
+        lines.append("To complete a reviewed one manually:")
+        lines.append('  & ".\\.venv\\Scripts\\python.exe" ibkr_paper_exec.py --execute '
+                     f"--only-tickers {','.join(od['ticker'] for od, _a, _r in aborted)}")
+    if kept:
+        lines.append("")
+        lines.append(f"Still waiting on funds (will retry next run): "
+                     f"{', '.join(od['ticker'] for od, _r in kept)}")
+    n_sub, n_ab = len(submitted), len(aborted)
+    subject = f"[Portfolio Optimiser] DEFERRED-BUY: {n_sub} completed, {n_ab} need review"
+    try:
+        rc = send(subject, "\n".join(lines))
+        print(f"  [complete-deferred] --email: outcome sent (rc={rc}).")
+    except Exception as _e:
+        print(f"  [complete-deferred] --email: send failed ({_e}); non-fatal.")
 
 
 def _write_fills_log(rec_entry: dict, trades: list, log_path: Path) -> int:
@@ -1103,7 +1341,32 @@ def main() -> int:
                              "Matching is case-sensitive; .AX suffix is optional "
                              "(BEAR matches BEAR.AX, both match each other). "
                              "Example: --only-tickers HBRD,BEAR,BBUS")
+    parser.add_argument("--complete-deferred", action="store_true",
+                        help="Guarded auto-completion of buys deferred on a prior "
+                             "--execute for insufficient funds (deferred_orders.json). "
+                             "Re-checks each behind price-drift / staleness / funds "
+                             "guards and submits only those that pass; refuses to "
+                             "auto-trade if a price can't be verified. Pair with "
+                             "--email for an outcome report. Used by the morning "
+                             "wrapper to finish offshore legs while you're asleep.")
+    parser.add_argument("--drift-pct", type=float, default=DEFERRED_DRIFT_PCT_DEFAULT,
+                        help=f"--complete-deferred: abort a buy if its price moved "
+                             f"more than this %% since the plan was approved "
+                             f"(default {DEFERRED_DRIFT_PCT_DEFAULT}).")
+    parser.add_argument("--max-age-hours", type=float,
+                        default=DEFERRED_MAX_AGE_HOURS_DEFAULT,
+                        help=f"--complete-deferred: abort a buy deferred longer ago "
+                             f"than this (default {DEFERRED_MAX_AGE_HOURS_DEFAULT}h) — "
+                             f"a stale plan needs a fresh run.")
     args = parser.parse_args()
+
+    # === --complete-deferred mode: guarded finish of prior deferred buys ===
+    if args.complete_deferred:
+        return _run_complete_deferred_mode(
+            drift_pct=float(args.drift_pct),
+            max_age_hours=float(args.max_age_hours),
+            email=bool(args.email),
+        )
 
     # === --check-fills mode: read-only status query for previous orders ===
     # No rec log needed, no orders placed. Returns 0 on success.
@@ -1316,6 +1579,23 @@ def main() -> int:
                   f"until sells settle: {_names}")
             print(f"[exec]        after the sells fill, re-run:")
             print(f"[exec]        ibkr_paper_exec.py --execute --only-tickers {_names}")
+            # Persist so the morning wrapper's guarded auto-completer can finish
+            # them (price-drift / staleness / funds guards). Captures the approved
+            # local price now for the drift check.
+            _dpath = _SCRIPT_DIR / DEFERRED_ORDERS_FILENAME
+            _nd = _write_deferred_orders(deferred, ib, rec_entry, _dpath)
+            if _nd:
+                print(f"[exec]        ({_nd} deferred order(s) saved to "
+                      f"{DEFERRED_ORDERS_FILENAME} for guarded auto-completion)")
+        else:
+            # No deferrals this run → clear any stale deferred file so the
+            # auto-completer doesn't act on an obsolete plan.
+            _dpath = _SCRIPT_DIR / DEFERRED_ORDERS_FILENAME
+            if _dpath.exists():
+                try:
+                    _dpath.unlink()
+                except Exception:
+                    pass
 
         # === Reconcile + log ===
         _print_reconciliation(trades)

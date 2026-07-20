@@ -724,6 +724,27 @@ try {
     Write-Log "Fill-confirmation failed (non-fatal): $($_.Exception.Message)"
 }
 
+# --- Guarded auto-completion of cash-deferred buys (2026-07-20, user directive) ---
+# When a rebalance defers a buy (e.g. a US buy funded by US-sell proceeds while
+# the US was shut), the sells fill overnight and by this 09:30 run the cash is
+# free. Finish the deferred buy WITHOUT waking the user — but only behind the
+# price-drift / staleness / funds guards in ibkr_paper_exec (it REFUSES to
+# auto-trade if it can't verify the price). No-op when deferred_orders.json is
+# absent. --email reports what completed vs what needs manual review. This is the
+# one place the pipeline places an order unattended, and it is deliberately
+# limited to buys the user ALREADY approved (and only re-priced within guard).
+try {
+    $cdPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $cdScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
+    $cdFile = Join-Path $ScriptDir "deferred_orders.json"
+    if ((Test-Path $cdPy) -and (Test-Path $cdScript) -and (Test-Path $cdFile)) {
+        $cdOut = & $cdPy $cdScript --complete-deferred --email 2>&1 | Select-Object -Last 4
+        Write-Log "Deferred auto-complete (guarded): $cdOut"
+    }
+} catch {
+    Write-Log "Deferred auto-complete failed (non-fatal): $($_.Exception.Message)"
+}
+
 # --- Evidence backup to OneDrive (2026-07-09) ---
 # The real-money track record + lot book live in gitignored local-only
 # files; mirror them to OneDrive each run so a disk failure can't erase the
