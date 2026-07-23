@@ -267,6 +267,99 @@ def _deferred_completion_decision(*, approved_price_local, current_price_local,
     return "submit", (f"drift {drift*100:+.1f}% within {drift_pct:.1f}%, funds OK")
 
 
+# ============================================================================
+# Pre-trade validation gate (broker-truth; the guardrail for safe autonomy)
+# ============================================================================
+
+def validate_pre_trade(trades: list, assumed_positions: dict, broker_positions: dict,
+                       available_cash_aud, nav_aud, *, max_turnover: float = 2.0,
+                       unit_tol: float = 1.0) -> tuple[bool, list]:
+    """PURE pre-trade safety gate — runs against BROKER TRUTH before any order.
+    Returns (ok, failures). The engine's _validate_trade_plan_sanity runs on the
+    SHEET; this runs on the broker, catching the exact 2026-07-23 failure the
+    sheet-side check couldn't (a stale sheet made turnover look fine while the
+    real book held a naked SOXX short the plan ignored).
+
+    trades:            [{ticker, delta_units, delta_value_aud}, ...] (the plan)
+    assumed_positions: {ticker: units} the plan was built on (rec-log current_units)
+    broker_positions:  {ticker: units} truth from ib.positions()
+    Checks (any failure ⇒ abort): (1) reconciliation — plan basis == broker;
+    (2) no resulting/uncovered short in the long-only book; (3) turnover bound;
+    (4) net buys ≤ available cash."""
+    fails: list[str] = []
+    delta = {}
+    for t in trades:
+        try:
+            delta[str(t["ticker"])] = delta.get(str(t["ticker"]), 0.0) + float(t.get("delta_units", 0.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    # 1) RECONCILIATION — the plan's assumed holdings must match the broker.
+    all_tk = set(assumed_positions) | set(broker_positions) | set(delta)
+    for tk in sorted(all_tk):
+        a = float(assumed_positions.get(tk, 0.0) or 0.0)
+        b = float(broker_positions.get(tk, 0.0) or 0.0)
+        if abs(a - b) > unit_tol:
+            fails.append(f"RECONCILE: {tk} plan-assumed {a:g}u != broker {b:g}u "
+                         f"— plan built on stale holdings (reconcile first)")
+
+    # 2) SHORTS — long-only book; no position may end (or stay) short.
+    for tk in sorted(set(broker_positions) | set(delta)):
+        b = float(broker_positions.get(tk, 0.0) or 0.0)
+        resulting = b + float(delta.get(tk, 0.0))
+        if resulting < -unit_tol:
+            if b < -unit_tol and abs(float(delta.get(tk, 0.0))) <= unit_tol:
+                fails.append(f"UNCOVERED-SHORT: {tk} broker {b:g}u short and the plan "
+                             f"doesn't flatten it")
+            else:
+                fails.append(f"SHORT: {tk} would end at {resulting:g}u (short) in a "
+                             f"long-only book")
+
+    # 3) TURNOVER bound (on broker NAV).
+    if nav_aud and float(nav_aud) > 0:
+        turnover = sum(abs(float(t.get("delta_value_aud", 0.0) or 0.0)) for t in trades) / float(nav_aud)
+        if turnover > max_turnover:
+            fails.append(f"TURNOVER: Σ|trade|/NAV = {turnover:.2f} > {max_turnover} "
+                         f"— would churn {turnover*100:.0f}% of NAV in one run")
+
+    # 4) CASH — net buys must fit available cash.
+    if available_cash_aud is not None:
+        net_buy = sum(float(t.get("delta_value_aud", 0.0) or 0.0) for t in trades)
+        if net_buy > float(available_cash_aud) * 1.01:
+            fails.append(f"CASH: net buys ${net_buy:,.0f} > available ${float(available_cash_aud):,.0f}")
+
+    return (len(fails) == 0, fails)
+
+
+def _broker_positions(ib) -> dict:
+    """{engine-ticker: units} from ib.positions(); ASX bare symbols → .AX
+    (mirrors _run_sync_holdings_mode's mapping). Best-effort → {} on failure."""
+    out: dict[str, float] = {}
+    try:
+        for pos in ib.positions():
+            c = pos.contract
+            if str(getattr(c, "secType", "STK")).upper() != "STK":
+                continue
+            sym = str(c.symbol).strip().upper()
+            if (str(getattr(c, "currency", "")).upper() == "AUD"
+                    or str(getattr(c, "primaryExchange", "")).upper() == "ASX"):
+                sym = f"{sym}.AX"
+            out[sym] = out.get(sym, 0.0) + float(pos.position)
+    except Exception:
+        pass
+    return out
+
+
+def _broker_net_liquidation_aud(ib) -> "float | None":
+    """Broker NetLiquidation (AUD) for the turnover check. None on failure."""
+    try:
+        rows = [v for v in ib.accountSummary()
+                if v.tag == "NetLiquidation" and str(v.currency).upper() == "AUD"]
+        return float(rows[0].value) if rows else None
+    except Exception:
+        return None
+
+
 def _write_deferred_orders(deferred: list, ib, rec_entry: dict, path: Path) -> int:
     """Persist cash-deferred buys so the guarded auto-completer can finish them.
     Captures the approved LOCAL price now (via IBKR) so completion can drift-check
@@ -1294,6 +1387,10 @@ def main() -> int:
     parser.add_argument("--no-qualify", action="store_true",
                         help="Skip IBKR connection and contract qualification "
                              "(preview only; --execute is ignored if set).")
+    parser.add_argument("--skip-validation", action="store_true",
+                        help="Override the broker-truth pre-trade validation gate "
+                             "(reconciliation / no-short / turnover / cash). Only "
+                             "use for a deliberate manual correction you understand.")
     parser.add_argument("--check-fills", action="store_true",
                         help="Read the most recent batch from ibkr_fills_log.jsonl, "
                              "query IBKR for the current status of each orderId, "
@@ -1543,6 +1640,40 @@ def main() -> int:
             "unqualified": len(unqualified),
         }
         _print_preview(rec_entry, plan, totals)
+
+        # === Pre-trade validation gate (broker truth) ===
+        # Runs BEFORE the typed-YES gate so a bad plan never even offers to
+        # execute. Catches the 2026-07-23 class (stale sheet → naked short) that
+        # the engine's sheet-side sanity check can't see. Overridable with
+        # --skip-validation for a deliberate manual correction.
+        try:
+            _broker_pos = _broker_positions(ib)
+            _assumed_pos = dict(rec_entry.get("current_units", {}) or {})
+            _val_trades = [{"ticker": r["ticker"],
+                            "delta_units": r.get("delta_units", 0),
+                            "delta_value_aud": r.get("delta_value_aud", 0.0)}
+                           for r in trades_recs]
+            _nav = _broker_net_liquidation_aud(ib)
+            _ok, _fails = validate_pre_trade(
+                _val_trades, _assumed_pos, _broker_pos,
+                available_cash_aud=_available_funds_aud(ib), nav_aud=_nav)
+            if not _ok:
+                print("\n" + "=" * 96)
+                print("PRE-TRADE VALIDATION FAILED — NOT executing. Fix these first:")
+                for _f in _fails:
+                    print(f"  ✗ {_f}")
+                print("=" * 96)
+                if not bool(args.skip_validation):
+                    print("[exec] aborted by validation gate. Most likely fix: "
+                          "ibkr_paper_exec.py --sync-holdings --execute, then re-run the engine.")
+                    print("[exec] (override with --skip-validation only if you understand why.)")
+                    return 6
+                print("[exec][WARN] --skip-validation set — proceeding DESPITE the failures above.")
+            else:
+                print("[exec] pre-trade validation: PASS (reconciled, no shorts, turnover + cash OK)")
+        except Exception as _e_val:
+            print(f"[exec][WARN] pre-trade validation errored ({_e_val}); "
+                  f"proceeding to the manual typed-YES gate.")
 
         # === Typed-YES gate ===
         if not _confirm_typed_yes(len(plan)):
