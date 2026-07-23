@@ -273,7 +273,7 @@ def _deferred_completion_decision(*, approved_price_local, current_price_local,
 
 def validate_pre_trade(trades: list, assumed_positions: dict, broker_positions: dict,
                        available_cash_aud, nav_aud, *, max_turnover: float = 2.0,
-                       unit_tol: float = 1.0) -> tuple[bool, list]:
+                       unit_tol: float = 1.0, open_orders: "dict | None" = None) -> tuple[bool, list]:
     """PURE pre-trade safety gate — runs against BROKER TRUTH before any order.
     Returns (ok, failures). The engine's _validate_trade_plan_sanity runs on the
     SHEET; this runs on the broker, catching the exact 2026-07-23 failure the
@@ -283,9 +283,14 @@ def validate_pre_trade(trades: list, assumed_positions: dict, broker_positions: 
     trades:            [{ticker, delta_units, delta_value_aud}, ...] (the plan)
     assumed_positions: {ticker: units} the plan was built on (rec-log current_units)
     broker_positions:  {ticker: units} truth from ib.positions()
+    open_orders:       {ticker: signed working units} from ib.openTrades() — orders
+                       from a prior run NOT yet in a terminal state. Optional; None
+                       skips the check (back-compat + unit tests that don't set it).
     Checks (any failure ⇒ abort): (1) reconciliation — plan basis == broker;
     (2) no resulting/uncovered short in the long-only book; (3) turnover bound;
-    (4) net buys ≤ available cash."""
+    (4) net buys ≤ available cash; (5) no working orders — the book must be
+    quiescent so a new plan can't STACK on unfilled orders (the daily-churn
+    failure autonomy must never cause)."""
     fails: list[str] = []
     delta = {}
     for t in trades:
@@ -328,6 +333,21 @@ def validate_pre_trade(trades: list, assumed_positions: dict, broker_positions: 
         if net_buy > float(available_cash_aud) * 1.01:
             fails.append(f"CASH: net buys ${net_buy:,.0f} > available ${float(available_cash_aud):,.0f}")
 
+    # 5) OPEN ORDERS — a clean rebalance must start from a QUIESCENT book. A
+    #    working order left over from a prior run (unfilled/PreSubmitted) is
+    #    invisible to the position-based checks above, so submitting a new plan
+    #    would STACK a fresh batch on top of it — the exact daily-churn failure
+    #    autonomy must never cause (broken calendar anchor keeps the verdict RUN,
+    #    drift stays high while orders sit unfilled → re-submit every day). Any
+    #    working order aborts; the fail-safe email tells the user to clear it.
+    if open_orders:
+        for tk in sorted(open_orders):
+            q = float(open_orders.get(tk, 0.0) or 0.0)
+            if abs(q) > unit_tol:
+                fails.append(f"OPEN-ORDER: {tk} has a working order ({q:g}u) at the "
+                             f"broker — a prior run hasn't settled; cancel/resolve it "
+                             f"before submitting (stacking risk)")
+
     return (len(fails) == 0, fails)
 
 
@@ -345,6 +365,45 @@ def _broker_positions(ib) -> dict:
                     or str(getattr(c, "primaryExchange", "")).upper() == "ASX"):
                 sym = f"{sym}.AX"
             out[sym] = out.get(sym, 0.0) + float(pos.position)
+    except Exception:
+        pass
+    return out
+
+
+def _broker_open_orders(ib) -> dict:
+    """{engine-ticker: signed working units} for orders NOT in a terminal state
+    (PreSubmitted/Submitted/PendingSubmit). A non-empty result means the book is
+    mid-adjustment — a prior run's orders haven't filled or cancelled — so a new
+    plan submitted now would STACK on top of them. ASX bare symbols → .AX
+    (mirrors _broker_positions). Best-effort → {} on failure (fail-open here is
+    safe: the validation gate treats {} as 'no working orders', and a real stuck
+    order also trips the reconcile/drift paths on the next run)."""
+    out: dict[str, float] = {}
+    try:
+        try:
+            ib.reqAllOpenOrders()
+            ib.sleep(1)
+        except Exception:
+            pass
+        for tr in ib.openTrades():
+            try:
+                if tr.isDone():
+                    continue
+            except Exception:
+                pass
+            c = getattr(tr, "contract", None)
+            if c is None or str(getattr(c, "secType", "STK")).upper() != "STK":
+                continue
+            sym = str(c.symbol).strip().upper()
+            if (str(getattr(c, "currency", "")).upper() == "AUD"
+                    or str(getattr(c, "primaryExchange", "")).upper() == "ASX"):
+                sym = f"{sym}.AX"
+            try:
+                rem = float(tr.remaining() or 0)
+            except Exception:
+                rem = float(getattr(tr.order, "totalQuantity", 0) or 0)
+            sign = -1.0 if str(getattr(tr.order, "action", "BUY")).upper() == "SELL" else 1.0
+            out[sym] = out.get(sym, 0.0) + sign * abs(rem)
     except Exception:
         pass
     return out
@@ -441,7 +500,8 @@ def _run_shadow_execute_mode(email: bool = False) -> int:
         ok, fails = validate_pre_trade(
             _val_trades, _assumed, _broker_pos,
             available_cash_aud=_available_funds_aud(ib),
-            nav_aud=_broker_net_liquidation_aud(ib))
+            nav_aud=_broker_net_liquidation_aud(ib),
+            open_orders=_broker_open_orders(ib))
     finally:
         if ib.isConnected():
             ib.disconnect()
@@ -1779,7 +1839,8 @@ def main() -> int:
             _val_ok, _val_fails = validate_pre_trade(
                 _val_trades, _assumed_pos, _broker_pos,
                 available_cash_aud=_available_funds_aud(ib),
-                nav_aud=_broker_net_liquidation_aud(ib))
+                nav_aud=_broker_net_liquidation_aud(ib),
+                open_orders=_broker_open_orders(ib))
         except Exception as _e_val:
             _val_errored = True
             print(f"[exec][WARN] pre-trade validation errored ({_e_val}).")

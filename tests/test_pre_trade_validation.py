@@ -83,6 +83,39 @@ def test_missing_cash_or_nav_does_not_crash():
     assert ok and fails == []
 
 
+# --- open-order guard (anti-stacking; the 2026-07-24 daily-churn fix) --------
+
+def test_working_order_on_plan_ticker_aborts():
+    # a prior run's HBRD buy is still working; re-submitting would STACK
+    trades = [_t("HBRD.AX", 497, 5004.79), _t("VLUE.AX", 100, 3600.0)]
+    assumed = {"HBRD.AX": 280, "VLUE.AX": 2000}
+    broker = {"HBRD.AX": 280, "VLUE.AX": 2000}
+    ok, fails = ex.validate_pre_trade(trades, assumed, broker,
+                                      available_cash_aud=50_000, nav_aud=246_000,
+                                      open_orders={"HBRD.AX": 497})
+    assert not ok
+    assert any("OPEN-ORDER" in f and "HBRD" in f for f in fails)
+
+
+def test_working_order_on_unrelated_ticker_also_aborts():
+    # book must be quiescent: even a working order the plan doesn't touch blocks
+    trades = [_t("VLUE.AX", 100, 3600.0)]
+    ok, fails = ex.validate_pre_trade(trades, {"VLUE.AX": 2000}, {"VLUE.AX": 2000},
+                                      available_cash_aud=50_000, nav_aud=246_000,
+                                      open_orders={"PDBC": -304})
+    assert not ok
+    assert any("OPEN-ORDER" in f and "PDBC" in f for f in fails)
+
+
+def test_no_open_orders_passes():
+    trades = [_t("VLUE.AX", 100, 3600.0)]
+    for oo in (None, {}, {"VLUE.AX": 0.0}):
+        ok, fails = ex.validate_pre_trade(trades, {"VLUE.AX": 2000}, {"VLUE.AX": 2000},
+                                          available_cash_aud=50_000, nav_aud=246_000,
+                                          open_orders=oo)
+        assert ok, (oo, fails)
+
+
 # --- shadow mode report body ------------------------------------------------
 
 def test_shadow_body_execute_lists_orders():
