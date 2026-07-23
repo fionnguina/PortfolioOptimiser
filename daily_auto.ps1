@@ -267,6 +267,24 @@ try {
     Write-Log "Could not truncate $LogPath ($($_.Exception.Message)); continuing."
 }
 
+# --- Reconcile Holdings sheet to broker truth BEFORE the engine (2026-07-23) ---
+# The engine builds the trade plan from the sheet's Units column. Real fills move
+# the BROKER but the sheet goes stale (2026-07-20: 3-day drift → every plan built
+# on wrong holdings, over-buying + a naked SOXX short the plan silently ignored).
+# Sync the sheet to broker positions FIRST so the plan is always on truth. Writes
+# ONLY the sheet Units via --assume-yes — places NO orders. Non-fatal: on failure
+# (e.g. TWS down) the engine proceeds on the existing sheet as before.
+try {
+    $syncPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $syncScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
+    if ((Test-Path $syncPy) -and (Test-Path $syncScript)) {
+        $syncOut = & $syncPy $syncScript --sync-holdings --execute --assume-yes 2>&1 | Select-Object -Last 3
+        Write-Log "Holdings reconcile (sync-holdings --assume-yes): $syncOut"
+    }
+} catch {
+    Write-Log "Holdings reconcile failed (non-fatal): $($_.Exception.Message)"
+}
+
 # --- Run engine with --auto-pipeline ---
 # Two-channel completion detection because PowerShell's Start-Process -Wait
 # can hang waiting for child processes that PyInstaller --noconsole exes

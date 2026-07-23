@@ -1098,7 +1098,7 @@ def _run_snapshot_nav_mode() -> int:
     return 0
 
 
-def _run_sync_holdings_mode(workbook: str, execute: bool) -> int:
+def _run_sync_holdings_mode(workbook: str, execute: bool, assume_yes: bool = False) -> int:
     """--sync-holdings: pull broker-truth positions from paper TWS and write
     them into the Holdings sheet's Units column (typed-YES gated).
 
@@ -1200,16 +1200,24 @@ def _run_sync_holdings_mode(workbook: str, execute: bool) -> int:
               f"Re-run with --sync-holdings --execute to write.")
         return 0
 
-    prompt = (f"\n[sync][CONFIRM] About to write {len(changes)} Units value(s) into "
-              f"the Holdings sheet of {workbook}.\n"
-              f"           Type YES (uppercase) to proceed: ")
-    try:
-        reply = input(prompt)
-    except EOFError:
-        reply = ""
-    if reply != "YES":
-        print(f"[sync][SAFETY] confirmation was '{reply}', expected 'YES'. Aborting.")
-        return 5
+    if assume_yes:
+        # Non-interactive path for the unattended wrapper. This writes ONLY the
+        # Holdings sheet Units to broker truth — it places NO orders, so it's a
+        # safe reconciliation to auto-run. The morning wrapper calls it before
+        # the engine so the plan is never built on stale holdings.
+        print(f"[sync] --assume-yes: writing {len(changes)} Units value(s) to broker truth "
+              f"(no orders placed).")
+    else:
+        prompt = (f"\n[sync][CONFIRM] About to write {len(changes)} Units value(s) into "
+                  f"the Holdings sheet of {workbook}.\n"
+                  f"           Type YES (uppercase) to proceed: ")
+        try:
+            reply = input(prompt)
+        except EOFError:
+            reply = ""
+        if reply != "YES":
+            print(f"[sync][SAFETY] confirmation was '{reply}', expected 'YES'. Aborting.")
+            return 5
 
     # Write via xlwings so an already-open workbook + macros are respected.
     import xlwings as xw
@@ -1330,6 +1338,10 @@ def main() -> int:
                              "manual TWS trades that never touch the fills log. "
                              "Preview by default; add --execute (+ typed YES) to "
                              "write the sheet.")
+    parser.add_argument("--assume-yes", action="store_true",
+                        help="With --sync-holdings --execute: skip the typed-YES "
+                             "prompt (for the unattended morning wrapper). Writes "
+                             "only the sheet Units to broker truth — places NO orders.")
     parser.add_argument("--workbook", type=str, default=str(_SCRIPT_DIR / "Stock Analysis.xlsm"),
                         help="Workbook path for --sync-holdings "
                              "(default: Stock Analysis.xlsm beside the script)")
@@ -1402,7 +1414,8 @@ def main() -> int:
 
     # === --sync-holdings mode: broker-truth Units reconciliation ===
     if args.sync_holdings:
-        return _run_sync_holdings_mode(args.workbook, execute=args.execute)
+        return _run_sync_holdings_mode(args.workbook, execute=args.execute,
+                                       assume_yes=bool(args.assume_yes))
 
     rec_entry = _load_latest_run(Path(args.rec_log))
     trades_recs = rec_entry.get("recommended_trades", [])

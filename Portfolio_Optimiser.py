@@ -6101,11 +6101,14 @@ if bool(CFG.get("oos_validation", True)):
         _cost_ser = ensemble_out.get("rebalance_costs", pd.Series(dtype=float))
         _tax_ser = ensemble_out.get("rebalance_taxes", pd.Series(dtype=float))
         _years = max(len(oos_returns_daily) / ANNUAL_TRADING_DAYS, 1e-6)
+        _ann_cost_bps = 0.0
         if not _cost_ser.empty:
             _ann_cost_bps = float(_cost_ser.sum()) / _years * 10_000
             print(f"[oos] brokerage ({BROKER_CONFIG['name']}): "
                   f"avg {float(_cost_ser.mean())*10000:.1f} bps/rebal, "
                   f"~{_ann_cost_bps:.0f} bps/year")
+        # Publish annualised drag so the health summary + deck can call it out.
+        globals()["BROKERAGE_DRAG_BPS_ANNUAL"] = _ann_cost_bps
         if not _tax_ser.empty and _tax_ser.sum() > 0:
             _ann_tax_bps = float(_tax_ser.sum()) / _years * 10_000
             _mtr_pct = (float(CGT_CONFIG['marginal_tax_rate']) +
@@ -6117,6 +6120,8 @@ if bool(CFG.get("oos_validation", True)):
                   f"~{_ann_tax_bps:.0f} bps/year")
             print(f"[oos] TOTAL drag (brokerage + CGT): "
                   f"~{_ann_cost_bps + _ann_tax_bps:.0f} bps/year (NET in metrics)")
+            globals()["CGT_DRAG_BPS_ANNUAL"] = _ann_tax_bps
+            globals()["TOTAL_DRAG_BPS_ANNUAL"] = _ann_cost_bps + _ann_tax_bps
         # TLH summary for the live OOS run: quantifies harvesting activity over
         # the full backtested window. Gross headline tax-saved figure assumes
         # 100% utilisation against future gains — see dev-validation output for
@@ -9130,6 +9135,20 @@ def _print_run_health_summary():
         _drift_summary = globals().get("DRIFT_LAST_SUMMARY", None)
         if isinstance(_drift_summary, str):
             print(f"  Drift tracker:        {_drift_summary}")
+    except Exception:
+        pass
+
+    # Annualised running cost — called out so the true cost of the fund is
+    # visible at a glance (brokerage is small; CGT is ~80% of the drag).
+    try:
+        _bk = float(globals().get("BROKERAGE_DRAG_BPS_ANNUAL", 0.0) or 0.0)
+        _cg = float(globals().get("CGT_DRAG_BPS_ANNUAL", 0.0) or 0.0)
+        _tot = float(globals().get("TOTAL_DRAG_BPS_ANNUAL", _bk + _cg) or (_bk + _cg))
+        if _tot > 0:
+            _nav = float(globals().get("TARGET_PORTFOLIO_VALUE_AUD", 0.0) or 0.0)
+            _dollar = f" (~${_bk/10000*_nav:,.0f} brokerage/yr)" if _nav > 0 else ""
+            print(f"  Est. annual cost:     brokerage ~{_bk:.0f} bps + CGT ~{_cg:.0f} bps "
+                  f"= ~{_tot:.0f} bps/yr{_dollar}")
     except Exception:
         pass
 
