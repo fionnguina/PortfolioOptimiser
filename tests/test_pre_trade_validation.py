@@ -81,3 +81,26 @@ def test_missing_cash_or_nav_does_not_crash():
     ok, fails = ex.validate_pre_trade(trades, {"VLUE.AX": 100}, {"VLUE.AX": 100},
                                       available_cash_aud=None, nav_aud=None)
     assert ok and fails == []
+
+
+# --- shadow mode report body ------------------------------------------------
+
+def test_shadow_body_execute_lists_orders():
+    rec = {"run_at": "2026-07-23T09:32:09"}
+    trades = [_t("SMH", 38, 31_832.0), _t("VEA", -16, -1610.0), _t("X", 0, 0.0)]
+    body = ex._shadow_report_body(rec, trades, ok=True, fails=[])
+    assert "WOULD EXECUTE" in body
+    assert "BUY " in body and "SMH" in body
+    assert "SELL" in body and "VEA" in body
+    assert "X" not in body.split("no orders")[0].split("VEA")[-1]  # zero-delta skipped
+    assert "no orders were placed" in body.lower()
+
+
+def test_shadow_body_abort_lists_failures():
+    rec = {"run_at": "2026-07-23T09:32:09"}
+    trades = [_t("SMH", 38, 31_832.0)]
+    body = ex._shadow_report_body(rec, trades, ok=False,
+                                  fails=["RECONCILE: SOXX plan-assumed 0u != broker -53u"])
+    assert "WOULD ABORT" in body
+    assert "RECONCILE" in body and "SOXX" in body
+    assert "would place" not in body.lower()

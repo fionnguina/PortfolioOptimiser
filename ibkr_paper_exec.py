@@ -360,6 +360,96 @@ def _broker_net_liquidation_aud(ib) -> "float | None":
         return None
 
 
+# ============================================================================
+# Shadow mode — dry-run the FULL autonomy decision, place NO orders
+# ============================================================================
+
+def _shadow_report_body(rec_entry: dict, trades_recs: list, ok: bool,
+                        fails: list) -> str:
+    """PURE report body for shadow mode (unit-tested). Shows exactly what the
+    autonomous path WOULD do this cycle — execute or abort — without trading."""
+    verdict = "WOULD EXECUTE" if ok else "WOULD ABORT (validation gate)"
+    lines = [f"AUTONOMY SHADOW — plan @ {rec_entry.get('run_at', '?')}",
+             f"Verdict: {verdict}", ""]
+    if ok:
+        lines.append("Orders it would place (pre-trade validation PASSED):")
+        for r in trades_recs:
+            try:
+                du = int(r.get("delta_units", 0) or 0)
+            except (TypeError, ValueError):
+                du = 0
+            if du == 0:
+                continue
+            side = "BUY " if du > 0 else "SELL"
+            lines.append(f"  {side} {abs(du):>6} {str(r.get('ticker','?')):<10} "
+                         f"~${abs(float(r.get('delta_value_aud', 0.0) or 0.0)):,.0f}")
+    else:
+        lines.append("Validation gate FAILED — it would NOT execute:")
+        for f in fails:
+            lines.append(f"  x {f}")
+    lines.append("")
+    lines.append("SHADOW MODE — no orders were placed. This is a dry run of the "
+                 "autonomous path; enable it deliberately once you trust these calls.")
+    return "\n".join(lines)
+
+
+def _run_shadow_execute_mode(email: bool = False) -> int:
+    """Dry-run the autonomous decision: load the latest plan, check it against
+    BROKER TRUTH via the same pre-trade gate the real path uses, and report what
+    it WOULD do. Places NO orders — the rung between the validation gate and the
+    live AUTO_EXECUTE switch, so the user can watch it before trusting it."""
+    rec_entry = _load_latest_run(Path(_SCRIPT_DIR / REC_LOG_FILENAME))
+    trades_recs = rec_entry.get("recommended_trades", []) if rec_entry else []
+    if not trades_recs:
+        print("[shadow] latest run has no recommended_trades — nothing to shadow.")
+        return 0
+    try:
+        from ib_insync import IB
+    except ImportError:
+        print("[shadow] ib_insync not installed.")
+        return 1
+    ib = IB()
+    try:
+        ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[shadow][ERR] connect failed ({e}); TWS/Gateway up?")
+        return 2
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed:
+            print("[shadow][SAFETY] no managed account.")
+            return 3
+        _refuse_if_live(managed[0])
+        _broker_pos = _broker_positions(ib)
+        _assumed = dict(rec_entry.get("current_units", {}) or {})
+        _val_trades = [{"ticker": r["ticker"],
+                        "delta_units": r.get("delta_units", 0),
+                        "delta_value_aud": r.get("delta_value_aud", 0.0)}
+                       for r in trades_recs]
+        ok, fails = validate_pre_trade(
+            _val_trades, _assumed, _broker_pos,
+            available_cash_aud=_available_funds_aud(ib),
+            nav_aud=_broker_net_liquidation_aud(ib))
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+    body = _shadow_report_body(rec_entry, trades_recs, ok, fails)
+    print("\n" + "=" * 96)
+    print(body)
+    print("=" * 96)
+    if email:
+        try:
+            from send_alert import send
+            subj = (f"[Portfolio Optimiser] SHADOW: would "
+                    f"{'EXECUTE' if ok else 'ABORT'} ({len(trades_recs)} orders)")
+            rc = send(subj, body)
+            print(f"[shadow] report emailed (rc={rc}).")
+        except Exception as e:
+            print(f"[shadow] email failed ({e}); non-fatal.")
+    return 0
+
+
 def _write_deferred_orders(deferred: list, ib, rec_entry: dict, path: Path) -> int:
     """Persist cash-deferred buys so the guarded auto-completer can finish them.
     Captures the approved LOCAL price now (via IBKR) so completion can drift-check
@@ -1476,7 +1566,17 @@ def main() -> int:
                         help="With --record-tax-payment: the AU FY label, e.g. FY2025-26.")
     parser.add_argument("--amount", type=float, default=0.0,
                         help="With --record-tax-payment: AUD paid to the ATO for that FY.")
+    parser.add_argument("--shadow-execute", action="store_true",
+                        help="Dry-run the AUTONOMOUS decision on the latest plan: "
+                             "check it against broker truth via the pre-trade gate "
+                             "and report (with --email) what it WOULD execute or "
+                             "abort — places NO orders. The rung before live "
+                             "auto-execution; run it a few cycles to build trust.")
     args = parser.parse_args()
+
+    # === --shadow-execute: dry-run the autonomous decision, place NO orders ===
+    if args.shadow_execute:
+        return _run_shadow_execute_mode(email=bool(args.email))
 
     # === --record-tax-payment: release the CGT provision for a settled FY ===
     if args.record_tax_payment:

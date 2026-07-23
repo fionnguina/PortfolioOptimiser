@@ -763,6 +763,25 @@ try {
     Write-Log "Deferred auto-complete failed (non-fatal): $($_.Exception.Message)"
 }
 
+# --- Autonomy shadow mode (2026-07-23, user directive) ---
+# Dry-run the AUTONOMOUS decision on today's fresh plan (post-reconcile): run the
+# same broker-truth pre-trade gate the live auto-execute would, and email what it
+# WOULD execute or abort — placing NO orders. Lets the user watch the autonomous
+# path make the right calls for a few cycles before flipping the AUTO_EXECUTE
+# switch. Non-fatal; only runs on a RUN verdict (no plan churn on SKIP days).
+if ($verdict -eq "RUN") {
+    try {
+        $shPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+        $shScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
+        if ((Test-Path $shPy) -and (Test-Path $shScript)) {
+            $shOut = & $shPy $shScript --shadow-execute --email 2>&1 | Select-Object -Last 4
+            Write-Log "Autonomy shadow (would-execute dry run): $shOut"
+        }
+    } catch {
+        Write-Log "Autonomy shadow failed (non-fatal): $($_.Exception.Message)"
+    }
+}
+
 # --- Evidence backup to OneDrive (2026-07-09) ---
 # The real-money track record + lot book live in gitignored local-only
 # files; mirror them to OneDrive each run so a disk failure can't erase the
