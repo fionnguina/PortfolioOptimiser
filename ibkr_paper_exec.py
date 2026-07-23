@@ -360,6 +360,18 @@ def _broker_net_liquidation_aud(ib) -> "float | None":
         return None
 
 
+def _auto_email(subject: str, body: str) -> None:
+    """Email an autonomous-run outcome (executed / blocked / aborted). Non-fatal;
+    silent if the mailer is unconfigured. Auto-execution is unattended, so every
+    outcome must reach the user."""
+    try:
+        from send_alert import send
+        send(f"[Portfolio Optimiser] {subject}", body)
+        print(f"[auto-exec] emailed: {subject}")
+    except Exception as _e:
+        print(f"[auto-exec] email failed ({_e}); non-fatal.")
+
+
 # ============================================================================
 # Shadow mode — dry-run the FULL autonomy decision, place NO orders
 # ============================================================================
@@ -1572,7 +1584,16 @@ def main() -> int:
                              "and report (with --email) what it WOULD execute or "
                              "abort — places NO orders. The rung before live "
                              "auto-execution; run it a few cycles to build trust.")
+    parser.add_argument("--auto-execute", action="store_true",
+                        help="AUTONOMOUS execution: submit the latest plan with NO "
+                             "human prompt — the broker-truth validation gate is the "
+                             "approval (MANDATORY here; a gate failure or error aborts "
+                             "and emails, never trades blind). Implies --execute. Pair "
+                             "with --email. This is the live auto-trade switch.")
     args = parser.parse_args()
+    # --auto-execute is a headless --execute; the validation gate replaces the prompt.
+    if args.auto_execute:
+        args.execute = True
 
     # === --shadow-execute: dry-run the autonomous decision, place NO orders ===
     if args.shadow_execute:
@@ -1742,10 +1763,12 @@ def main() -> int:
         _print_preview(rec_entry, plan, totals)
 
         # === Pre-trade validation gate (broker truth) ===
-        # Runs BEFORE the typed-YES gate so a bad plan never even offers to
-        # execute. Catches the 2026-07-23 class (stale sheet → naked short) that
-        # the engine's sheet-side sanity check can't see. Overridable with
-        # --skip-validation for a deliberate manual correction.
+        # Runs BEFORE approval so a bad plan never executes. Catches the
+        # 2026-07-23 class (stale sheet → naked short) the engine's sheet-side
+        # sanity check can't see. In AUTO mode this gate IS the approval and is
+        # MANDATORY — --skip-validation is ignored and a validation ERROR aborts
+        # (never auto-trade blind). Manual mode may override with --skip-validation.
+        _val_ok, _val_fails, _val_errored = False, [], False
         try:
             _broker_pos = _broker_positions(ib)
             _assumed_pos = dict(rec_entry.get("current_units", {}) or {})
@@ -1753,30 +1776,49 @@ def main() -> int:
                             "delta_units": r.get("delta_units", 0),
                             "delta_value_aud": r.get("delta_value_aud", 0.0)}
                            for r in trades_recs]
-            _nav = _broker_net_liquidation_aud(ib)
-            _ok, _fails = validate_pre_trade(
+            _val_ok, _val_fails = validate_pre_trade(
                 _val_trades, _assumed_pos, _broker_pos,
-                available_cash_aud=_available_funds_aud(ib), nav_aud=_nav)
-            if not _ok:
-                print("\n" + "=" * 96)
-                print("PRE-TRADE VALIDATION FAILED — NOT executing. Fix these first:")
-                for _f in _fails:
-                    print(f"  ✗ {_f}")
-                print("=" * 96)
-                if not bool(args.skip_validation):
-                    print("[exec] aborted by validation gate. Most likely fix: "
-                          "ibkr_paper_exec.py --sync-holdings --execute, then re-run the engine.")
-                    print("[exec] (override with --skip-validation only if you understand why.)")
-                    return 6
-                print("[exec][WARN] --skip-validation set — proceeding DESPITE the failures above.")
-            else:
-                print("[exec] pre-trade validation: PASS (reconciled, no shorts, turnover + cash OK)")
+                available_cash_aud=_available_funds_aud(ib),
+                nav_aud=_broker_net_liquidation_aud(ib))
         except Exception as _e_val:
-            print(f"[exec][WARN] pre-trade validation errored ({_e_val}); "
-                  f"proceeding to the manual typed-YES gate.")
+            _val_errored = True
+            print(f"[exec][WARN] pre-trade validation errored ({_e_val}).")
 
-        # === Typed-YES gate ===
-        if not _confirm_typed_yes(len(plan)):
+        if _val_errored:
+            if args.auto_execute:
+                _auto_email("AUTO-EXECUTE ABORTED — validation could not run",
+                            "The pre-trade gate errored, so the autonomous run refused "
+                            "to trade blind. No orders placed. Check the logs.")
+                print("[exec] AUTO-EXECUTE aborted (validation errored — fail-safe). No orders.")
+                return 6
+            print("[exec][WARN] validation errored — falling through to the manual typed-YES gate.")
+        elif not _val_ok:
+            print("\n" + "=" * 96)
+            print("PRE-TRADE VALIDATION FAILED — NOT executing. Fix these first:")
+            for _f in _val_fails:
+                print(f"  x {_f}")
+            print("=" * 96)
+            if args.auto_execute or not bool(args.skip_validation):
+                if args.auto_execute:
+                    _auto_email("AUTO-EXECUTE BLOCKED by validation gate",
+                                "The autonomous run refused to execute:\n\n"
+                                + "\n".join(f"  x {f}" for f in _val_fails)
+                                + "\n\nNo orders placed. Fix: ibkr_paper_exec.py "
+                                  "--sync-holdings --execute, then re-run the engine.")
+                print("[exec] aborted by validation gate. Most likely fix: "
+                      "ibkr_paper_exec.py --sync-holdings --execute, then re-run the engine.")
+                return 6
+            print("[exec][WARN] --skip-validation set — proceeding DESPITE the failures above.")
+        else:
+            print("[exec] pre-trade validation: PASS (reconciled, no shorts, turnover + cash OK)")
+
+        # === Approval gate ===
+        # AUTO mode: the validation gate above IS the approval (no human prompt).
+        # Manual mode: require the typed-YES.
+        if args.auto_execute:
+            print(f"[exec] AUTO-EXECUTE: {len(plan)} order(s) auto-approved by the validation "
+                  f"gate — submitting (no human prompt).")
+        elif not _confirm_typed_yes(len(plan)):
             return 4
 
         # === Submit orders — funds-aware two phases (2026-07-08) ===
@@ -1869,6 +1911,19 @@ def main() -> int:
         fills_path = _SCRIPT_DIR / FILLS_LOG_FILENAME  # anchored: scheduled-task CWD=System32
         n_written = _write_fills_log(rec_entry, trades, fills_path)
         print(f"[exec] {n_written} row(s) appended to {fills_path}")
+
+        # AUTO mode: email the outcome — this ran unattended, so every result must reach the user.
+        if args.auto_execute:
+            _lines = [f"AUTO-EXECUTE submitted {len(trades)} order(s) "
+                      f"(gate PASSED, no human prompt)."]
+            if deferred:
+                _lines.append(f"{len(deferred)} deferred (insufficient funds until sells "
+                              f"settle): {','.join(r['ticker'] for r, _c, _o in deferred)} "
+                              f"— the guarded auto-completer finishes them next run.")
+            _lines.append("")
+            _lines.append("Orders may still be settling; the wrapper's --check-fills email "
+                          "confirms fills. Review positions if anything looks off.")
+            _auto_email("AUTO-EXECUTE complete", "\n".join(_lines))
 
     finally:
         if ib.isConnected():

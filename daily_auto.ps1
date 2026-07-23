@@ -763,22 +763,25 @@ try {
     Write-Log "Deferred auto-complete failed (non-fatal): $($_.Exception.Message)"
 }
 
-# --- Autonomy shadow mode (2026-07-23, user directive) ---
-# Dry-run the AUTONOMOUS decision on today's fresh plan (post-reconcile): run the
-# same broker-truth pre-trade gate the live auto-execute would, and email what it
-# WOULD execute or abort — placing NO orders. Lets the user watch the autonomous
-# path make the right calls for a few cycles before flipping the AUTO_EXECUTE
-# switch. Non-fatal; only runs on a RUN verdict (no plan churn on SKIP days).
+# --- Autonomy: auto-execute (or shadow) on RUN (2026-07-23, user directive) ---
+# THE SWITCH. $AutoExecute = $true → place orders AUTONOMOUSLY behind the MANDATORY
+# broker-truth validation gate (reconcile / no-short / turnover / cash): a bad plan
+# is BLOCKED + emailed, never executed; a validation error aborts (never trades
+# blind). $false → shadow only (dry-run report, no orders). Paper account. The
+# reconcile step above ran first, so the gate sees a fresh sheet. Non-fatal;
+# RUN-verdict only. To revert to notify-only, set $AutoExecute = $false.
+$AutoExecute = $true
 if ($verdict -eq "RUN") {
     try {
         $shPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
         $shScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
         if ((Test-Path $shPy) -and (Test-Path $shScript)) {
-            $shOut = & $shPy $shScript --shadow-execute --email 2>&1 | Select-Object -Last 4
-            Write-Log "Autonomy shadow (would-execute dry run): $shOut"
+            $autoArg = if ($AutoExecute) { "--auto-execute" } else { "--shadow-execute" }
+            $shOut = & $shPy $shScript $autoArg --email 2>&1 | Select-Object -Last 6
+            Write-Log "Autonomy ($autoArg): $shOut"
         }
     } catch {
-        Write-Log "Autonomy shadow failed (non-fatal): $($_.Exception.Message)"
+        Write-Log "Autonomy step failed (non-fatal): $($_.Exception.Message)"
     }
 }
 
