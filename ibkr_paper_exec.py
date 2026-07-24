@@ -273,7 +273,8 @@ def _deferred_completion_decision(*, approved_price_local, current_price_local,
 
 def validate_pre_trade(trades: list, assumed_positions: dict, broker_positions: dict,
                        available_cash_aud, nav_aud, *, max_turnover: float = 2.0,
-                       unit_tol: float = 1.0, open_orders: "dict | None" = None) -> tuple[bool, list]:
+                       unit_tol: float = 1.0, open_orders: "dict | None" = None,
+                       data_farm_broken: bool = False, data_farm_reason: str = "") -> tuple[bool, list]:
     """PURE pre-trade safety gate — runs against BROKER TRUTH before any order.
     Returns (ok, failures). The engine's _validate_trade_plan_sanity runs on the
     SHEET; this runs on the broker, catching the exact 2026-07-23 failure the
@@ -286,11 +287,17 @@ def validate_pre_trade(trades: list, assumed_positions: dict, broker_positions: 
     open_orders:       {ticker: signed working units} from ib.openTrades() — orders
                        from a prior run NOT yet in a terminal state. Optional; None
                        skips the check (back-compat + unit tests that don't set it).
+    data_farm_broken:  True if IBKR's market-data farm reported BROKEN (code 2103)
+                       on this session — the feed is down, so market orders would
+                       sit unfilled (the 2026-07-24 incident: TWS up, data farm
+                       down, orders stuck PreSubmitted for 4 days). data_farm_reason
+                       carries the human-readable status. Default False = no gate.
     Checks (any failure ⇒ abort): (1) reconciliation — plan basis == broker;
     (2) no resulting/uncovered short in the long-only book; (3) turnover bound;
     (4) net buys ≤ available cash; (5) no working orders — the book must be
     quiescent so a new plan can't STACK on unfilled orders (the daily-churn
-    failure autonomy must never cause)."""
+    failure autonomy must never cause); (6) market-data feed live — never submit
+    into a dead feed where orders can't fill."""
     fails: list[str] = []
     delta = {}
     for t in trades:
@@ -347,6 +354,17 @@ def validate_pre_trade(trades: list, assumed_positions: dict, broker_positions: 
                 fails.append(f"OPEN-ORDER: {tk} has a working order ({q:g}u) at the "
                              f"broker — a prior run hasn't settled; cancel/resolve it "
                              f"before submitting (stacking risk)")
+
+    # 6) MARKET-DATA FEED — a market order submitted into a dead data farm sits
+    #    PreSubmitted and never fills (the 2026-07-24 incident: 7 orders stuck 4
+    #    days while the account was 'not connected to the market data system').
+    #    Delayed cached prices still return in that state, so a price probe is a
+    #    FALSE all-clear — the farm connection status (code 2103 vs 2104) is the
+    #    only reliable signal. If it's broken, refuse: better to abort+email than
+    #    submit orders that can't fill and pile up.
+    if data_farm_broken:
+        fails.append(f"MKT-DATA: {data_farm_reason or 'market-data farm connection is broken'} "
+                     f"— the feed is down; orders would sit unfilled. Not trading.")
 
     return (len(fails) == 0, fails)
 
@@ -407,6 +425,54 @@ def _broker_open_orders(ib) -> dict:
     except Exception:
         pass
     return out
+
+
+class _DataFarmMonitor:
+    """Tracks IBKR's market-data farm connection status from ib.errorEvent so the
+    auto-execute gate can refuse to trade when the feed is DOWN (orders would sit
+    unfilled — the 2026-07-24 incident). Subscribe RIGHT AFTER connect: IBKR emits
+    the farm-status burst (2103/2104 …) once, moments after connecting, so a
+    handler registered later would miss it. Farm status can also flip mid-session,
+    which this keeps tracking. Only the MARKET-DATA farm gates trading — HMDS
+    (historical) and sec-def (contract defs) don't block live fills."""
+    _BROKEN = {2103: "market-data farm", 2105: "HMDS farm", 2157: "sec-def farm"}
+    _OK = {2104: "market-data farm", 2106: "HMDS farm", 2158: "sec-def farm"}
+
+    def __init__(self, ib):
+        self._ib = ib
+        self._status: dict = {}   # farm-name -> (ok: bool, msg: str)
+        try:
+            ib.errorEvent += self._on
+        except Exception:
+            pass
+
+    def _on(self, reqId, code, msg, contract):
+        if code in self._BROKEN:
+            self._status[self._BROKEN[code]] = (False, str(msg))
+        elif code in self._OK:
+            self._status[self._OK[code]] = (True, str(msg))
+
+    def mktdata_ok(self, settle: float = 3.0) -> "tuple[bool, str]":
+        """(ok, reason). Waits `settle`s for the post-connect status burst, then
+        reports the MARKET-DATA farm only. Fail-OPEN on a missing status message
+        (the farm reliably reports on connect, and a genuinely-down feed reports
+        BROKEN, not silence) — don't halt a run on an absent message; check (5)
+        already blocks stacking, and a WARN is logged upstream."""
+        try:
+            self._ib.sleep(settle)
+        except Exception:
+            pass
+        st = self._status.get("market-data farm")
+        if st is None:
+            return True, "no market-data farm status seen (assumed ok)"
+        return st[0], ("market-data farm OK" if st[0]
+                       else f"market-data farm connection is broken ({st[1]})")
+
+    def detach(self):
+        try:
+            self._ib.errorEvent -= self._on
+        except Exception:
+            pass
 
 
 def _broker_net_liquidation_aud(ib) -> "float | None":
@@ -485,6 +551,7 @@ def _run_shadow_execute_mode(email: bool = False) -> int:
     except Exception as e:
         print(f"[shadow][ERR] connect failed ({e}); TWS/Gateway up?")
         return 2
+    _farm_mon = _DataFarmMonitor(ib)   # capture the post-connect farm-status burst
     try:
         managed = ib.managedAccounts() or []
         if not managed:
@@ -497,11 +564,13 @@ def _run_shadow_execute_mode(email: bool = False) -> int:
                         "delta_units": r.get("delta_units", 0),
                         "delta_value_aud": r.get("delta_value_aud", 0.0)}
                        for r in trades_recs]
+        _df_ok, _df_reason = _farm_mon.mktdata_ok()
         ok, fails = validate_pre_trade(
             _val_trades, _assumed, _broker_pos,
             available_cash_aud=_available_funds_aud(ib),
             nav_aud=_broker_net_liquidation_aud(ib),
-            open_orders=_broker_open_orders(ib))
+            open_orders=_broker_open_orders(ib),
+            data_farm_broken=(not _df_ok), data_farm_reason=_df_reason)
     finally:
         if ib.isConnected():
             ib.disconnect()
@@ -1786,6 +1855,9 @@ def main() -> int:
         print(f"[exec][ERR] connect failed ({type(e).__name__}): {e}")
         print(f"[exec] make sure TWS / IB Gateway is running on port {PORT} (paper).")
         return 2
+    # Subscribe to the data-farm status burst NOW (it fires once, just after
+    # connect) so the pre-trade gate can refuse to trade into a dead feed.
+    _farm_mon = _DataFarmMonitor(ib)
 
     try:
         managed = ib.managedAccounts() or []
@@ -1836,11 +1908,15 @@ def main() -> int:
                             "delta_units": r.get("delta_units", 0),
                             "delta_value_aud": r.get("delta_value_aud", 0.0)}
                            for r in trades_recs]
+            _df_ok, _df_reason = _farm_mon.mktdata_ok()
+            if not _df_ok:
+                print(f"[exec][WARN] market-data feed: {_df_reason}")
             _val_ok, _val_fails = validate_pre_trade(
                 _val_trades, _assumed_pos, _broker_pos,
                 available_cash_aud=_available_funds_aud(ib),
                 nav_aud=_broker_net_liquidation_aud(ib),
-                open_orders=_broker_open_orders(ib))
+                open_orders=_broker_open_orders(ib),
+                data_farm_broken=(not _df_ok), data_farm_reason=_df_reason)
         except Exception as _e_val:
             _val_errored = True
             print(f"[exec][WARN] pre-trade validation errored ({_e_val}).")

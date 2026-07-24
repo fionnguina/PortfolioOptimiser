@@ -116,6 +116,63 @@ def test_no_open_orders_passes():
         assert ok, (oo, fails)
 
 
+# --- data-farm liveness gate (the 2026-07-24 dead-feed fix) ------------------
+
+def test_broken_data_farm_aborts():
+    # feed down → market orders would sit unfilled → refuse
+    trades = [_t("VLUE.AX", 100, 3600.0)]
+    ok, fails = ex.validate_pre_trade(trades, {"VLUE.AX": 2000}, {"VLUE.AX": 2000},
+                                      available_cash_aud=50_000, nav_aud=246_000,
+                                      data_farm_broken=True,
+                                      data_farm_reason="market-data farm connection is broken (usfarm.nj)")
+    assert not ok
+    assert any("MKT-DATA" in f and "unfilled" in f for f in fails)
+
+
+def test_data_farm_ok_passes():
+    trades = [_t("VLUE.AX", 100, 3600.0)]
+    ok, fails = ex.validate_pre_trade(trades, {"VLUE.AX": 2000}, {"VLUE.AX": 2000},
+                                      available_cash_aud=50_000, nav_aud=246_000,
+                                      data_farm_broken=False)
+    assert ok and fails == []
+
+
+# --- _DataFarmMonitor: farm-status tracking from errorEvent codes ------------
+
+class _FakeEvent:
+    def __iadd__(self, fn): return self
+    def __isub__(self, fn): return self
+
+
+class _FakeIB:
+    def __init__(self): self.errorEvent = _FakeEvent()
+    def sleep(self, _s): pass
+
+
+def test_farm_monitor_broken_then_recovers():
+    mon = ex._DataFarmMonitor(_FakeIB())
+    mon._on(-1, 2103, "Market data farm connection is broken:usfarm.nj", None)
+    ok, why = mon.mktdata_ok(settle=0.0)
+    assert not ok and "broken" in why.lower()
+    mon._on(-1, 2104, "Market data farm connection is OK:usfarm.nj", None)
+    ok, why = mon.mktdata_ok(settle=0.0)
+    assert ok
+
+
+def test_farm_monitor_silence_fails_open():
+    ok, why = ex._DataFarmMonitor(_FakeIB()).mktdata_ok(settle=0.0)
+    assert ok  # no status message → assume ok (a down feed reports BROKEN, not silence)
+
+
+def test_farm_monitor_hmds_or_secdef_broken_does_not_block():
+    # HMDS (historical) + sec-def don't gate live fills — only the market-data farm does
+    mon = ex._DataFarmMonitor(_FakeIB())
+    mon._on(-1, 2105, "HMDS data farm connection is broken:apachmds", None)
+    mon._on(-1, 2157, "Sec-def data farm connection is broken:secdefsg", None)
+    ok, _ = mon.mktdata_ok(settle=0.0)
+    assert ok
+
+
 # --- shadow mode report body ------------------------------------------------
 
 def test_shadow_body_execute_lists_orders():
