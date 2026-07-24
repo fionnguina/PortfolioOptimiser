@@ -1466,6 +1466,115 @@ def _run_snapshot_nav_mode() -> int:
     return 0
 
 
+def _run_cancel_open_orders_mode(execute: bool = False, assume_yes: bool = False,
+                                 only_tickers: str = "", email: bool = False) -> int:
+    """Cancel WORKING (non-terminal) orders at the paper broker. PREVIEW by
+    default (read-only); --execute + typed YES (or --assume-yes) actually cancels.
+
+    Clears stale unfilled orders so the book is quiescent: the pre-trade open-order
+    guard blocks trading while ANY working order remains, so a stuck order (e.g. the
+    off-hours orders that sat PreSubmitted for days) wedges autonomy until cleared.
+    Paper-only. Cancelling removes resting orders — it places NO trades and moves no
+    funds. --only-tickers scopes; --email reports the outcome."""
+    def _working(t) -> bool:
+        try:
+            return not t.isDone()
+        except Exception:
+            return True   # unknown state → treat as working (conservative)
+
+    try:
+        from ib_insync import IB
+    except ImportError:
+        print("[cancel] ib_insync not installed.")
+        return 1
+    ib = IB()
+    try:
+        ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[cancel][ERR] connect failed ({type(e).__name__}): {e}")
+        print(f"[cancel] make sure TWS / IB Gateway is on port {PORT} (paper).")
+        return 2
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed:
+            print("[cancel][SAFETY] managedAccounts() returned nothing.")
+            return 3
+        _refuse_if_live(managed[0])
+        print(f"[cancel] paper account: {managed[0]}")
+
+        ib.reqAllOpenOrders()
+        ib.sleep(1.5)
+        opens = [t for t in ib.openTrades() if _working(t)]
+
+        # --only-tickers filter (suffix-tolerant, mirrors the exec path).
+        if only_tickers:
+            def _strip_ax(s: str) -> str:
+                return s[:-3] if s.endswith(".AX") else s
+            wanted = {_strip_ax(t.strip().upper()) for t in only_tickers.split(",") if t.strip()}
+            opens = [t for t in opens
+                     if _strip_ax(str(t.contract.symbol).upper()) in wanted]
+
+        if not opens:
+            print("[cancel] no working orders at the broker. Book is already quiescent.")
+            return 0
+
+        print("=" * 78)
+        print(f"WORKING ORDERS ({len(opens)}):")
+        for t in opens:
+            o, c = t.order, t.contract
+            try:
+                rem = int(t.remaining() or 0)
+            except Exception:
+                rem = int(getattr(o, "totalQuantity", 0) or 0)
+            print(f"  {c.symbol:<9} {o.action:<4} {int(o.totalQuantity or 0):>6} "
+                  f"{o.orderType:<4} status={t.orderStatus.status:<12} "
+                  f"remaining={rem:>6} orderId={o.orderId}")
+        print("=" * 78)
+
+        if not execute:
+            print("[cancel] PREVIEW ONLY — re-run with --cancel-open-orders --execute to cancel.")
+            return 0
+
+        if not assume_yes:
+            prompt = (f"\n[cancel][CONFIRM] About to CANCEL {len(opens)} working order(s) on "
+                      f"PAPER account {managed[0]}.\n"
+                      f"           Type YES (uppercase) to proceed: ")
+            try:
+                reply = input(prompt)
+            except EOFError:
+                reply = ""
+            if reply != "YES":
+                print(f"[cancel][SAFETY] confirmation was '{reply}', expected 'YES'. Aborting.")
+                return 4
+
+        cancelled = 0
+        for t in opens:
+            try:
+                ib.cancelOrder(t.order)
+                cancelled += 1
+            except Exception as e:
+                print(f"[cancel][WARN] {t.contract.symbol} cancel failed: {e}")
+        ib.sleep(2)   # let cancel acks land
+        ib.reqAllOpenOrders()
+        ib.sleep(1.0)
+        still = [t for t in ib.openTrades() if _working(t)]
+        msg = (f"requested {cancelled} cancel(s); {len(still)} still working after settle"
+               + (f" ({', '.join(str(t.contract.symbol) for t in still)})" if still else ""))
+        print(f"[cancel] {msg}")
+        if email:
+            try:
+                from send_alert import send
+                rc = send(f"[Portfolio Optimiser] CANCEL: {cancelled} order(s) cancelled",
+                          f"Paper account {managed[0]}.\n{msg}.")
+                print(f"[cancel] outcome emailed (rc={rc}).")
+            except Exception as e:
+                print(f"[cancel] email failed ({e}); non-fatal.")
+        return 0
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
 def _run_sync_holdings_mode(workbook: str, execute: bool, assume_yes: bool = False) -> int:
     """--sync-holdings: pull broker-truth positions from paper TWS and write
     them into the Holdings sheet's Units column (typed-YES gated).
@@ -1710,10 +1819,18 @@ def main() -> int:
                              "manual TWS trades that never touch the fills log. "
                              "Preview by default; add --execute (+ typed YES) to "
                              "write the sheet.")
+    parser.add_argument("--cancel-open-orders", action="store_true",
+                        help="Cancel WORKING (non-terminal) orders at the paper "
+                             "broker so the book is quiescent for the next rebalance "
+                             "(the pre-trade open-order guard blocks trading while any "
+                             "remain, so a stuck order wedges autonomy). Preview by "
+                             "default; add --execute (+ typed YES, or --assume-yes) to "
+                             "cancel. Scope with --only-tickers; report with --email.")
     parser.add_argument("--assume-yes", action="store_true",
-                        help="With --sync-holdings --execute: skip the typed-YES "
-                             "prompt (for the unattended morning wrapper). Writes "
-                             "only the sheet Units to broker truth — places NO orders.")
+                        help="With --sync-holdings or --cancel-open-orders --execute: "
+                             "skip the typed-YES prompt (for the unattended wrapper). "
+                             "sync-holdings writes only sheet Units; cancel places NO "
+                             "orders — both are safe to auto-run.")
     parser.add_argument("--workbook", type=str, default=str(_SCRIPT_DIR / "Stock Analysis.xlsm"),
                         help="Workbook path for --sync-holdings "
                              "(default: Stock Analysis.xlsm beside the script)")
@@ -1807,6 +1924,13 @@ def main() -> int:
     if args.sync_holdings:
         return _run_sync_holdings_mode(args.workbook, execute=args.execute,
                                        assume_yes=bool(args.assume_yes))
+
+    # === --cancel-open-orders mode: clear stale working orders ===
+    if args.cancel_open_orders:
+        return _run_cancel_open_orders_mode(execute=args.execute,
+                                            assume_yes=bool(args.assume_yes),
+                                            only_tickers=args.only_tickers,
+                                            email=bool(args.email))
 
     rec_entry = _load_latest_run(Path(args.rec_log))
     trades_recs = rec_entry.get("recommended_trades", [])
