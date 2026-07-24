@@ -173,6 +173,25 @@ def test_farm_monitor_hmds_or_secdef_broken_does_not_block():
     assert ok
 
 
+# --- marketable LIMIT pricing (the off-hours gap-fill fix) -------------------
+
+def test_marketable_limit_buy_caps_above():
+    # BUY willing to pay UP TO +1% — the ceiling on a bad fill
+    assert ex._marketable_limit_price(100.0, "BUY", 1.0) == 101.0
+    assert ex._marketable_limit_price(7.33, "buy", 1.0) == 7.40  # rounds to 2dp
+
+
+def test_marketable_limit_sell_floors_below():
+    # SELL willing to accept DOWN TO -1% — the floor on a bad fill
+    assert ex._marketable_limit_price(100.0, "SELL", 1.0) == 99.0
+    assert ex._marketable_limit_price(582.5, "SELL", 1.0) == 576.67
+
+
+def test_marketable_limit_collar_scales():
+    assert ex._marketable_limit_price(100.0, "BUY", 0.5) == 100.5
+    assert ex._marketable_limit_price(100.0, "BUY", 2.0) == 102.0
+
+
 # --- shadow mode report body ------------------------------------------------
 
 def test_shadow_body_execute_lists_orders():

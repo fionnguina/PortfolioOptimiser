@@ -1,7 +1,8 @@
 r"""IBKR Phase 3 — paper-account execution.
 
-Submits MarketOrders to the connected PAPER IBKR account for every line in
-the most recent trade_recommendation_log.jsonl entry. Tracks fills, writes
+Submits marketable LIMIT orders (touch ± LIMIT_COLLAR_PCT) to the connected
+PAPER IBKR account for every line in the most recent
+trade_recommendation_log.jsonl entry. Tracks fills, writes
 ibkr_fills_log.jsonl, and prints a reconciliation summary (slippage vs
 last_price from the rec log, fill rate, status counts).
 
@@ -66,6 +67,14 @@ PORT = 7497              # PAPER (live = 7496, never used here)
 CLIENT_ID = 12           # distinct from dry_run (11), engine (10), price_check (9), seed (8), paper_test (7)
 CONNECT_TIMEOUT = 12
 FILL_WAIT_SECONDS = 60   # how long to wait for orders to settle before summarising
+# Marketable-LIMIT collar (%): orders go in as LIMIT, not MARKET, priced at the
+# current local quote ± this band. Rationale (2026-07-24): a MARKET order placed
+# off-hours fills at the next open at WHATEVER price it gaps to — unbounded
+# slippage on an unattended order. A marketable limit still fills immediately
+# under normal conditions (spread on these ETFs « 1%) but REFUSES to fill beyond
+# the band, so an abnormal gap defers to the next run instead of executing blind.
+# The band caps the WORST fill; the order still fills at the better touch price.
+LIMIT_COLLAR_PCT = 1.0
 FILLS_LOG_FILENAME = "ibkr_fills_log.jsonl"
 REC_LOG_FILENAME = "trade_recommendation_log.jsonl"
 DEFERRED_ORDERS_FILENAME = "deferred_orders.json"  # cash-deferred buys awaiting completion
@@ -96,8 +105,8 @@ def _confirm_typed_yes(n_orders: int) -> bool:
     Print is unconditional so the user can see what they're confirming even when
     stdout is piped."""
     prompt = (
-        f"\n[exec][CONFIRM] About to submit {n_orders} MarketOrder(s) to the PAPER "
-        f"account.\n"
+        f"\n[exec][CONFIRM] About to submit {n_orders} marketable LIMIT order(s) to the "
+        f"PAPER account.\n"
         f"           Type the four-character string YES (uppercase) to proceed,\n"
         f"           or anything else to abort.\n"
         f"           > "
@@ -227,6 +236,38 @@ def _current_local_price(ib, contract) -> "float | None":
     except Exception:
         pass
     return None
+
+
+def _marketable_limit_price(ref_local: float, side: str, collar_pct: float) -> float:
+    """Marketable LIMIT price (local ccy): BUY caps at ref*(1+collar), SELL floors
+    at ref*(1-collar). The band bounds the WORST acceptable fill (gap protection)
+    — a limit order still fills at the better touch price. Rounded to 2dp: every
+    traded ETF here is >$2, so a 1-cent tick is always valid."""
+    mult = (1.0 + collar_pct / 100.0) if str(side).upper() == "BUY" else (1.0 - collar_pct / 100.0)
+    return round(float(ref_local) * mult, 2)
+
+
+def _price_orders_as_limits(ib, plan: list, collar_pct: float) -> tuple:
+    """Set a marketable-LIMIT price on every order in `plan` from its current
+    local quote. Returns (priced, unpriceable). An order whose price can't be
+    verified is DROPPED into `unpriceable` — never submit a limit blind (fail-safe;
+    it retries next run). For .AX the rec's px_aud IS the local (AUD) price, a
+    safe fallback when the live quote is momentarily unavailable; US names have no
+    local price in the rec log (px_aud is AUD), so they require a live/delayed quote."""
+    priced, unpriceable = [], []
+    for rec, contract, order in plan:
+        ref = _current_local_price(ib, contract)
+        if (ref is None or ref <= 0) and str(rec.get("ticker", "")).endswith(".AX"):
+            try:
+                ref = float(rec.get("px_aud") or 0) or None
+            except (TypeError, ValueError):
+                ref = None
+        if ref is None or ref <= 0:
+            unpriceable.append((rec, contract, order))
+            continue
+        order.lmtPrice = _marketable_limit_price(ref, order.action, collar_pct)
+        priced.append((rec, contract, order))
+    return priced, unpriceable
 
 
 def _deferred_completion_decision(*, approved_price_local, current_price_local,
@@ -645,7 +686,7 @@ def _run_complete_deferred_mode(drift_pct: float, max_age_hours: float,
         return 0
 
     try:
-        from ib_insync import IB, MarketOrder
+        from ib_insync import IB, LimitOrder
     except ImportError:
         print("[complete-deferred] ib_insync not installed.")
         return 1
@@ -686,7 +727,10 @@ def _run_complete_deferred_mode(drift_pct: float, max_age_hours: float,
             )
             print(f"[complete-deferred] {od['ticker']}: {action} — {reason}")
             if action == "submit":
-                order = MarketOrder(od["side"], int(od["qty"]))
+                # Marketable limit off the verified current price (cur_local is
+                # guaranteed present here — the decision aborts_no_price otherwise).
+                order = LimitOrder(od["side"], int(od["qty"]),
+                                   _marketable_limit_price(cur_local, od["side"], LIMIT_COLLAR_PCT))
                 order.tif = "DAY"
                 _submit_orders(ib, [({"ticker": od["ticker"]}, contract, order)],
                                wait=True)
@@ -1801,7 +1845,10 @@ def main() -> int:
         return 1
 
     # === Build contracts + orders ===
-    from ib_insync import MarketOrder
+    # Marketable LIMIT orders (lmtPrice set after connect+qualify, from the live
+    # quote — see _price_orders_as_limits). LIMIT not MARKET so an unattended
+    # order can't fill at an unbounded off-hours gap (2026-07-24).
+    from ib_insync import LimitOrder
     plan = []
     n_skipped_bench = 0
     for rec in trades_recs:
@@ -1814,7 +1861,7 @@ def main() -> int:
             n_skipped_bench += 1
             continue
         side = "BUY" if delta > 0 else "SELL"
-        order = MarketOrder(side, abs(delta))
+        order = LimitOrder(side, abs(delta), 0.0)   # price filled in post-qualify
         # Set TIF explicitly so IBKR doesn't apply the account order preset and
         # fire the noisy Error 10349 ("Order TIF was set to DAY based on order
         # preset") on every order — it prints a scary-looking "Canceled order"
@@ -1877,6 +1924,25 @@ def main() -> int:
             print(f"[exec][WARN] {len(unqualified)} ticker(s) failed to qualify "
                   f"and will be skipped: {', '.join(unqualified)}")
             plan = [(r, c, o) for (r, c, o) in plan if getattr(c, "conId", 0)]
+
+        # === Price the marketable LIMIT orders from live quotes ===
+        # Sets each order.lmtPrice at the current touch ± LIMIT_COLLAR_PCT. An
+        # order whose price can't be verified is DROPPED (never submit a limit
+        # blind) — it retries next run. Runs after the data-farm gate confirmed
+        # the feed is live, so unpriceable should be rare.
+        plan, _unpriceable = _price_orders_as_limits(ib, plan, LIMIT_COLLAR_PCT)
+        if _unpriceable:
+            _names = ", ".join(r["ticker"] for r, _c, _o in _unpriceable)
+            print(f"[exec][WARN] {len(_unpriceable)} order(s) DROPPED — no verifiable "
+                  f"price (retry next run): {_names}")
+        if plan:
+            print(f"[exec] priced {len(plan)} marketable LIMIT order(s) "
+                  f"(±{LIMIT_COLLAR_PCT:.1f}% collar): "
+                  + ", ".join(f"{r['ticker']}@{o.lmtPrice:g}" for r, c, o in plan[:12])
+                  + (" …" if len(plan) > 12 else ""))
+        else:
+            print("[exec] no priceable orders remain. Nothing to submit.")
+            return 0
 
         # === Preview before confirmation ===
         n_buy = sum(1 for r, c, o in plan if o.action == "BUY")
