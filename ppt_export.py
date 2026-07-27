@@ -166,7 +166,7 @@ def export_to_ppt(results, trades, charts=None):
                 f"${_live_loss:,.0f} loss to realise  ·  baked into rebalance  ·  "
                 f"{_live_pairs}"
             )
-            _live_box = slide.shapes.add_textbox(Cm(1.10), Cm(16.20), Cm(23.80), Cm(0.50))
+            _live_box = slide.shapes.add_textbox(Cm(1.10), Cm(13.50), Cm(23.80), Cm(0.50))
             _ltf = _live_box.text_frame
             _ltf.clear()
             _ltf.word_wrap = False
@@ -211,7 +211,7 @@ def export_to_ppt(results, trades, charts=None):
                 _tlh_text = (f"Tax-loss harvesting: enabled, 0 events triggered  ·  "
                              f"threshold {TLH_MIN_LOSS_PCT*100:+.0f}%, "
                              f"${TLH_MIN_LOSS_AUD:.0f} min, {TLH_COOLDOWN_DAYS}d cooldown")
-            tlh_box = slide.shapes.add_textbox(Cm(1.10), Cm(16.70), Cm(23.80), Cm(0.50))
+            tlh_box = slide.shapes.add_textbox(Cm(1.10), Cm(14.10), Cm(23.80), Cm(0.50))
             tft = tlh_box.text_frame
             tft.clear()
             tft.word_wrap = False
@@ -309,7 +309,7 @@ def export_to_ppt(results, trades, charts=None):
         for idx, subdf in enumerate(table_sets):
             top = Cm(4.0)
         
-            table_w = 12.02
+            table_w = 14.0   # widened from 12.02 so "Current" header + 4-digit unit counts fit on one line
             gap = 0.8
             left_margin = 0.35
             left = Cm(left_margin + idx * (table_w + gap))
@@ -410,7 +410,7 @@ def export_to_ppt(results, trades, charts=None):
             if trades is not None and not trades.empty and "Cash Flow (AUD)" in trades.columns:
                 cash_balance = float(results.get("cash_balance", 0.0))
 
-            cash_box = slide.shapes.add_textbox(Cm(18.288), Cm(14.732), Cm(6.604), Cm(1.524))
+            cash_box = slide.shapes.add_textbox(Cm(18.288), Cm(11.70), Cm(6.604), Cm(1.524))
             tfc = cash_box.text_frame
             tfc.clear()
             p = tfc.paragraphs[0]
@@ -428,7 +428,7 @@ def export_to_ppt(results, trades, charts=None):
             _cgt_owed = float(results.get("total_cgt", 0.0))
             _cgt_saved = float(results.get("loss_carry_forward_tax_aud", 0.0))
             _net_deferred = _cgt_saved - _cgt_owed
-            _tax_box = slide.shapes.add_textbox(Cm(11.684), Cm(14.732), Cm(6.604), Cm(1.524))
+            _tax_box = slide.shapes.add_textbox(Cm(11.684), Cm(11.70), Cm(6.604), Cm(1.524))
             tft = _tax_box.text_frame
             tft.clear()
             pt = tft.paragraphs[0]
@@ -443,6 +443,23 @@ def export_to_ppt(results, trades, charts=None):
             pt.alignment = PP_ALIGN.RIGHT
         except Exception as _e_dt:
             print(f"[pptx] Deferred Tax callout skipped: {_e_dt}")
+
+        # --- Currency footnote (clarifies the Last Price / Cash Flow columns) ---
+        # Prices come from px_aud and cash flows are AUD, but the table shows a
+        # bare "$" across both .AX (AUD) and US (AUD-converted) names — label it
+        # so the mixed magnitudes aren't misread as a currency error.
+        try:
+            _ccy_box = slide.shapes.add_textbox(Cm(1.10), Cm(11.15), Cm(16.0), Cm(0.5))
+            _ctf = _ccy_box.text_frame
+            _ctf.clear()
+            _ctf.margin_left = 0
+            _cp = _ctf.paragraphs[0]
+            _cp.text = "All prices and cash flows shown in AUD (foreign holdings converted at the run's FX)."
+            _cp.font.size = Pt(9)
+            _cp.font.italic = True
+            _cp.font.color.rgb = RGBColor(90, 90, 90)
+        except Exception as _e_ccy:
+            print(f"[pptx] Currency footnote skipped: {_e_ccy}")
 
         slide_layout = prs.slide_layouts[20]  # clean layout from your master
         slide = prs.slides.add_slide(slide_layout)
@@ -619,10 +636,11 @@ def export_to_ppt(results, trades, charts=None):
         except Exception:
             pass
 
-        # Now that perf_df is finalised, add the date callout using the ACTUAL
-        # first/last trading day rendered. This is what the user sees on the
-        # x-axis, so the callout cannot disagree with the chart.
-        _add_date_callout(slide3, perf_df.index.min(), perf_df.index.max(), prefix="Data")
+        # The date callout is deferred until AFTER the live-performance block so
+        # the live summary can be appended onto the SAME banner line (the banner
+        # only fits one subtitle row — a second line clips its bottom edge).
+        _s4_date_start, _s4_date_end = perf_df.index.min(), perf_df.index.max()
+        _s4_live_extra = ""
 
         # --- Live performance callout (real returns across rebalances) ----
         # Single-line summary of the actual NAV's since-inception return,
@@ -718,23 +736,19 @@ def export_to_ppt(results, trades, charts=None):
                         pass
                     _live_text = "    ".join(_parts)
 
-                    _live_tb = slide3.shapes.add_textbox(
-                        Cm(2.032), Cm(2.55), Cm(21.5), Cm(0.55)
-                    )
-                    _live_tf = _live_tb.text_frame
-                    _live_tf.clear()
-                    _live_tf.word_wrap = False
-                    _live_tf.margin_left = 0
-                    _live_tf.margin_top = 0
-                    _live_p = _live_tf.paragraphs[0]
-                    _live_p.text = _live_text
-                    _live_p.font.size = Pt(11)
-                    _live_p.font.bold = True
-                    _live_p.font.color.rgb = RGBColor(255, 255, 255)
-                    _live_p.alignment = PP_ALIGN.LEFT
-                    print(f"[pptx] Slide 3 live perf callout: {_live_text}")
+                    # Append the live summary onto the banner's date line (added
+                    # below) rather than its own textbox — the slide has no free
+                    # band (chart + return table fill it), and a header-ribbon
+                    # textbox clipped against the banner edge.
+                    _s4_live_extra = _live_text
+                    print(f"[pptx] Slide 4 live perf callout: {_live_text}")
         except Exception as _e_live:
-            print(f"[pptx] Slide 3 live perf callout skipped: {_e_live}")
+            print(f"[pptx] Slide 4 live perf callout skipped: {_e_live}")
+
+        # Now emit the banner date callout, with the live summary appended if we
+        # built one (one line, clear of the banner's bottom edge).
+        _add_date_callout(slide3, _s4_date_start, _s4_date_end,
+                          prefix="Data", extra=_s4_live_extra)
 
         # --- Plot ---
         # Use matplotlib directly (not pandas .plot) so the x-axis is a real
@@ -1243,7 +1257,7 @@ def export_to_ppt(results, trades, charts=None):
                         else:
                             _wt = float("nan")
                         rows.append({"Point": _label, "Vol (ann.)": vol,
-                                     "Return (ann.)": ret, "Today's Weight": _wt})
+                                     "Return (ann.)": ret, "Weight": _wt})
                 except Exception:
                     pass
 
@@ -1264,7 +1278,7 @@ def export_to_ppt(results, trades, charts=None):
             # Points table (always add if we have data)
             if rows:
                 df_pts = pd.DataFrame(rows).set_index("Point").rename(
-                    columns={"Vol (ann.)": "Volatility", "Return (ann.)": "Return"}
+                    columns={"Vol (ann.)": "Vol.", "Return (ann.)": "Return"}
                 )
                 # Widened from 7.72cm to 8.70cm so the new Today's Weight
                 # column fits without crowding the existing 3. Left edge
@@ -1973,75 +1987,97 @@ def export_to_ppt(results, trades, charts=None):
                 except Exception:
                     return None
 
-            # Big numbers: 10Y Strategy vs SPY, side-by-side
-            _box_metrics = dump_slide.shapes.add_textbox(Cm(1.5), Cm(3.7), Cm(22.5), Cm(7.0))
-            _mtf = _box_metrics.text_frame
-            _mtf.clear()
-            _mtf.word_wrap = False
-            _mtf.margin_left = Cm(0.3)
-            _mtf.margin_top = Cm(0.3)
+            # --- Styled-table helper (colored header, zebra rows) so the dashboard
+            #     reads as a tear-sheet of tables rather than a wall of text. ---
+            def _styled_table(left_cm, top_cm, width_cm, header_cells, data_rows,
+                              col_fracs=None, font_pt=11, row_h_cm=0.64,
+                              header_fill=(31, 78, 161)):
+                _nr, _nc = len(data_rows) + 1, len(header_cells)
+                _shp = dump_slide.shapes.add_table(
+                    _nr, _nc, Cm(left_cm), Cm(top_cm), Cm(width_cm), Cm(row_h_cm * _nr))
+                _t = _shp.table
+                try:
+                    _t.first_row = False
+                    _t.horz_banding = False
+                except Exception:
+                    pass
+                for _j, _h in enumerate(header_cells):
+                    _c = _t.cell(0, _j)
+                    _c.text = str(_h)
+                    _c.fill.solid(); _c.fill.fore_color.rgb = RGBColor(*header_fill)
+                    _p = _c.text_frame.paragraphs[0]
+                    _p.font.bold = True; _p.font.size = Pt(font_pt)
+                    _p.font.color.rgb = RGBColor(255, 255, 255)
+                    _p.alignment = PP_ALIGN.LEFT if _j == 0 else PP_ALIGN.CENTER
+                for _i, _row_vals in enumerate(data_rows, start=1):
+                    _shade = (234, 240, 248) if (_i % 2 == 1) else (255, 255, 255)
+                    for _j, _val in enumerate(_row_vals):
+                        _c = _t.cell(_i, _j)
+                        _c.text = str(_val)
+                        _c.fill.solid(); _c.fill.fore_color.rgb = RGBColor(*_shade)
+                        _p = _c.text_frame.paragraphs[0]
+                        _p.font.size = Pt(font_pt)
+                        _p.font.bold = (_j == 0)
+                        _p.font.color.rgb = RGBColor(40, 40, 40)
+                        _p.alignment = PP_ALIGN.LEFT if _j == 0 else PP_ALIGN.CENTER
+                for _r in range(_nr):
+                    _t.rows[_r].height = Cm(row_h_cm)
+                if col_fracs:
+                    for _j, _fr in enumerate(col_fracs):
+                        _t.columns[_j].width = int(Cm(width_cm) * _fr)
+                for _c in _t.iter_cells():
+                    _c.text_frame.word_wrap = False
+                    _c.margin_left = Cm(0.15); _c.margin_right = Cm(0.1)
+                    _c.margin_top = Cm(0.02); _c.margin_bottom = Cm(0.02)
+                return _t
 
-            def _add_line(tf, text, size=14, bold=False, color=(40, 40, 40), align=PP_ALIGN.LEFT, first=False):
-                p = tf.paragraphs[0] if first else tf.add_paragraph()
-                p.text = text
-                p.font.size = Pt(size)
-                p.font.bold = bold
-                p.font.color.rgb = RGBColor(*color)
-                p.alignment = align
-                return p
+            def _section_label(left_cm, top_cm, text):
+                _b = dump_slide.shapes.add_textbox(Cm(left_cm), Cm(top_cm), Cm(11.0), Cm(0.55))
+                _tf = _b.text_frame; _tf.clear(); _tf.margin_left = 0; _tf.margin_top = 0
+                _p = _tf.paragraphs[0]
+                _p.text = text; _p.font.size = Pt(12); _p.font.bold = True
+                _p.font.color.rgb = RGBColor(31, 78, 161)
 
-            _add_line(_mtf, "10-YEAR HEADLINE (since OOS start)", size=12, bold=True,
-                       color=(31, 78, 161), first=True)
-            _add_line(_mtf, "", size=8)
+            def _f_pct(v):
+                return f"{v*100:+.2f}%" if v is not None else "n/a"
+            def _f_ratio(v):
+                return f"{v:.2f}" if v is not None else "n/a"
 
-            def _row(label, s_val, b_val, fmt="{:+.2f}%", scale=100.0):
-                if s_val is None or b_val is None:
-                    s_str = b_str = "?"
-                else:
-                    s_str = fmt.format(s_val * scale) if scale != 1 else fmt.format(s_val)
-                    b_str = fmt.format(b_val * scale) if scale != 1 else fmt.format(b_val)
-                _add_line(_mtf, f"  {label:<28}  Strategy: {s_str:>10}    SPY (AUD): {b_str:>10}",
-                           size=13, bold=False)
+            _LX, _RX = 1.4, 13.2           # left / right column x-anchors
+            _LW, _RW = 11.2, 10.8          # column widths
 
-            _row("Annualised Return:",
-                  _mt_get("Annualised Return", "10Y", "Strategy"),
-                  _mt_get("Annualised Return", "10Y", "SPY (AUD)"))
-            _row("Sharpe Ratio:",
-                  _mt_get("Sharpe Ratio", "10Y", "Strategy"),
-                  _mt_get("Sharpe Ratio", "10Y", "SPY (AUD)"),
-                  fmt="{:.2f}", scale=1)
-            _row("Sortino Ratio:",
-                  _mt_get("Sortino Ratio", "10Y", "Strategy"),
-                  _mt_get("Sortino Ratio", "10Y", "SPY (AUD)"),
-                  fmt="{:.2f}", scale=1)
-            _row("Max Drawdown:",
-                  _mt_get("Max Drawdown", "10Y", "Strategy"),
-                  _mt_get("Max Drawdown", "10Y", "SPY (AUD)"))
-            # Alpha vs SPY — Strategy only
+            # === (1) 10-Year headline vs SPY (left) ===
             _alpha_10y = _mt_get("Alpha vs SPY (ann)", "10Y", "Strategy")
-            _alpha_str = f"{_alpha_10y*100:+.2f}%/yr" if _alpha_10y is not None else "?"
-            _add_line(_mtf, f"  {'Alpha vs SPY (annualised):':<28}  Strategy: {_alpha_str:>14}",
-                       size=13, bold=False)
-            _add_line(_mtf, "", size=8)
-            # 3Y / 5Y / 10Y Sharpe quick-glance line
-            _sh3 = _mt_get("Sharpe Ratio", "3Y", "Strategy")
-            _sh5 = _mt_get("Sharpe Ratio", "5Y", "Strategy")
-            _sh10 = _mt_get("Sharpe Ratio", "10Y", "Strategy")
-            _add_line(_mtf,
-                       f"  Sharpe across horizons:    3Y {_sh3:.2f}  ·  5Y {_sh5:.2f}  ·  10Y {_sh10:.2f}"
-                       if all(x is not None for x in (_sh3, _sh5, _sh10))
-                       else "  (horizon Sharpe data unavailable)",
-                       size=12, bold=True, color=(31, 78, 161))
+            _section_label(_LX, 3.35, "10-Year Headline (since OOS start)")
+            _hl_rows = [
+                ["Annualised Return", _f_pct(_mt_get("Annualised Return", "10Y", "Strategy")),
+                 _f_pct(_mt_get("Annualised Return", "10Y", "SPY (AUD)"))],
+                ["Sharpe Ratio", _f_ratio(_mt_get("Sharpe Ratio", "10Y", "Strategy")),
+                 _f_ratio(_mt_get("Sharpe Ratio", "10Y", "SPY (AUD)"))],
+                ["Sortino Ratio", _f_ratio(_mt_get("Sortino Ratio", "10Y", "Strategy")),
+                 _f_ratio(_mt_get("Sortino Ratio", "10Y", "SPY (AUD)"))],
+                ["Max Drawdown", _f_pct(_mt_get("Max Drawdown", "10Y", "Strategy")),
+                 _f_pct(_mt_get("Max Drawdown", "10Y", "SPY (AUD)"))],
+                ["Alpha vs SPY (ann.)",
+                 (f"{_alpha_10y*100:+.2f}%/yr" if _alpha_10y is not None else "n/a"), "—"],
+            ]
+            _styled_table(_LX, 3.95, _LW, ["Metric", "Strategy", "SPY (AUD)"],
+                          _hl_rows, col_fracs=[0.46, 0.27, 0.27])
 
-            # === ENGINE TOTALS (10Y OOS) ===
-            _box_engine = dump_slide.shapes.add_textbox(Cm(1.5), Cm(11.0), Cm(22.5), Cm(3.0))
-            _etf = _box_engine.text_frame
-            _etf.clear()
-            _etf.word_wrap = False
-            _etf.margin_left = Cm(0.3)
+            # === (2) By-horizon (right) ===
+            _section_label(_RX, 3.35, "Strategy by Horizon")
+            _bh_rows = [
+                ["Ann. Return", _f_pct(_mt_get("Annualised Return", "3Y", "Strategy")),
+                 _f_pct(_mt_get("Annualised Return", "5Y", "Strategy")),
+                 _f_pct(_mt_get("Annualised Return", "10Y", "Strategy"))],
+                ["Sharpe", _f_ratio(_mt_get("Sharpe Ratio", "3Y", "Strategy")),
+                 _f_ratio(_mt_get("Sharpe Ratio", "5Y", "Strategy")),
+                 _f_ratio(_mt_get("Sharpe Ratio", "10Y", "Strategy"))],
+            ]
+            _styled_table(_RX, 3.95, _RW, ["Horizon", "3Y", "5Y", "10Y"],
+                          _bh_rows, col_fracs=[0.40, 0.20, 0.20, 0.20])
 
-            _add_line(_etf, "ENGINE TOTALS (10Y OOS window)", size=12, bold=True,
-                       color=(31, 78, 161), first=True)
+            # === (3) Engine totals (left) ===
             _tlh_events_ds = globals().get("oos_tlh_events", []) or []
             _tlh_n = len(_tlh_events_ds)
             _tlh_loss = float(sum(e.get("loss_aud", 0.0) for e in _tlh_events_ds))
@@ -2054,35 +2090,38 @@ def export_to_ppt(results, trades, charts=None):
             _years = max(len(_oos_rets) / ANNUAL_TRADING_DAYS, 1e-6) if isinstance(_oos_rets, pd.Series) else 1.0
             _brk_bps = (float(_cost_ser.sum()) / _years * 10_000) if not _cost_ser.empty else 0.0
             _cgt_bps = (float(_tax_ser.sum()) / _years * 10_000) if not _tax_ser.empty else 0.0
-            _add_line(_etf, f"  TLH events: {_tlh_n}    ·    Loss realised: ${_tlh_loss:,.0f}"
-                              f"    ·    Tax saved est (gross): ${_tax_saved_est:,.0f}", size=11)
-            _add_line(_etf, f"  Brokerage drag: {_brk_bps:.0f} bps/yr"
-                              f"    ·    CGT drag: {_cgt_bps:.0f} bps/yr"
-                              f"    ·    Total cost: {_brk_bps + _cgt_bps:.0f} bps/yr", size=11)
+            _section_label(_LX, 8.7, "Engine Totals (10Y OOS window)")
+            _et_rows = [
+                ["TLH events", f"{_tlh_n}"],
+                ["Loss realised", f"${_tlh_loss:,.0f}"],
+                ["Tax saved (gross, est.)", f"${_tax_saved_est:,.0f}"],
+                ["Brokerage drag", f"{_brk_bps:.0f} bps/yr"],
+                ["CGT drag", f"{_cgt_bps:.0f} bps/yr"],
+                ["Total cost", f"{_brk_bps + _cgt_bps:.0f} bps/yr"],
+            ]
+            _styled_table(_LX, 9.3, _LW, ["Metric", "Value"], _et_rows,
+                          col_fracs=[0.62, 0.38])
 
-            # === LIVE RECOMMENDATION (today) ===
-            _box_live = dump_slide.shapes.add_textbox(Cm(1.5), Cm(14.3), Cm(22.5), Cm(2.5))
-            _ltf = _box_live.text_frame
-            _ltf.clear()
-            _ltf.word_wrap = True
-            _ltf.margin_left = Cm(0.3)
-
-            _add_line(_ltf, "LIVE RECOMMENDATION (today)", size=12, bold=True,
-                       color=(31, 78, 161), first=True)
+            # === (4) Today — regime mix (right) ===
             _mix_live = globals().get("ensemble_mix_live", pd.Series(dtype=float))
+            _abbr2 = {"Modest (SPY+0%)": "Modest", "Aggressive (SPY+5%)": "Aggressive",
+                       "Bold (SPY+10%)": "Bold", "Maximum (SPY+15%)": "Maximum",
+                       "Stretch (SPY+25%)": "Stretch"}
             if isinstance(_mix_live, pd.Series) and not _mix_live.empty:
-                _abbr2 = {"Modest (SPY+0%)": "Modest", "Aggressive (SPY+5%)": "Agg",
-                           "Bold (SPY+10%)": "Bold", "Maximum (SPY+15%)": "Max",
-                           "Stretch (SPY+25%)": "Stretch"}
-                _mix_parts = [f"{_abbr2.get(n, n)} {float(_mix_live.get(n, 0))*100:.0f}%"
-                               for n in ENSEMBLE_SLOT_NAMES if n in _mix_live.index]
-                _add_line(_ltf, f"  Regime mix:  {' · '.join(_mix_parts)}", size=11)
+                _section_label(_RX, 6.6, "Today — Regime Mix")
+                _rm_rows = [[_abbr2.get(n, n), f"{float(_mix_live.get(n, 0))*100:.0f}%"]
+                            for n in ENSEMBLE_SLOT_NAMES if n in _mix_live.index]
+                _styled_table(_RX, 7.2, _RW, ["Slot", "Weight"], _rm_rows,
+                              col_fracs=[0.62, 0.38])
+
+            # === (5) Today — top positions (right) ===
             _w_live = globals().get("W_ENSEMBLE_SER", pd.Series(dtype=float))
             if isinstance(_w_live, pd.Series) and not _w_live.empty:
-                _top5 = _w_live.nlargest(5)
-                _top_parts = [f"{str(k).replace('.AX','')} {float(v)*100:.0f}%"
-                               for k, v in _top5.items()]
-                _add_line(_ltf, f"  Top 5 positions:  {' · '.join(_top_parts)}", size=11)
+                _section_label(_RX, 11.6, "Today — Top 5 Positions")
+                _tp_rows = [[str(k).replace(".AX", ""), f"{float(v)*100:.0f}%"]
+                            for k, v in _w_live.nlargest(5).items()]
+                _styled_table(_RX, 12.2, _RW, ["Ticker", "Weight"], _tp_rows,
+                              col_fracs=[0.62, 0.38])
 
             # === Footer timestamp ===
             _ftext = (f"Generated {pd.Timestamp.now().isoformat(timespec='seconds')}    ·    "
@@ -2148,6 +2187,46 @@ def export_to_ppt(results, trades, charts=None):
                     p.font.size = Pt(body_size)
                     p.font.color.rgb = RGBColor(40, 40, 40)
 
+            # --- Live metrics for the disclosure (consistency with slides 2 & 7) ---
+            # Read from the SAME globals the performance/dashboard slides use so the
+            # PDS can never drift from the headline again (the stale 0.97/0.83 bug:
+            # the disclosure carried June's numbers while slides 2/7 showed 1.03/0.81).
+            # Every value falls back to conservative generic wording if unavailable.
+            _pds_mt = globals().get("oos_metrics_table", None)
+            def _pds_get(metric, horizon="10Y", series="Strategy"):
+                try:
+                    return float(_pds_mt.loc[metric, (horizon, series)])
+                except Exception:
+                    return None
+            _pds_shr_s = _pds_get("Sharpe Ratio", "10Y", "Strategy")
+            _pds_shr_b = _pds_get("Sharpe Ratio", "10Y", "SPY (AUD)")
+            _pds_mdd_s = _pds_get("Max Drawdown", "10Y", "Strategy")
+            _pds_cost = globals().get("oos_rebalance_costs", pd.Series(dtype=float))
+            _pds_tax  = globals().get("oos_rebalance_taxes", pd.Series(dtype=float))
+            _pds_rets = globals().get("oos_returns_daily", pd.Series(dtype=float))
+            _pds_years = (max(len(_pds_rets) / ANNUAL_TRADING_DAYS, 1e-6)
+                          if isinstance(_pds_rets, pd.Series) and len(_pds_rets) else 1.0)
+            _pds_brk_bps = (float(_pds_cost.sum()) / _pds_years * 10_000
+                            if isinstance(_pds_cost, pd.Series) and not _pds_cost.empty else None)
+            _pds_cgt_bps = (float(_pds_tax.sum()) / _pds_years * 10_000
+                            if isinstance(_pds_tax, pd.Series) and not _pds_tax.empty else None)
+            _pds_sharpe_line = (
+                f"  Backtest 10Y Sharpe ≈ {_pds_shr_s:.2f} vs SPY {_pds_shr_b:.2f}."
+                if (_pds_shr_s is not None and _pds_shr_b is not None)
+                else "  Backtest 10Y Sharpe ≈ 1.0 vs SPY ~0.8.")
+            _pds_brk_line = (
+                f"  · Modelled cost ~{_pds_brk_bps:.0f} bps/yr at current NAV."
+                if _pds_brk_bps is not None
+                else "  · Modelled cost varies with NAV (fixed minima).")
+            _pds_cgt_line = (
+                f"  · Modelled drag ~{_pds_cgt_bps:.0f} bps/yr at current NAV."
+                if _pds_cgt_bps is not None
+                else "  · Modelled drag varies with turnover + FY netting.")
+            _pds_mdd_line = (
+                f"• MaxDD: backtest {_pds_mdd_s*100:.0f}% modern, -25% GFC stress test."
+                if _pds_mdd_s is not None
+                else "• MaxDD: backtest ~-21% modern, -25% GFC stress test.")
+
             # --- Left column: Fund summary ---
             # Top blocks: body 9pt + height 8.0cm so the longer post-2026-06-22
             # content (trustee + investor lines) doesn't overflow into the
@@ -2172,7 +2251,7 @@ def export_to_ppt(results, trades, charts=None):
                     "Universe:  ~46 ETFs; ~45 pass FF5 universe validation each run.",
                     "",
                     "Target Return:  SPY (AUD)-comparable, risk-adjusted (Sharpe).",
-                    "  Backtest 10Y Sharpe ≈ 0.97 vs SPY 0.83.",
+                    _pds_sharpe_line,
                     "",
                     "Investment Horizon:  5+ years recommended.",
                 ],
@@ -2193,12 +2272,12 @@ def export_to_ppt(results, trades, charts=None):
                 "",
                 "Brokerage:  Interactive Brokers Pro AU schedule",
                 "  · AU min $5.00 + 0.080% · US min $1.50 + 0.020%",
-                "  · Modelled cost ~28 bps/yr at $1M AUM.",
+                _pds_brk_line,
                 "",
                 "CGT:  Australian personal MTR 30% + Medicare 2%",
                 "  · 50% LT discount on holdings ≥365 days",
                 "  · FY netting + carry-forward losses honoured.",
-                "  · Modelled drag ~296 bps/yr at $1M AUM.",
+                _pds_cgt_line,
                 "",
                 "FX:  AUD-denominated. USD assets unhedged.",
                 "Liquidity:  Redemptions at quarterly rebalance only.",
@@ -2218,7 +2297,7 @@ def export_to_ppt(results, trades, charts=None):
                 header="KEY RISKS",
                 body_lines=[
                     "• Equity-like volatility (backtest annualised ~14%).",
-                    "• MaxDD: backtest -20% modern, -25% GFC stress test.",
+                    _pds_mdd_line,
                     "• Tail risk: 2008-class crash modelled to -25% drawdown;",
                     "  uncovered tail regimes (e.g. stagflation) untested.",
                     "• Concentration: individual ticker weight up to 5% (capped).",

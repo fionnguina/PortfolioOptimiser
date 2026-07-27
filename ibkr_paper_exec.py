@@ -238,6 +238,30 @@ def _current_local_price(ib, contract) -> "float | None":
     return None
 
 
+def _last_close_via_history(ib, contract) -> "float | None":
+    """Last daily close via reqHistoricalData — a subscription-INDEPENDENT price
+    reference. Historical bars come from the HMDS farm, which is available without
+    a top-of-book market-data subscription, so this works for the cap-0.0 names a
+    flatten targets (SOXX tripped Error 354/10168 on both live and delayed
+    top-of-book). Returns the most recent valid daily close, or None on any
+    failure (fail-safe — caller drops the order rather than price it blind)."""
+    try:
+        bars = ib.reqHistoricalData(
+            contract, endDateTime="", durationStr="5 D",
+            barSizeSetting="1 day", whatToShow="TRADES",
+            useRTH=True, formatDate=1)
+        for b in reversed(bars or []):
+            try:
+                px = float(b.close)
+                if px == px and px > 0:   # not NaN, positive
+                    return px
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        pass
+    return None
+
+
 def _marketable_limit_price(ref_local: float, side: str, collar_pct: float) -> float:
     """Marketable LIMIT price (local ccy): BUY caps at ref*(1+collar), SELL floors
     at ref*(1-collar). The band bounds the WORST acceptable fill (gap protection)
@@ -426,6 +450,34 @@ def _broker_positions(ib) -> dict:
             out[sym] = out.get(sym, 0.0) + float(pos.position)
     except Exception:
         pass
+    return out
+
+
+def _flatten_targets(broker_positions: dict, wanted_norm: set,
+                     *, unit_tol: float = 1.0) -> list:
+    """PURE (no IO): the to-zero orders needed to flatten the requested names,
+    read from broker truth. Returns [(ticker, held_units, side, qty, signed_delta)]
+    for every requested name held beyond unit_tol. BUY covers a short, SELL closes
+    a long. Names already flat (|units| <= tol) or not requested are dropped.
+
+    `wanted_norm` is the set of requested tickers with any .AX suffix stripped and
+    upper-cased (suffix-tolerant match, mirrors the exec path). Factored out so the
+    signed-delta logic — the part that has to be exactly right — is unit-testable
+    without a broker connection."""
+    def _strip_ax(s: str) -> str:
+        s = str(s).upper()
+        return s[:-3] if s.endswith(".AX") else s
+    out = []
+    for tk, units in broker_positions.items():
+        if _strip_ax(tk) not in wanted_norm:
+            continue
+        u = float(units or 0.0)
+        if abs(u) <= unit_tol:
+            continue
+        qty = int(round(abs(u)))
+        side = "BUY" if u < 0 else "SELL"
+        signed = qty if side == "BUY" else -qty
+        out.append((tk, u, side, qty, signed))
     return out
 
 
@@ -1575,6 +1627,206 @@ def _run_cancel_open_orders_mode(execute: bool = False, assume_yes: bool = False
             ib.disconnect()
 
 
+def _run_flatten_mode(only_tickers: str, execute: bool = False,
+                      assume_yes: bool = False, email: bool = False,
+                      no_wait: bool = False) -> int:
+    """Flatten a broker position the engine's own plan can NEVER close itself.
+
+    A name with weight cap 0.0 is solver-EXCLUDED, so it never enters
+    recommended_trades — which means a residual position in it (the 2026-07-24
+    SOXX -53u short) is invisible to the normal exec path and, if it's a short,
+    wedges autonomy on the pre-trade gate's UNCOVERED-SHORT check every run. This
+    mode reads the SIGNED broker position directly, builds a to-zero order (BUY to
+    cover a short, SELL to close a long) as a marketable LIMIT, runs it through the
+    SAME broker-truth pre-trade gate, then submits.
+
+    MUST be scoped with --only-tickers — never a blanket flatten. PREVIEW by
+    default (read-only); --execute + typed YES (or --assume-yes) trades. Paper
+    only. --email reports the outcome."""
+    if not only_tickers.strip():
+        print("[flatten] --flatten requires --only-tickers NAME[,NAME] "
+              "(refusing to flatten the whole book).")
+        return 1
+
+    def _strip_ax(s: str) -> str:
+        s = str(s).upper()
+        return s[:-3] if s.endswith(".AX") else s
+    wanted_norm = {_strip_ax(t.strip()) for t in only_tickers.split(",") if t.strip()}
+
+    try:
+        from ib_insync import IB, LimitOrder
+    except ImportError:
+        print("[flatten] ib_insync not installed.")
+        return 1
+    ib = IB()
+    try:
+        ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=CONNECT_TIMEOUT)
+    except Exception as e:
+        print(f"[flatten][ERR] connect failed ({type(e).__name__}): {e}")
+        print(f"[flatten] make sure TWS / IB Gateway is on port {PORT} (paper).")
+        return 2
+    # Subscribe to the data-farm status burst NOW (fires once, just after connect)
+    # so the gate can refuse to trade into a dead feed.
+    _farm_mon = _DataFarmMonitor(ib)
+    try:
+        managed = ib.managedAccounts() or []
+        if not managed:
+            print("[flatten][SAFETY] managedAccounts() returned nothing. Aborting.")
+            return 3
+        _refuse_if_live(managed[0])
+        print(f"[flatten] paper account confirmed: {managed[0]}")
+
+        broker_pos = _broker_positions(ib)
+        targets = _flatten_targets(broker_pos, wanted_norm)
+        found_norm = {_strip_ax(tk) for tk, *_ in targets}
+        missing = wanted_norm - found_norm
+        if missing:
+            print(f"[flatten] no non-trivial broker position for {sorted(missing)} "
+                  f"(already flat) — skipping those.")
+        if not targets:
+            print("[flatten] nothing to flatten — all requested names are already flat.")
+            return 0
+
+        plan = []
+        for tk, held, side, qty, signed in targets:
+            contract = _ticker_to_contract(tk)
+            if contract is None:
+                print(f"[flatten][WARN] {tk}: no contract (benchmark/unknown) — skipping.")
+                continue
+            order = LimitOrder(side, qty, 0.0)   # price set post-qualify
+            order.tif = "DAY"
+            rec = {"ticker": tk, "px_aud": 0.0, "delta_value_aud": 0.0,
+                   "brokerage_aud": 0.0, "delta_units": signed}
+            plan.append((rec, contract, order))
+            print(f"[flatten] {tk}: broker {held:+g}u -> flatten via {side} {qty}u")
+        if not plan:
+            print("[flatten] no flattenable orders after contract build. Nothing to do.")
+            return 0
+
+        print(f"[flatten] qualifying {len(plan)} contract(s)...")
+        ib.qualifyContracts(*[c for _, c, _ in plan])
+        plan = [(r, c, o) for (r, c, o) in plan if getattr(c, "conId", 0)]
+        if not plan:
+            print("[flatten][WARN] no contracts qualified. Nothing to do.")
+            return 0
+
+        # A cap-0.0 name is never traded, so this paper account has no real-time
+        # data subscription for it (SOXX tripped Error 10168). Request DELAYED-
+        # FROZEN data (type 4) so the collar can price off the last available quote
+        # — free, no subscription, and returns the prior close when the US market
+        # is shut (the usual case for a morning-AEST flatten). Real-time names are
+        # unaffected. Non-fatal.
+        try:
+            ib.reqMarketDataType(4)
+            print("[flatten] market data: requested DELAYED-FROZEN (type 4) fallback "
+                  "for unsubscribed names.")
+        except Exception as _e:
+            print(f"[flatten][WARN] reqMarketDataType failed ({_e}); non-fatal.")
+
+        # Price each order for the marketable-LIMIT collar. Prefer a live/delayed
+        # snapshot; fall back to the last daily close via historical data. A
+        # cap-0.0 name has no top-of-book subscription, and the delayed snapshot is
+        # intermittent (Error 354), so the history fallback (HMDS farm, no
+        # subscription needed) is what makes a flatten reliably priceable. Never
+        # submit a limit blind: an order with no verifiable reference is DROPPED.
+        _df_ok, _df_reason = _farm_mon.mktdata_ok()
+        if not _df_ok:
+            print(f"[flatten][WARN] market-data feed: {_df_reason}")
+        priced, unpriceable = [], []
+        for rec, contract, order in plan:
+            ref = _current_local_price(ib, contract)
+            src = "live/delayed"
+            if ref is None or ref <= 0:
+                ref = _last_close_via_history(ib, contract)
+                src = "hist-close"
+            if ref is None or ref <= 0:
+                unpriceable.append((rec, contract, order))
+                continue
+            order.lmtPrice = _marketable_limit_price(ref, order.action, LIMIT_COLLAR_PCT)
+            print(f"[flatten] {rec['ticker']}: ref {ref:g} ({src}) -> "
+                  f"limit {order.lmtPrice:g}")
+            priced.append((rec, contract, order))
+        plan = priced
+        if unpriceable:
+            _n = ", ".join(r["ticker"] for r, _c, _o in unpriceable)
+            print(f"[flatten][WARN] {len(unpriceable)} order(s) DROPPED — no verifiable "
+                  f"price (no live/delayed quote and no historical close): {_n}")
+        if not plan:
+            print("[flatten] no priceable orders remain. Nothing to submit.")
+            return 0
+        print("[flatten] priced (±{:.1f}% collar): ".format(LIMIT_COLLAR_PCT)
+              + ", ".join(f"{r['ticker']} {o.action} {int(o.totalQuantity)}@{o.lmtPrice:g}"
+                          for r, c, o in plan))
+
+        # === Same broker-truth pre-trade gate as the main exec path ===
+        # assumed == broker truth (the plan is built FROM the broker), so the
+        # reconcile check passes by construction; the checks that MATTER for a
+        # flatten still run: no resulting short, turnover, cash, open orders, live
+        # feed. A BUY-to-cover clears the very UNCOVERED-SHORT check that blocks the
+        # normal path (proven by tests.test_covering_an_existing_short_passes).
+        _val_trades = [{"ticker": r["ticker"], "delta_units": r["delta_units"],
+                        "delta_value_aud": r.get("delta_value_aud", 0.0)}
+                       for r, c, o in plan]
+        _val_ok, _val_fails = validate_pre_trade(
+            _val_trades, dict(broker_pos), dict(broker_pos),
+            available_cash_aud=_available_funds_aud(ib),
+            nav_aud=_broker_net_liquidation_aud(ib),
+            open_orders=_broker_open_orders(ib),
+            data_farm_broken=(not _df_ok), data_farm_reason=_df_reason)
+        if not _val_ok:
+            print("\n" + "=" * 78)
+            print("PRE-TRADE VALIDATION FAILED — NOT flattening. Fix these first:")
+            for _f in _val_fails:
+                print(f"  x {_f}")
+            print("=" * 78)
+            if email:
+                _auto_email("FLATTEN BLOCKED by validation gate",
+                            "The flatten refused to execute:\n\n"
+                            + "\n".join(f"  x {f}" for f in _val_fails))
+            return 6
+        print("[flatten] pre-trade validation: PASS.")
+
+        if not execute:
+            print("[flatten] PREVIEW ONLY — re-run with --flatten --execute to submit.")
+            return 0
+        if not assume_yes and not _confirm_typed_yes(len(plan)):
+            return 4
+
+        print("=" * 78)
+        print(f"FLATTENING {len(plan)} POSITION(S) — PAPER ACCOUNT {managed[0]}")
+        print("=" * 78)
+        # Sells first (free cash/margin), then buys — mirrors the main path.
+        sells = [(r, c, o) for r, c, o in plan if o.action == "SELL"]
+        buys = [(r, c, o) for r, c, o in plan if o.action == "BUY"]
+        trades = []
+        if sells:
+            trades += _submit_orders(ib, sells, wait=(not no_wait))
+        if buys:
+            trades += _submit_orders(ib, buys, wait=(not no_wait))
+
+        _print_reconciliation(trades)
+        fills_path = _SCRIPT_DIR / FILLS_LOG_FILENAME
+        rec_entry = {"run_at": f"flatten@{datetime.now().isoformat(timespec='seconds')}"}
+        n_written = _write_fills_log(rec_entry, trades, fills_path)
+        print(f"[flatten] {n_written} row(s) appended to {fills_path}")
+
+        # Best-effort post-flatten residual check.
+        ib.sleep(2)
+        after = _broker_positions(ib)
+        resid = {tk: after.get(tk, 0.0) for tk, *_ in targets
+                 if abs(after.get(tk, 0.0)) > 1.0}
+        msg = (f"flatten submitted {len(trades)} order(s); "
+               + ("residual: " + ", ".join(f"{tk} {u:+g}u" for tk, u in resid.items())
+                  if resid else "all target positions flat."))
+        print(f"[flatten] {msg}")
+        if email:
+            _auto_email("FLATTEN complete", msg)
+        return 0
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
 def _run_sync_holdings_mode(workbook: str, execute: bool, assume_yes: bool = False) -> int:
     """--sync-holdings: pull broker-truth positions from paper TWS and write
     them into the Holdings sheet's Units column (typed-YES gated).
@@ -1819,6 +2071,15 @@ def main() -> int:
                              "manual TWS trades that never touch the fills log. "
                              "Preview by default; add --execute (+ typed YES) to "
                              "write the sheet.")
+    parser.add_argument("--flatten", action="store_true",
+                        help="Flatten a broker position the engine can't close "
+                             "itself — a cap-0.0, solver-excluded name (e.g. a "
+                             "residual SOXX short). Reads the SIGNED broker "
+                             "position, builds a to-zero marketable-LIMIT order "
+                             "(BUY covers a short, SELL closes a long), runs the "
+                             "SAME pre-trade gate, then submits. MUST be scoped "
+                             "with --only-tickers. Preview by default; add "
+                             "--execute (+ typed YES or --assume-yes) to trade.")
     parser.add_argument("--cancel-open-orders", action="store_true",
                         help="Cancel WORKING (non-terminal) orders at the paper "
                              "broker so the book is quiescent for the next rebalance "
@@ -1924,6 +2185,14 @@ def main() -> int:
     if args.sync_holdings:
         return _run_sync_holdings_mode(args.workbook, execute=args.execute,
                                        assume_yes=bool(args.assume_yes))
+
+    # === --flatten mode: cover/close a position the engine can't touch ===
+    if args.flatten:
+        return _run_flatten_mode(only_tickers=args.only_tickers,
+                                 execute=bool(args.execute),
+                                 assume_yes=bool(args.assume_yes),
+                                 email=bool(args.email),
+                                 no_wait=bool(args.no_wait))
 
     # === --cancel-open-orders mode: clear stale working orders ===
     if args.cancel_open_orders:

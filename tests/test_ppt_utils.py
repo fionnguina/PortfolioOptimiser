@@ -91,10 +91,10 @@ def test_window_compound_total_degenerate_window_is_nan():
     (-0.05, "pct2", "-5.00%"),
     (1.23456, "dec3", "1.235"),
     (42.0, "raw", "42.0"),
-    (float("nan"), "pct2", ""),
-    (float("inf"), "pct2", ""),
-    (None, "pct2", ""),
-    ("not a number", "pct2", ""),
+    (float("nan"), "pct2", "n/a"),
+    (float("inf"), "pct2", "n/a"),
+    (None, "pct2", "n/a"),
+    ("not a number", "pct2", "n/a"),
 ])
 def test_format_perf_value(v, fmt, expected):
     assert ppt_utils._format_perf_value(v, fmt=fmt) == expected
@@ -119,7 +119,7 @@ def test_add_perf_table_fills_cells():
     assert tbl.cell(0, 1).text == "SPY"
     assert tbl.cell(1, 0).text == "Return"
     assert tbl.cell(1, 1).text == "10.00%"
-    assert tbl.cell(2, 2).text == ""          # NaN cell renders blank
+    assert tbl.cell(2, 2).text == "n/a"       # NaN cell renders 'n/a', not blank
 
 
 def test_add_change_run_signs_and_zero():

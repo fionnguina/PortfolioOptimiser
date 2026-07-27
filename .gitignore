@@ -42,6 +42,9 @@ _version.py
 # OOS disk cache (Phase 3a, 2026-06-29) — recomputable, never share
 .cache/
 
+# Generated PowerPoint reports — regenerated every run, large binaries
+Reports/
+
 # Reorganised outputs (2026-07-08) — regenerable run/experiment artefacts.
 # All *.log now live in logs/; experiment summaries + diagnostic charts too.
 # Keeps the working tree + git status clean as experiments regenerate them.

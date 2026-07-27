@@ -76,6 +76,38 @@ def test_covering_an_existing_short_passes():
     assert ok, fails
 
 
+# --- --flatten mode: to-zero order builder for cap-0.0 stuck positions --------
+
+def test_flatten_targets_covers_a_short():
+    # broker holds a -53 SOXX short the engine can't touch (cap 0.0) → BUY 53
+    out = ex._flatten_targets({"SOXX": -53, "SMH": 50}, {"SOXX"})
+    assert out == [("SOXX", -53.0, "BUY", 53, 53)]
+
+
+def test_flatten_targets_closes_a_long():
+    # a cap-0.0 long residual is equally stuck → SELL to zero (negative delta)
+    out = ex._flatten_targets({"PMGOLD.AX": 120}, {"PMGOLD"})
+    assert out == [("PMGOLD.AX", 120.0, "SELL", 120, -120)]
+
+
+def test_flatten_targets_skips_flat_and_unrequested():
+    # already-flat (within tol) and non-requested names are dropped
+    out = ex._flatten_targets({"SOXX": 0.4, "SMH": 50}, {"SOXX", "SMH"})
+    assert [t[0] for t in out] == ["SMH"]
+    assert ex._flatten_targets({"SMH": 50}, {"SOXX"}) == []
+
+
+def test_flatten_built_order_clears_the_gate():
+    # the order _flatten_targets builds for the SOXX short must PASS the same
+    # broker-truth gate that blocks the normal exec path (assumed == broker truth)
+    broker = {"SOXX": -53, "SMH": 50}
+    tgts = ex._flatten_targets(broker, {"SOXX"})
+    trades = [_t(tk, signed, 0.0) for tk, _held, _side, _qty, signed in tgts]
+    ok, fails = ex.validate_pre_trade(trades, dict(broker), dict(broker),
+                                      available_cash_aud=50_000, nav_aud=246_000)
+    assert ok, fails
+
+
 def test_missing_cash_or_nav_does_not_crash():
     trades = [_t("VLUE.AX", 10, 360.0)]
     ok, fails = ex.validate_pre_trade(trades, {"VLUE.AX": 100}, {"VLUE.AX": 100},

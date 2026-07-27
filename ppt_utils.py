@@ -104,15 +104,17 @@ def _ppt_anchor(slide, layout, name, fb_left_cm, fb_top_cm, fb_w_cm, fb_h_cm):
 
 
 def _format_perf_value(v, fmt="pct2"):
-    """Format a numeric value for a perf-style table cell."""
+    """Format a numeric value for a perf-style table cell. Uncomputable values
+    (NaN / non-finite — e.g. a 3Y column when live history is shorter than 3Y)
+    render as 'n/a' rather than an empty cell, so a blank never reads as a bug."""
     if pd.isna(v):
-        return ""
+        return "n/a"
     try:
         fv = float(v)
     except (TypeError, ValueError):
-        return ""
+        return "n/a"
     if not np.isfinite(fv):
-        return ""
+        return "n/a"
     if fmt == "pct2":
         return f"{fv*100:.2f}%"
     if fmt == "dec3":
@@ -120,20 +122,29 @@ def _format_perf_value(v, fmt="pct2"):
     return str(fv)
 
 
-def _add_date_callout(slide, start_dt, end_dt, prefix: str = "Data"):
+def _add_date_callout(slide, start_dt, end_dt, prefix: str = "Data", extra: str = ""):
     """Add a left-aligned white callout under the slide title showing the data window.
     Makes it impossible to mis-read the chart's date range — Slide 3 anchors to live
-    portfolio end, Slide 4 anchors to FF data end, and these may differ by ~1 month."""
+    portfolio end, Slide 4 anchors to FF data end, and these may differ by ~1 month.
+
+    `extra` appends a second clause on the SAME line (e.g. the live-performance
+    summary). The banner is only tall enough for one subtitle line, so this keeps
+    everything on one row (10pt when extra is present) rather than a second line
+    that would clip against the banner's bottom edge."""
     try:
-        tb = slide.shapes.add_textbox(Cm(2.032), Cm(1.92), Cm(21.5), Cm(0.7))
+        tb = slide.shapes.add_textbox(Cm(2.032), Cm(1.92), Cm(22.8), Cm(0.7))
         tf = tb.text_frame
         tf.clear()
+        tf.word_wrap = False
         p = tf.paragraphs[0]
-        p.text = (
+        _txt = (
             f"{prefix}: {pd.Timestamp(start_dt).strftime('%d %b %Y')}"
             f"  →  {pd.Timestamp(end_dt).strftime('%d %b %Y')}"
         )
-        p.font.size = Pt(11)
+        if extra:
+            _txt += f"      ·      {extra}"
+        p.text = _txt
+        p.font.size = Pt(10) if extra else Pt(11)
         p.font.italic = True
         p.font.color.rgb = RGBColor(255, 255, 255)
         p.alignment = PP_ALIGN.LEFT
@@ -161,6 +172,17 @@ def _add_perf_table(slide, df_metrics, left, top, width, height,
                 p.font.size = Pt(font_pt)
                 p.font.bold = True
                 p.alignment = PP_ALIGN.CENTER
+    # Give the row-label column ~34% of the width so long labels ("Actual NAV
+    # (since 08 Jul)", "Current Book (pro-forma)", "Aggressive") don't wrap; split
+    # the rest evenly across the value columns.
+    try:
+        _label_w = int(width * 0.34)
+        _data_w = int((width - _label_w) / max(cols - 1, 1))
+        tbl.columns[0].width = _label_w
+        for _cj in range(1, cols):
+            tbl.columns[_cj].width = _data_w
+    except Exception:
+        pass
     return tbl
 
 

@@ -250,7 +250,7 @@ def _autofit_table_width(table, df, total_width_cm=12.02):
         header_w = est_width(col)
         data_w = max(est_width(v) for v in df[col].astype(str)) if len(df) else header_w
         width = max(header_w, data_w)
-        if col.lower() in ("target", "change"):
+        if col.lower() in ("current", "target", "change"):
             width = max(width, 1.85)
         elif col.lower() == "security":
             width = max(width, 1.778)
