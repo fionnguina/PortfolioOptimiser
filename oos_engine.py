@@ -1176,6 +1176,7 @@ def run_oos_ensemble_walk_forward(
                     cooldown_state=_tlh_cooldown,
                     pairs=TLH_PAIRS,
                     nav_aud=_running_nav,
+                    weight_caps=PER_ASSET_WEIGHT_CAPS,
                 )
                 for k in _fy_buckets:
                     _fy_buckets[k] += tlh_out["realised"][k]

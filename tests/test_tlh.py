@@ -116,3 +116,46 @@ def test_tlh_skips_loss_below_min_aud():
                             {"IVV.AX": "VAS.AX"}, min_loss_pct=-0.05,
                             min_loss_aud=100.0, cooldown_days=31, cfg=CGT_CONFIG)
     assert res["n_events"] == 0
+
+
+# ---- 0.0-cap substitute guard (2026-07-28) ----
+# A loss lot must NOT be harvested into a solver-excluded (cap<=0.0) substitute:
+# the same-run optimiser targets the un-holdable name back to zero, producing a
+# self-contradictory buy+sell round-trip that jams live auto-execution (the
+# SMH->SOXX / GOLD.AX->PMGOLD.AX loop). weight_caps=None keeps the guard inert.
+
+def test_tlh_skips_when_substitute_is_cap_zero():
+    lb, prices, pairs, as_of = _loss_setup()  # IVV.AX -> VAS.AX, harvestable loss
+    res = tlh._run_tlh_pass(lb, prices, as_of, {}, pairs,
+                            min_loss_pct=-0.05, min_loss_aud=100.0,
+                            cooldown_days=31, cfg=CGT_CONFIG,
+                            weight_caps={"VAS.AX": 0.0})  # substitute excluded
+    assert res["n_events"] == 0
+    assert lb.units("IVV.AX") == pytest.approx(100)  # untouched — no harvest
+
+def test_tlh_harvests_when_substitute_cap_positive():
+    """A holdable substitute (cap>0) still swaps — guard only blocks cap<=0.0."""
+    lb, prices, pairs, as_of = _loss_setup()
+    res = tlh._run_tlh_pass(lb, prices, as_of, {}, pairs,
+                            min_loss_pct=-0.05, min_loss_aud=100.0,
+                            cooldown_days=31, cfg=CGT_CONFIG,
+                            weight_caps={"VAS.AX": 0.08})
+    assert res["n_events"] == 1
+    assert lb.units("VAS.AX") == pytest.approx(100, rel=1e-6)
+
+def test_tlh_cap_guard_defaults_off_when_caps_absent():
+    """weight_caps=None (the default) leaves legacy behaviour unchanged."""
+    lb, prices, pairs, as_of = _loss_setup()
+    res = tlh._run_tlh_pass(lb, prices, as_of, {}, pairs,
+                            min_loss_pct=-0.05, min_loss_aud=100.0,
+                            cooldown_days=31, cfg=CGT_CONFIG)  # no weight_caps
+    assert res["n_events"] == 1
+
+def test_tlh_harvests_when_substitute_not_in_caps():
+    """Substitute absent from the caps dict = uncapped/holdable = still swaps."""
+    lb, prices, pairs, as_of = _loss_setup()
+    res = tlh._run_tlh_pass(lb, prices, as_of, {}, pairs,
+                            min_loss_pct=-0.05, min_loss_aud=100.0,
+                            cooldown_days=31, cfg=CGT_CONFIG,
+                            weight_caps={"SOME_OTHER": 0.0})  # VAS.AX not listed
+    assert res["n_events"] == 1

@@ -84,13 +84,15 @@ def _run_tlh_pass(
     cooldown_days: int | None = None,
     cfg: dict | None = None,
     nav_aud: float | None = None,
+    weight_caps: dict | None = None,
 ) -> dict:
     """One pass of tax-loss harvesting. Mutates `lot_book` and `cooldown_state`.
 
     For each lot in unrealised loss ≥ min_loss_pct (and ≥ min_loss_aud absolute):
       1. Look up its substitute in `pairs`. Skip if no pair, substitute price
-         unavailable, or substitute is itself within the cooldown window
-         (recently sold via TLH → buying it back here is a wash-swap).
+         unavailable, the substitute is itself within the cooldown window
+         (recently sold via TLH → buying it back here is a wash-swap), or the
+         substitute is solver-excluded (weight_caps[sub] <= 0.0).
       2. Sell the specific loss lot (realises loss into the FY bucket).
       3. Buy equivalent dollar value of the substitute at current price.
       4. Record the ticker we sold in cooldown_state[ticker] = as_of so it
@@ -140,6 +142,23 @@ def _run_tlh_pass(
         sub = pairs.get(tkr)
         if not sub:
             continue
+        # Structural guard (2026-07-28): never harvest INTO a substitute the
+        # solver is configured to exclude (weight cap <= 0.0). Such a name is
+        # unholdable — the same-run optimiser targets it back to zero, so the
+        # trade plan both buys it (this swap) and sells it (solver), a self-
+        # contradictory round-trip. When the harvested ticker is itself a
+        # solver-wanted holding (e.g. SMH@0.28 -> SOXX@cap-0, GOLD.AX -> PMGOLD
+        # .AX@cap-0) the solver just re-buys the original, and in live the net
+        # SELL of the un-held substitute trips the long-only short guard,
+        # jamming auto-execution every cycle. Leave the loss unharvested rather
+        # than emit an unexecutable plan. (weight_caps=None => guard inert, so
+        # existing callers/tests are unaffected.)
+        if weight_caps is not None:
+            _sub_cap = weight_caps.get(sub, None)
+            if _sub_cap is not None and float(_sub_cap) <= 0.0:
+                print(f"[tlh] skip {tkr}->{sub}: substitute solver-capped at "
+                      f"0.0 (unholdable) — swap would round-trip")
+                continue
         # Substitute price must exist + be positive.
         try:
             if hasattr(price_snapshot, "get"):

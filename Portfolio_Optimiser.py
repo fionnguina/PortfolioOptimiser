@@ -7161,6 +7161,7 @@ if USE_XLWINGS:
                         cooldown_state=_live_cooldown_state,
                         pairs=TLH_PAIRS,
                         nav_aud=_live_nav,
+                        weight_caps=PER_ASSET_WEIGHT_CAPS,
                     )
                     live_tlh_events = _tlh_out.get("events", []) or []
                     if live_tlh_events:
