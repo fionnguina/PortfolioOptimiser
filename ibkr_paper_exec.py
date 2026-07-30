@@ -262,6 +262,18 @@ def _last_close_via_history(ib, contract) -> "float | None":
     return None
 
 
+def _ref_local_price(ib, contract) -> "float | None":
+    """Local-ccy reference price with a subscription-independent fallback: live/
+    delayed top-of-book first, then the last daily close from the HMDS farm. The
+    fallback is what makes a US name priceable during an ASX-hours run (US market
+    shut → no top-of-book quote); without it US legs are silently dropped. Mirrors
+    the --flatten pricing chain. Returns None only if BOTH sources fail."""
+    ref = _current_local_price(ib, contract)
+    if ref is None or ref <= 0:
+        ref = _last_close_via_history(ib, contract)
+    return ref if (ref is not None and ref > 0) else None
+
+
 def _marketable_limit_price(ref_local: float, side: str, collar_pct: float) -> float:
     """Marketable LIMIT price (local ccy): BUY caps at ref*(1+collar), SELL floors
     at ref*(1-collar). The band bounds the WORST acceptable fill (gap protection)
@@ -277,15 +289,22 @@ def _price_orders_as_limits(ib, plan: list, collar_pct: float) -> tuple:
     verified is DROPPED into `unpriceable` — never submit a limit blind (fail-safe;
     it retries next run). For .AX the rec's px_aud IS the local (AUD) price, a
     safe fallback when the live quote is momentarily unavailable; US names have no
-    local price in the rec log (px_aud is AUD), so they require a live/delayed quote."""
+    local price in the rec log (px_aud is AUD), so they fall back to the last daily
+    close from the HMDS farm (subscription-independent, available off-hours) — this
+    is what lets a US buy placed during ASX hours (US market shut) be priced as a
+    resting marketable LIMIT instead of being silently dropped every run."""
     priced, unpriceable = [], []
     for rec, contract, order in plan:
         ref = _current_local_price(ib, contract)
-        if (ref is None or ref <= 0) and str(rec.get("ticker", "")).endswith(".AX"):
-            try:
-                ref = float(rec.get("px_aud") or 0) or None
-            except (TypeError, ValueError):
-                ref = None
+        if ref is None or ref <= 0:
+            if str(rec.get("ticker", "")).endswith(".AX"):
+                try:
+                    ref = float(rec.get("px_aud") or 0) or None
+                except (TypeError, ValueError):
+                    ref = None
+            else:
+                # US name, no live quote (market shut) → historical close.
+                ref = _last_close_via_history(ib, contract)
         if ref is None or ref <= 0:
             unpriceable.append((rec, contract, order))
             continue
@@ -703,7 +722,7 @@ def _write_deferred_orders(deferred: list, ib, rec_entry: dict, path: Path) -> i
             "qty": int(o.totalQuantity),
             "need_aud": abs(float(r.get("delta_value_aud") or 0.0)) * 1.01,
             "approved_price_aud": approved_aud,
-            "approved_price_local": _current_local_price(ib, c),
+            "approved_price_local": _ref_local_price(ib, c),
             "ccy": getattr(c, "currency", None),
             "rec_log_run_at": _run_at,
             "deferred_at": _now,
@@ -768,7 +787,7 @@ def _run_complete_deferred_mode(drift_pct: float, max_age_hours: float,
                 aborted.append((od, "abort_no_contract", "could not build contract"))
                 continue
             ib.qualifyContracts(contract)
-            cur_local = _current_local_price(ib, contract)
+            cur_local = _ref_local_price(ib, contract)
             action, reason = _deferred_completion_decision(
                 approved_price_local=od.get("approved_price_local"),
                 current_price_local=cur_local,
