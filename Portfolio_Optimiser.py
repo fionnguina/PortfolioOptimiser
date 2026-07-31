@@ -177,6 +177,7 @@ from nav import (
     compute_actual_nav_series,
     _load_broker_nav_series,
     compute_actual_nav_series_spliced,
+    last_position_change_date,
 )
 
 # Excel/PPT sheet writers + formatting utils (module split #18, 2026-07-09).
@@ -750,34 +751,19 @@ def _resolve_live_nav_aud() -> tuple:
 
 
 def _last_executed_rebal_date():
-    """Date of the last ACTUAL execution (a fill with qty_filled > 0) from
-    ibkr_fills_log.jsonl, or None if nothing has ever filled.
+    """Date the broker book last actually MOVED, from position-unit changes in
+    ibkr_nav_log.jsonl (via nav.last_position_change_date), or None if it has
+    never been observed to move.
 
-    Broker truth — recommendations don't count. As of the 2026-07-17 audit
-    NOTHING has filled since the 06-22 batch (all Cancelled/PreSubmitted/
-    Inactive), i.e. the live portfolio has never been aligned to the model.
+    Broker truth — recommendations don't count. Anchors off NAV-snapshot unit
+    changes, NOT fills-log qty_filled: that field is permanently 0 because TWS
+    serves no execution history (the fills log never back-fills — see the
+    lot-book re-seed note), so the old fills-based anchor never fired and the
+    live 6W cadence gate never engaged. Units change only on a trade, so a NAV
+    unit change IS the execution timing.
     """
     try:
-        _p = APP_DIR / "ibkr_fills_log.jsonl"
-        if not _p.exists():
-            return None
-        _dates = []
-        with _p.open("r", encoding="utf-8") as _f:
-            for _line in _f:
-                _line = _line.strip()
-                if not _line:
-                    continue
-                try:
-                    _r = json.loads(_line)
-                except Exception:
-                    continue
-                if float(_r.get("qty_filled") or 0) > 0:
-                    _ts = _r.get("exec_timestamp") or ""
-                    try:
-                        _dates.append(pd.Timestamp(_ts).normalize().tz_localize(None))
-                    except Exception:
-                        continue
-        return max(_dates) if _dates else None
+        return last_position_change_date()
     except Exception:
         return None
 

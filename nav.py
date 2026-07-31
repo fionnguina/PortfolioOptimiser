@@ -204,6 +204,72 @@ def load_broker_positions(path=None) -> dict:
     return out
 
 
+def last_position_change_date(path=None):
+    """Date the broker book last actually MOVED — the local date of the most
+    recent ibkr_nav_log snapshot whose position UNITS differ from the snapshot
+    before it.
+
+    Position units change ONLY on a fill, so a unit change between consecutive
+    NAV snapshots is broker-truth execution timing that does NOT depend on IBKR
+    confirming fills (qty_filled is permanently 0 — TWS serves no execution
+    history; the fills log never back-fills). This is what anchors the live
+    rebalance-cadence gate; the old fills-based anchor (qty_filled > 0) never
+    fired, so the 6W gate never engaged and live could rebalance on drift alone.
+
+    Market moves don't change units, so calm snapshots compare equal (no false
+    anchor). Returns a tz-naive, midnight-normalised pd.Timestamp of the last
+    change, or None if there are fewer than 2 snapshots or the book has never
+    been observed to move.
+    """
+    p = Path(path) if path is not None else (APP_DIR / "ibkr_nav_log.jsonl")
+    if not p.exists():
+        return None
+    snaps = []
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    snaps.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    # ISO timestamps with a consistent offset sort chronologically as strings.
+    snaps.sort(key=lambda s: str(s.get("ts") or ""))
+
+    def _units(snap) -> dict:
+        out: dict = {}
+        for pos in (snap.get("positions") or []):
+            try:
+                u = int(round(float(pos.get("units") or 0)))
+            except (TypeError, ValueError):
+                continue
+            if u != 0:   # a fully-closed position simply drops out of the map
+                out[str(pos.get("ticker", "")).strip().upper()] = u
+        return out
+
+    rows = []
+    for s in snaps:
+        try:
+            # .date() takes the wall-clock LOCAL date (tz-aware safe); wrap back
+            # to a tz-naive midnight Timestamp so the caller's date math (against
+            # a tz-naive "today") never raises.
+            d = pd.Timestamp(pd.Timestamp(s.get("ts")).date())
+        except Exception:
+            continue
+        rows.append((d, _units(s)))
+    if len(rows) < 2:
+        return None
+    last = None
+    for i in range(1, len(rows)):
+        if rows[i][1] != rows[i - 1][1]:
+            last = rows[i][0]
+    return last
+
+
 def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
                                       broker_nav_path=None) -> pd.Series:
     """Actual-NAV path: fills-log reconstruction, upgraded to BROKER truth
