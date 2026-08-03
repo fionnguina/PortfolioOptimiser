@@ -9,6 +9,7 @@ things a naive re-seed would get wrong.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 import pandas as pd
@@ -269,3 +270,96 @@ def test_end_to_end_usd_cost_base_from_real_snapshot():
     assert abs(sum(L["Units"] * L["CostBaseAUD"]
                    for L in out if L["Security"] == "PDBC")
                - 420 * 17.3771 * fx["USD"]) < 0.05
+
+
+# --- pending-order watch (2026-08-03) --------------------------------------
+# An order filling after the placing session ends is never confirmed: the row
+# stays qty_filled=0 and --check-fills cannot see it. The reconcile resolves it
+# either way, so it must SAY which — a non-fill used to be indistinguishable
+# from silence, and it is the outcome that needs a human.
+
+import ibkr_paper_exec as ex
+
+MON_1300 = datetime(2026, 8, 3, 13, 0, 0)     # SMH submitted, US shut
+
+
+def test_us_order_not_yet_decidable_before_its_close():
+    # placed Mon 13:00 AEST; US close maps to Tue 08:00 AEST
+    assert not ex._session_has_closed("SMH", MON_1300.isoformat(),
+                                      now=datetime(2026, 8, 4, 7, 0))
+
+
+def test_us_order_decidable_after_its_close():
+    assert ex._session_has_closed("SMH", MON_1300.isoformat(),
+                                  now=datetime(2026, 8, 4, 10, 20))
+
+
+def test_asx_order_decidable_same_day_after_1600():
+    placed = datetime(2026, 8, 3, 10, 25).isoformat()
+    assert not ex._session_has_closed("VLUE.AX", placed,
+                                      now=datetime(2026, 8, 3, 15, 0))
+    assert ex._session_has_closed("VLUE.AX", placed,
+                                  now=datetime(2026, 8, 3, 16, 30))
+
+
+def test_wrapper_slot_can_always_decide_yesterdays_orders():
+    """The 10:20 daily run must never be stuck on 'no verdict yet'."""
+    run = datetime(2026, 8, 4, 10, 20)
+    for tkr, placed in (("SMH", datetime(2026, 8, 3, 10, 25)),
+                        ("VLUE.AX", datetime(2026, 8, 3, 10, 25))):
+        assert ex._session_has_closed(tkr, placed.isoformat(), now=run)
+
+
+def test_unparseable_timestamp_still_gets_a_verdict():
+    assert ex._session_has_closed("SMH", "not-a-timestamp")
+    assert ex._session_has_closed("SMH", None)
+
+
+def _watch(tmp_path, rows, actions, now_row=None):
+    p = tmp_path / "fills.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    return ex._pending_order_watch(p, actions)
+
+
+def test_watch_reports_fill_when_units_moved(tmp_path):
+    rows = [{"exec_timestamp": MON_1300.isoformat(), "ticker": "SMH",
+             "side": "BUY", "qty_requested": 31, "qty_filled": 0,
+             "is_done": False, "order_id": 97}]
+    got = _watch(tmp_path, rows,
+                 [{"ticker": "SMH", "action": "added", "units": 31,
+                   "detail": ""}])
+    assert got[0]["verdict"].startswith("FILLED")
+
+
+def test_watch_reports_non_fill_once_session_closed(tmp_path):
+    old = datetime(2026, 7, 20, 9, 35).isoformat()
+    rows = [{"exec_timestamp": old, "ticker": "SMH", "side": "BUY",
+             "qty_requested": 31, "qty_filled": 0, "is_done": False,
+             "order_id": 97}]
+    got = _watch(tmp_path, rows,
+                 [{"ticker": "SMH", "action": "ok", "units": 0, "detail": ""}])
+    assert got[0]["verdict"].startswith("DID NOT FILL")
+
+
+def test_watch_will_not_call_a_live_order_dead(tmp_path):
+    """THE double-buy guard: unchanged units before the session closes is not
+    evidence of anything. Calling it a non-fill invites re-placing on top of a
+    working order."""
+    rows = [{"exec_timestamp": datetime.now().isoformat(), "ticker": "SMH",
+             "side": "BUY", "qty_requested": 31, "qty_filled": 0,
+             "is_done": False, "order_id": 97}]
+    got = _watch(tmp_path, rows,
+                 [{"ticker": "SMH", "action": "ok", "units": 0, "detail": ""}])
+    assert got[0]["verdict"].startswith("STILL WORKING")
+    assert "DID NOT FILL" not in got[0]["verdict"]
+
+
+def test_watch_ignores_rows_that_already_confirmed_a_fill(tmp_path):
+    rows = [{"exec_timestamp": MON_1300.isoformat(), "ticker": "SMH",
+             "side": "BUY", "qty_requested": 31, "qty_filled": 31,
+             "is_done": True, "order_id": 97}]
+    assert _watch(tmp_path, rows, []) == []
+
+
+def test_watch_empty_when_no_fills_log(tmp_path):
+    assert ex._pending_order_watch(tmp_path / "nope.jsonl", []) == []

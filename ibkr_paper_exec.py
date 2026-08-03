@@ -1687,8 +1687,26 @@ def _run_reconcile_lots_mode(write: bool = False, email: bool = False) -> int:
         for a in lost:
             print(f"        {a['ticker']:<12} {a['units']:>10,.0f} units")
 
+    # --- Pending-order watch ---------------------------------------------
+    # An order that fills after the placing session ends is never confirmed:
+    # the row stays qty_filled=0 forever and --check-fills cannot see it. The
+    # reconcile above resolves it either way, so say WHICH — affirmatively.
+    # Silence used to mean "nothing changed", which is indistinguishable from
+    # "the step didn't run", and the outcome that needs action (the order
+    # DIED unfilled) was the silent one.
+    watch = _pending_order_watch(_SCRIPT_DIR / FILLS_LOG_FILENAME, actions)
+    if watch:
+        print()
+        print("  PENDING ORDER WATCH — orders logged qty_filled=0, resolved")
+        print("  against broker positions:")
+        for w in watch:
+            print(f"    {w['ticker']:<12} {w['side']:<5} {w['qty']:>6} "
+                  f"{w['verdict']}")
+
     if not changed:
         print("\n[reconcile-lots] already reconciled — nothing to write.")
+        if watch and email:
+            _email_reconcile_outcome([], [], watch)
         return 0
 
     if not write:
@@ -1709,22 +1727,139 @@ def _run_reconcile_lots_mode(write: bool = False, email: bool = False) -> int:
         return 1
 
     if email:
-        try:
-            from send_alert import send
-            body = "\n".join(
-                f"{a['ticker']:<12} {a['action']:<13} {a['units']:>10,.0f}  "
-                f"{a['detail']}" for a in changed)
-            if lost:
-                body += ("\n\nUNRECOVERABLE CGT — positions shrank with no "
-                         "logged sale price:\n" + "\n".join(
-                             f"  {a['ticker']} {a['units']:,.0f} units"
-                             for a in lost))
-            rc = send(f"[Portfolio Optimiser] LOT SEED reconciled "
-                      f"({len(changed)} ticker(s))", body)
-            print(f"[reconcile-lots] --email: sent (rc={rc}).")
-        except Exception as e:
-            print(f"[reconcile-lots] --email: send failed ({e}); non-fatal.")
+        _email_reconcile_outcome(changed, lost, watch)
     return 0
+
+
+def _session_has_closed(ticker: str, submitted_iso, now=None) -> bool:
+    """Has the ticker's market closed at least once since the order was placed?
+
+    Until it has, unchanged broker units mean nothing — the order simply has
+    not had its chance. Local wall-clock is AEST (the machine's tz), and the
+    universe is exactly two venues:
+      .AX  -> ASX close 16:00 AEST
+      else -> US close 16:00 ET, which is 06:00 AEST on EDT and 08:00 on EST.
+              08:00 is used for both: erring LATE only delays a verdict by two
+              hours, while erring early risks declaring a live order dead and
+              prompting a duplicate buy.
+    Unparseable timestamp -> True, so a corrupt row still gets a verdict from
+    the position comparison rather than being silently dropped."""
+    if not submitted_iso:
+        return True
+    try:
+        placed = datetime.fromisoformat(str(submitted_iso)).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return True
+    now = now or datetime.now()
+    close_hour = 16 if str(ticker).upper().endswith(".AX") else 8
+    close = placed.replace(hour=close_hour, minute=0, second=0, microsecond=0)
+    if close <= placed:
+        close += timedelta(days=1)
+    return now >= close
+
+
+def _pending_order_watch(fills_path, actions: list) -> list:
+    """Resolve the latest batch's unconfirmed orders against the reconcile.
+
+    PURE-ish (one file read). An order logged qty_filled=0 either filled after
+    the session died — in which case the reconcile moved that ticker's units —
+    or it expired unfilled, in which case the units agree. DAY orders placed
+    outside RTH die at the close of the next session and nothing retries them,
+    so 'did not fill' is the verdict that needs a human."""
+    try:
+        rows = []
+        with open(fills_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        return []
+    if not rows:
+        return []
+
+    latest_ts, batch, _ = _plan_check_fills_batch(rows)
+    if not batch:
+        return []
+
+    by_tkr = {a["ticker"]: a for a in actions}
+    out = []
+    for r in batch:
+        if float(r.get("qty_filled") or 0) > 0 or r.get("is_done"):
+            continue
+        tkr = str(r.get("ticker", "")).strip().upper()
+        qty = int(float(r.get("qty_requested") or 0))
+        a = by_tkr.get(tkr)
+        if a and a["action"] in ("added", "opened", "reduced", "closed"):
+            verdict = (f"FILLED — broker moved {a['units']:+,.0f} units "
+                       f"(logged as qty_filled=0)")
+        elif a and a["action"] == "ok" and not _session_has_closed(
+                tkr, r.get("exec_timestamp")):
+            # Unchanged units prove nothing until the order has actually had
+            # its session. Calling that a non-fill would invite a re-place on
+            # top of a still-working order — a double buy.
+            verdict = ("STILL WORKING — its market has not closed since the "
+                       "order was placed; no verdict yet")
+        elif a and a["action"] == "ok":
+            verdict = ("DID NOT FILL — broker units unchanged. A DAY order "
+                       "placed outside RTH expires at the next session close "
+                       "and is NOT retried; re-place it if still wanted.")
+        else:
+            verdict = "UNRESOLVED — no broker position to compare against"
+        out.append({"ticker": tkr, "side": str(r.get("side", "")),
+                    "qty": qty, "verdict": verdict, "batch": latest_ts})
+    return out
+
+
+def _email_reconcile_outcome(changed: list, lost: list, watch: list) -> None:
+    """Send the reconcile outcome. Fires when anything moved OR when there were
+    unconfirmed orders to resolve — so a non-fill is reported, not just
+    implied by silence. Non-fatal."""
+    try:
+        from send_alert import send
+    except Exception as e:
+        print(f"[reconcile-lots] --email: send_alert unavailable ({e}).")
+        return
+
+    parts = []
+    if watch:
+        parts.append("PENDING ORDERS RESOLVED\n" + "\n".join(
+            f"  {w['ticker']:<12} {w['side']:<5} {w['qty']:>6}  {w['verdict']}"
+            for w in watch))
+    if changed:
+        parts.append("LOT SEED CHANGES\n" + "\n".join(
+            f"  {a['ticker']:<12} {a['action']:<13} {a['units']:>10,.0f}  "
+            f"{a['detail']}" for a in changed))
+    else:
+        parts.append("LOT SEED CHANGES\n  none — book already matched broker.")
+    if lost:
+        parts.append("UNRECOVERABLE CGT — positions shrank with no logged "
+                     "sale price:\n" + "\n".join(
+                         f"  {a['ticker']} {a['units']:,.0f} units"
+                         for a in lost))
+
+    # Lead the subject with the thing that needs action.
+    dead = [w for w in watch if w["verdict"].startswith("DID NOT FILL")]
+    filled = [w for w in watch if w["verdict"].startswith("FILLED")]
+    if dead:
+        subj = (f"[Portfolio Optimiser] ORDER DID NOT FILL: "
+                f"{', '.join(w['ticker'] for w in dead)}")
+    elif filled:
+        subj = (f"[Portfolio Optimiser] Order(s) filled: "
+                f"{', '.join(w['ticker'] for w in filled)}")
+    elif watch:
+        subj = (f"[Portfolio Optimiser] Order(s) still working: "
+                f"{', '.join(w['ticker'] for w in watch)}")
+    else:
+        subj = f"[Portfolio Optimiser] LOT SEED reconciled ({len(changed)} ticker(s))"
+    try:
+        rc = send(subj, "\n\n".join(parts))
+        print(f"[reconcile-lots] --email: sent (rc={rc}).")
+    except Exception as e:
+        print(f"[reconcile-lots] --email: send failed ({e}); non-fatal.")
 
 
 def _run_cancel_open_orders_mode(execute: bool = False, assume_yes: bool = False,
