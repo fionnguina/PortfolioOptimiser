@@ -48,7 +48,7 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Reuse the proven contract-builder + preview formatter + safety check from
@@ -90,8 +90,17 @@ DEFERRED_ORDERS_FILENAME = "deferred_orders.json"  # cash-deferred buys awaiting
 #   * funds: skip if the sells still haven't freed enough cash.
 # Fail-safe: if the price can't be verified at all, REFUSE (never auto-trade
 # blind). All defaults overridable via CLI flags.
-DEFERRED_DRIFT_PCT_DEFAULT = 3.0      # abort if |Δprice| > 3% vs approved
-DEFERRED_MAX_AGE_HOURS_DEFAULT = 48   # abort if the deferral is older than 48h
+#
+# Staleness is measured in BUSINESS hours, not wall-clock (2026-08-03). The
+# 48h wall-clock guard could not survive a weekend: a buy deferred on a Friday
+# was next checked on Monday at 72h and aborted EVERY time — a deterministic
+# kill, observed on SOXX (2026-07-24 -> 07-27) and SMH (2026-07-31 -> 08-03).
+# A plan does not go stale while the market is shut, so weekend hours don't
+# count. WALL-clock is still bounded by a hard ceiling so the relaxation can
+# never let a genuinely ancient plan through unattended.
+DEFERRED_DRIFT_PCT_DEFAULT = 3.0        # abort if |Δprice| > 3% vs approved
+DEFERRED_MAX_AGE_HOURS_DEFAULT = 48     # abort if older than 48 BUSINESS hours
+DEFERRED_MAX_WALL_AGE_HOURS_DEFAULT = 120  # hard ceiling: 5 wall days, regardless
 
 # Anchor log writes to this script's directory, NOT the process CWD. The daily
 # scheduled task runs with WorkingDir unset (CWD = C:\Windows\System32), so a
@@ -313,26 +322,57 @@ def _price_orders_as_limits(ib, plan: list, collar_pct: float) -> tuple:
     return priced, unpriceable
 
 
+def _business_hours_between(start: datetime, end: datetime) -> float:
+    """Hours between start and end EXCLUDING whole weekend days (Sat/Sun).
+
+    PURE. Used for the deferral staleness guard: a plan approved on Friday is
+    not 72h stale on Monday morning — the market was shut for 2 of those days,
+    so nothing could have moved. Walks midnight-to-midnight so partial first/
+    last days are counted correctly. Returns 0.0 if end <= start."""
+    if end <= start:
+        return 0.0
+    total = 0.0
+    cur = start
+    while cur < end:
+        next_midnight = (cur.replace(hour=0, minute=0, second=0, microsecond=0)
+                         + timedelta(days=1))
+        seg_end = min(next_midnight, end)
+        if cur.weekday() < 5:          # Mon=0 .. Fri=4
+            total += (seg_end - cur).total_seconds() / 3600.0
+        cur = seg_end
+    return total
+
+
 def _deferred_completion_decision(*, approved_price_local, current_price_local,
                                   need_aud, funds_aud, deferred_at_iso, now,
-                                  drift_pct, max_age_hours):
+                                  drift_pct, max_age_hours,
+                                  max_wall_age_hours=DEFERRED_MAX_WALL_AGE_HOURS_DEFAULT):
     """PURE guard for auto-completing one deferred buy. No I/O — unit-tested.
 
     Returns (action, reason) where action is one of:
       submit          — all guards pass, safe to place the order
-      abort_stale     — the deferral is older than max_age_hours (plan too old)
+      abort_stale     — older than max_age_hours BUSINESS hours, or past the
+                        max_wall_age_hours wall-clock ceiling (plan too old)
       abort_drift     — price moved more than drift_pct since approval
       abort_no_price  — price can't be verified → refuse to auto-trade blind
       defer_funds     — sells still haven't freed enough cash → try again later
     Order of checks is deliberate: staleness → price → funds. Fail-safe: any
     missing price is a REFUSAL, never a silent proceed."""
-    # 1) staleness
+    # 1) staleness — business hours (weekends don't age a plan), plus a hard
+    #    wall-clock ceiling so the weekend allowance can't be stretched forever.
     if deferred_at_iso:
         try:
-            age_h = (now - datetime.fromisoformat(deferred_at_iso)).total_seconds() / 3600.0
-            if age_h > max_age_hours:
-                return "abort_stale", (f"deferred {age_h:.0f}h ago > {max_age_hours}h "
-                                       f"guard — plan too old, complete manually")
+            _at = datetime.fromisoformat(deferred_at_iso)
+            wall_h = (now - _at).total_seconds() / 3600.0
+            biz_h = _business_hours_between(_at, now)
+            if wall_h > max_wall_age_hours:
+                return "abort_stale", (f"deferred {wall_h:.0f}h ago > {max_wall_age_hours}h "
+                                       f"wall-clock ceiling — plan too old, "
+                                       f"complete manually")
+            if biz_h > max_age_hours:
+                return "abort_stale", (f"deferred {biz_h:.0f} business-h ago "
+                                       f"({wall_h:.0f}h wall) > {max_age_hours}h guard "
+                                       f"— plan too old, complete manually")
         except Exception:
             pass
     # 2) price drift — BOTH prices required; missing either = refuse
@@ -763,7 +803,8 @@ def _run_complete_deferred_mode(drift_pct: float, max_age_hours: float,
         return 1
 
     print(f"[complete-deferred] {len(pending)} deferred order(s); guards: "
-          f"drift<={drift_pct:.1f}%, age<={max_age_hours:.0f}h")
+          f"drift<={drift_pct:.1f}%, age<={max_age_hours:.0f} business-h "
+          f"(<={DEFERRED_MAX_WALL_AGE_HOURS_DEFAULT:.0f}h wall)")
     ib = IB()
     try:
         ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=CONNECT_TIMEOUT)
@@ -1510,6 +1551,13 @@ def _run_snapshot_nav_mode() -> int:
             positions.append({
                 "ticker": sym, "units": float(p.position),
                 "mark_local": float(p.marketPrice),
+                # NAME IS A MISNOMER, kept only because historical rows use it:
+                # PortfolioItem.marketValue is in the contract's TRADING
+                # currency, NOT the account base currency. It equals
+                # units * mark_local exactly, USD rows included. Do NOT divide
+                # by units*mark to get FX — that always yields 1.0. Use
+                # lots.derive_fx_from_snapshot, which reads the rate off the
+                # account-level gross_positions_aud identity instead.
                 "mkt_value_base": float(p.marketValue),
                 "unrealized_pnl": float(p.unrealizedPNL),
                 "avg_cost_local": avg_cost_local,
@@ -1534,6 +1582,148 @@ def _run_snapshot_nav_mode() -> int:
     print(f"[nav] snapshot: NetLiq ${row['net_liquidation_aud']:,.2f} AUD "
           f"(cash ${row['cash_aud']:,.2f}, {len(positions)} positions) "
           f"-> ibkr_nav_log.jsonl")
+    return 0
+
+
+def _run_reconcile_lots_mode(write: bool = False, email: bool = False) -> int:
+    """--reconcile-lots: realign lots_seed.json to the latest broker snapshot.
+
+    The fills log freezes rows at qty_filled=0 whenever an order fills after the
+    placing session ends (every US leg, and any ASX leg filling after the run),
+    and the broker serves no historical executions to repair it from. The lot
+    book therefore drifts from broker truth a little more every rebalance until
+    someone re-seeds by hand — which is what happened on 2026-07-28, and by
+    2026-08-03 VLUE.AX was already 400 units adrift again.
+
+    This automates that re-seed properly: it PRESERVES the AcqDate and AUD cost
+    of units that already exist (a blunt re-seed would restamp everything with
+    today's date and reset the 12-month LT-discount clock) and only writes the
+    difference. PREVIEW by default; --write applies it and backs up the old
+    seed first."""
+    seed_path = _SCRIPT_DIR / "lots_seed.json"
+    nav_path = _SCRIPT_DIR / "ibkr_nav_log.jsonl"
+    if not nav_path.exists():
+        print(f"[reconcile-lots] {nav_path.name} not found — no broker truth "
+              f"to reconcile against. Run --snapshot-nav first.")
+        return 1
+
+    snap = None
+    with open(nav_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                snap = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    if not snap or not snap.get("positions"):
+        print("[reconcile-lots] latest NAV snapshot has no positions.")
+        return 1
+
+    seed = []
+    if seed_path.exists():
+        try:
+            seed = json.loads(seed_path.read_text(encoding="utf-8")) or []
+        except Exception as e:
+            print(f"[reconcile-lots][ERR] unreadable {seed_path.name} ({e}); "
+                  f"refusing to overwrite it.")
+            return 1
+
+    broker = {str(p.get("ticker", "")).strip().upper(): p
+              for p in snap["positions"]}
+    snap_ts = snap.get("ts")
+    print(f"[reconcile-lots] seed {seed_path.name} ({len(seed)} lot(s)) vs "
+          f"broker snapshot {snap_ts} ({len(broker)} position(s))")
+
+    try:
+        from lots import reconcile_seed_to_broker, derive_fx_from_snapshot
+    except ImportError as e:
+        print(f"[reconcile-lots][ERR] cannot import lots.py ({e}).")
+        return 1
+
+    # FX must come from the snapshot's ACCOUNT-level identity, not per position:
+    # mkt_value_base is local currency despite its name (see derive_fx_from_
+    # snapshot). Getting this wrong books US cost bases ~42% light.
+    fx_map = derive_fx_from_snapshot(snap)
+    print(f"[reconcile-lots] snapshot FX: "
+          + ", ".join(f"{k}->AUD {v:.4f}" for k, v in sorted(fx_map.items())))
+    foreign = {p.get("currency") for p in snap["positions"]
+               if str(p.get("currency") or "").upper() not in ("", "AUD")}
+    unresolved = {c for c in foreign if str(c).upper() not in fx_map}
+    if unresolved:
+        print(f"[reconcile-lots][WARN] no FX for {sorted(unresolved)} — those "
+              f"positions will be reported unpriceable rather than guessed.")
+
+    # AcqDate for new units is the SNAPSHOT time, not now: that is when the
+    # units are first evidenced. Naive so it matches the seed's existing format.
+    as_of = datetime.fromisoformat(snap_ts).replace(tzinfo=None) if snap_ts \
+        else datetime.now()
+    new_seed, actions = reconcile_seed_to_broker(seed, broker, as_of=as_of,
+                                                 fx_map=fx_map)
+
+    changed = [a for a in actions if a["action"] != "ok"]
+    print()
+    print("=" * 96)
+    print("LOT SEED RECONCILIATION")
+    print("=" * 96)
+    print(f"  {'Ticker':<12} {'Action':<13} {'Units':>10}  Detail")
+    print(f"  {'-'*12} {'-'*13} {'-'*10}  {'-'*54}")
+    for a in actions:
+        print(f"  {a['ticker']:<12} {a['action']:<13} {a['units']:>10,.0f}  "
+              f"{a['detail']}")
+    print(f"  {'-'*12} {'-'*13} {'-'*10}  {'-'*54}")
+    print(f"\n  Changed: {len(changed)} of {len(actions)} ticker(s)")
+
+    # A lost sell means a realised CGT event we can never price. Say so loudly
+    # rather than letting a tidy-looking seed imply the books are complete.
+    lost = [a for a in actions if a["action"] in ("reduced", "closed")]
+    if lost:
+        print()
+        print("  [!] UNRECOVERABLE CGT: these positions shrank without a logged")
+        print("      sale price, so the realised gain/loss cannot be computed.")
+        print("      The FY tax ledger will understate them. Reconstruct from")
+        print("      the IBKR account statement if the amounts are material:")
+        for a in lost:
+            print(f"        {a['ticker']:<12} {a['units']:>10,.0f} units")
+
+    if not changed:
+        print("\n[reconcile-lots] already reconciled — nothing to write.")
+        return 0
+
+    if not write:
+        print("\n[reconcile-lots] PREVIEW only. Re-run with --write to apply.")
+        return 0
+
+    backup = seed_path.with_name(
+        f"lots_seed.backup_{datetime.now():%Y-%m-%d_%H%M%S}.json")
+    try:
+        if seed_path.exists():
+            backup.write_text(seed_path.read_text(encoding="utf-8"),
+                              encoding="utf-8")
+            print(f"\n[reconcile-lots] backed up old seed -> {backup.name}")
+        seed_path.write_text(json.dumps(new_seed, indent=4), encoding="utf-8")
+        print(f"[reconcile-lots] wrote {len(new_seed)} lot(s) -> {seed_path.name}")
+    except Exception as e:
+        print(f"[reconcile-lots][ERR] write failed ({e}); seed unchanged.")
+        return 1
+
+    if email:
+        try:
+            from send_alert import send
+            body = "\n".join(
+                f"{a['ticker']:<12} {a['action']:<13} {a['units']:>10,.0f}  "
+                f"{a['detail']}" for a in changed)
+            if lost:
+                body += ("\n\nUNRECOVERABLE CGT — positions shrank with no "
+                         "logged sale price:\n" + "\n".join(
+                             f"  {a['ticker']} {a['units']:,.0f} units"
+                             for a in lost))
+            rc = send(f"[Portfolio Optimiser] LOT SEED reconciled "
+                      f"({len(changed)} ticker(s))", body)
+            print(f"[reconcile-lots] --email: sent (rc={rc}).")
+        except Exception as e:
+            print(f"[reconcile-lots] --email: send failed ({e}); non-fatal.")
     return 0
 
 
@@ -2122,6 +2312,17 @@ def main() -> int:
                              "Matching is case-sensitive; .AX suffix is optional "
                              "(BEAR matches BEAR.AX, both match each other). "
                              "Example: --only-tickers HBRD,BEAR,BBUS")
+    parser.add_argument("--reconcile-lots", action="store_true",
+                        help="Realign lots_seed.json to the latest broker NAV "
+                             "snapshot. The fills log freezes rows at "
+                             "qty_filled=0 when an order fills after the placing "
+                             "session ends, and the broker serves no historical "
+                             "executions to repair it — so the lot book drifts "
+                             "until re-seeded. PREVIEW by default; add --write "
+                             "to apply (backs up the old seed). Preserves the "
+                             "AcqDate + AUD cost of existing units, so the "
+                             "12-month LT-discount clock is not reset. Pair with "
+                             "--email to be told what moved.")
     parser.add_argument("--complete-deferred", action="store_true",
                         help="Guarded auto-completion of buys deferred on a prior "
                              "--execute for insufficient funds (deferred_orders.json). "
@@ -2137,8 +2338,11 @@ def main() -> int:
     parser.add_argument("--max-age-hours", type=float,
                         default=DEFERRED_MAX_AGE_HOURS_DEFAULT,
                         help=f"--complete-deferred: abort a buy deferred longer ago "
-                             f"than this (default {DEFERRED_MAX_AGE_HOURS_DEFAULT}h) — "
-                             f"a stale plan needs a fresh run.")
+                             f"than this many BUSINESS hours — weekends don't age "
+                             f"a plan (default {DEFERRED_MAX_AGE_HOURS_DEFAULT}h). "
+                             f"A hard {DEFERRED_MAX_WALL_AGE_HOURS_DEFAULT:.0f}h "
+                             f"wall-clock ceiling applies regardless. A stale plan "
+                             f"needs a fresh run.")
     parser.add_argument("--record-tax-payment", action="store_true",
                         help="Record an ATO CGT payment so the tax provision RELEASES "
                              "that cash back to investable. Requires --fy and --amount. "
@@ -2199,6 +2403,12 @@ def main() -> int:
     # === --snapshot-nav mode: read-only broker NAV logging ===
     if args.snapshot_nav:
         return _run_snapshot_nav_mode()
+
+    # === --reconcile-lots mode: realign the lot seed to broker truth ===
+    # Offline — reads lots_seed.json + ibkr_nav_log.jsonl, no IBKR connection.
+    if args.reconcile_lots:
+        return _run_reconcile_lots_mode(write=bool(args.write),
+                                        email=bool(args.email))
 
     # === --sync-holdings mode: broker-truth Units reconciliation ===
     if args.sync_holdings:

@@ -35,9 +35,19 @@
     To schedule (one-time setup):
       schtasks /Create /SC WEEKLY /D MON,TUE,WED,THU,FRI /TN "Portfolio Optimiser Daily" `
         /TR "powershell -ExecutionPolicy Bypass -File C:\Users\Fionn Guina\Portfolio_Optimiser\daily_auto.ps1" `
-        /ST 09:30
+        /ST 10:20
+
+    START TIME IS LOAD-BEARING — 10:20 AEST, not 09:30 (changed 2026-08-03).
+    At 09:30 the ASX was still in PRE-OPEN (continuous trading starts 10:00),
+    so sells were queued but unfilled when the executor re-read AvailableFunds
+    — the cash never existed, and the largest BUY (SMH, ~$24k) was deferred
+    every single rebalance. 10:20 puts the whole run after the ASX open with
+    ~20 min for the opening auction to fill and settle. Do not move it earlier.
+    (The US session is 23:30-06:00 AEST either way; US legs go in outside RTH
+    as PreSubmitted and fill at the US open. That was never the failure mode.)
 
     Check status:           schtasks /Query /TN "Portfolio Optimiser Daily"
+    Change start time:      schtasks /Change /TN "Portfolio Optimiser Daily" /ST 10:20
     Remove:                 schtasks /Delete /TN "Portfolio Optimiser Daily" /F
 #>
 
@@ -575,6 +585,33 @@ try {
     Write-Log "NAV snapshot failed (non-fatal): $($_.Exception.Message)"
 }
 
+# --- Lot-seed reconciliation to broker truth (2026-08-03) ---
+# MUST run immediately after the NAV snapshot — it reconciles against the row
+# that step just wrote, so a stale snapshot would re-introduce the drift it is
+# meant to remove.
+#
+# The fills log freezes rows at qty_filled=0 whenever an order fills after the
+# session that placed it ends. That is EVERY US leg (the US session is
+# 23:30-06:00 AEST, long after the run exits) and any ASX leg filling after the
+# run. It cannot be repaired from the API: reqExecutions returns 0 even with a
+# 30-day filter, and ib.trades() is session-scoped while this wrapper restarts
+# IB Gateway daily. So the lot book was only ever correct just after a MANUAL
+# re-seed, and drifted every rebalance after that — 400 units of VLUE.AX in the
+# 6 days following the 2026-07-28 re-seed, which corrupts the CGT cost base.
+# Reconciling to broker POSITIONS each run keeps it honest without a human.
+# Non-fatal: a failure here must never block the run.
+try {
+    $rlPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $rlScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
+    if ((Test-Path $rlPy) -and (Test-Path $rlScript)) {
+        $rlOut = & $rlPy $rlScript --reconcile-lots --write --email 2>&1 |
+                 Select-Object -Last 3
+        Write-Log "Lot-seed reconcile: $rlOut"
+    }
+} catch {
+    Write-Log "Lot-seed reconcile failed (non-fatal): $($_.Exception.Message)"
+}
+
 # --- Notification + optional PPT open ---
 # Build a simulator suffix that appears on every toast — if the
 # simulator's sanity layer rejected anything, the user needs to see
@@ -777,7 +814,15 @@ if ($verdict -eq "RUN") {
         $shScript = Join-Path $ScriptDir "ibkr_paper_exec.py"
         if ((Test-Path $shPy) -and (Test-Path $shScript)) {
             $autoArg = if ($AutoExecute) { "--auto-execute" } else { "--shadow-execute" }
-            $shOut = & $shPy $shScript $autoArg --email 2>&1 | Select-Object -Last 6
+            # --wait-for-funds (2026-08-03): the executor submits sells, re-reads
+            # AvailableFunds, then only submits the BUYs that fit. Queued sells
+            # contribute nothing until they FILL, so with the task at 10:20 the
+            # ASX open (10:00) has filled them but settlement into AvailableFunds
+            # can lag a few minutes. Poll for 15 min so the deferred leg goes in
+            # THIS session instead of becoming tomorrow's deferred_orders.json
+            # entry. Buys are sorted ascending by size, so the leg squeezed out
+            # is always the largest (SMH) — the exact repeat failure this fixes.
+            $shOut = & $shPy $shScript $autoArg --wait-for-funds 900 --email 2>&1 | Select-Object -Last 6
             Write-Log "Autonomy ($autoArg): $shOut"
         }
     } catch {

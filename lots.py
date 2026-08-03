@@ -153,6 +153,220 @@ def reconcile_lots_vs_broker(lots_df, broker_positions, fx_map=None, *,
     return warnings
 
 
+# ---------------------------------------------------------------------------
+# Seed reconciliation — turning the drift WARNING into a CORRECTION
+# ---------------------------------------------------------------------------
+# reconcile_lots_vs_broker (above) only reports. It has reported the same drift
+# every run since 2026-07-28 because nothing acts on it, and the drift only
+# grows: by 2026-08-03 the book held VLUE.AX 3374 units against a broker 2974.
+#
+# WHY THE FILLS LOG CANNOT BE REPAIRED. The obvious fix — go back and fill in
+# qty_filled from the broker — is impossible on this account, verified twice:
+#   * reqExecutions returns 0 even with a 30-day ExecutionFilter (2026-07-17);
+#   * ib.trades() is scoped to the CURRENT API session, and the daily wrapper
+#     restarts IB Gateway, so yesterday's orders are simply gone.
+# --check-fills can therefore only ever catch fills that land while the session
+# that placed them is still alive. Anything filling after the run exits (every
+# US leg, since the US session is 23:30-06:00 AEST) is unrecoverable from the
+# API. The fills log is structurally incomplete and no amount of re-querying
+# changes that.
+#
+# WHAT SURVIVES is the broker's position + averageCost, which IS exact (units *
+# (mark_local - avg_cost_local) reproduces unrealizedPNL to the cent). So the
+# lot book is reconciled to POSITIONS rather than reconstructed from fills.
+#
+# COST BASE IS DELIBERATELY NOT REWRITTEN on units that already exist. For an
+# AU investor the CGT cost base of a foreign asset is the AUD amount at the
+# ACQUISITION date, so re-deriving it from the broker's local avg cost at
+# TODAY's FX would corrupt a correct historical figure — it would look tidier
+# and be wrong. Only genuinely new units get a cost, and they are converted at
+# the snapshot's own implied FX (they were acquired within a day or so of it).
+
+def reconcile_seed_to_broker(seed_lots, broker_positions, *, as_of, fx_map=None,
+                             unit_tol: float = LOT_RECON_UNIT_TOL) -> tuple:
+    """Reconcile a lot seed to broker-truth positions. PURE — no I/O.
+
+    Returns (new_seed_lots, actions) where actions is a list of dicts
+    {ticker, action, units, detail} describing every change, for logging and
+    for the operator to review. Action is one of:
+      ok            — units agree, nothing changed
+      added         — broker holds MORE: a buy the fills log missed
+      opened        — ticker absent from the seed entirely
+      reduced       — broker holds FEWER: a sell the fills log missed (FIFO)
+      closed        — position fully exited
+      unpriceable   — broker units exist but no usable cost anchor; left alone
+
+    New units are priced so the book's units-weighted average cost lands on the
+    broker's, which keeps the TOTAL cost base exact rather than merely close.
+    If that implied per-unit cost comes out nonsensical (<=0, or more than 5x
+    the broker average — which means the pre-existing book cost was already
+    wrong), it is rejected in favour of the plain broker average and flagged.
+    """
+    actions: list = []
+    broker = {str(k).strip().upper(): v
+              for k, v in (broker_positions or {}).items()
+              if not str(k).startswith("_") and isinstance(v, dict)}
+
+    by_ticker: dict = {}
+    for lot in (seed_lots or []):
+        by_ticker.setdefault(str(lot.get("Security", "")).strip().upper(),
+                             []).append(dict(lot))
+
+    as_of_iso = pd.Timestamp(as_of).to_pydatetime().isoformat()
+    out: list = []
+
+    for tkr in sorted(set(by_ticker) | set(broker)):
+        lots = sorted(by_ticker.get(tkr, []),
+                      key=lambda L: pd.Timestamp(L.get("AcqDate")))
+        book_units = sum(float(L.get("Units") or 0.0) for L in lots)
+        b = broker.get(tkr)
+        b_units = float(b.get("units") or 0.0) if b else 0.0
+
+        if b is None or b_units <= 0:
+            if lots:
+                actions.append({"ticker": tkr, "action": "closed",
+                                "units": -book_units,
+                                "detail": (f"broker holds none; dropping "
+                                           f"{book_units:g} book unit(s). "
+                                           f"Realised CGT on the exit is NOT "
+                                           f"recoverable — the sale price was "
+                                           f"never logged")})
+            continue
+
+        delta = b_units - book_units
+        if abs(delta) <= unit_tol:
+            out.extend(lots)
+            actions.append({"ticker": tkr, "action": "ok", "units": 0.0,
+                            "detail": f"{b_units:g} units agree"})
+            continue
+
+        if delta < 0:
+            # Broker holds fewer — units were sold. Reduce FIFO (oldest first),
+            # matching the engine's LOT_MATCH_METHOD.
+            to_drop = -delta
+            kept = []
+            for L in lots:
+                u = float(L.get("Units") or 0.0)
+                if to_drop <= 0:
+                    kept.append(L)
+                elif u <= to_drop:
+                    to_drop -= u
+                else:
+                    L = dict(L)
+                    L["Units"] = u - to_drop
+                    to_drop = 0.0
+                    kept.append(L)
+            out.extend(kept)
+            actions.append({"ticker": tkr, "action": "reduced", "units": delta,
+                            "detail": (f"broker {b_units:g} < book "
+                                       f"{book_units:g}; released {-delta:g} "
+                                       f"unit(s) FIFO. Realised CGT on that "
+                                       f"sale is NOT recoverable")})
+            continue
+
+        # Broker holds more — units were bought. Price the new lot.
+        b_avg_local = b.get("avg_cost_local")
+        fx = (fx_map or {"AUD": 1.0}).get(
+            str(b.get("currency") or "").upper() or "AUD")
+        if b_avg_local is None or not fx or fx <= 0:
+            out.extend(lots)
+            actions.append({"ticker": tkr, "action": "unpriceable",
+                            "units": delta,
+                            "detail": (f"broker holds {delta:g} more unit(s) "
+                                       f"but no usable cost/FX anchor — left "
+                                       f"alone, reconcile manually")})
+            continue
+
+        b_avg_aud = float(b_avg_local) * fx
+        book_cost = sum(float(L.get("Units") or 0.0)
+                        * float(L.get("CostBaseAUD") or 0.0) for L in lots)
+        implied = (b_units * b_avg_aud - book_cost) / delta
+        note = ""
+        if not (0 < implied <= 5 * b_avg_aud):
+            note = (f" (implied unit cost A${implied:,.4f} rejected as "
+                    f"nonsensical — the pre-existing book cost was already "
+                    f"wrong; used broker average instead)")
+            implied = b_avg_aud
+
+        out.extend(lots)
+        out.append({
+            "Security": tkr,
+            # Dated at the snapshot, not backdated: it is the earliest date we
+            # can EVIDENCE, and a later AcqDate delays 12-month LT-discount
+            # eligibility — i.e. it errs toward over-provisioning tax, never
+            # under. Backdating to win the discount would be a guess in the
+            # taxpayer's favour with no support.
+            "AcqDate": as_of_iso,
+            "Units": delta,
+            "CostBaseAUD": round(implied, 7),
+            "SeedAsOf": as_of_iso,
+        })
+        actions.append({
+            "ticker": tkr, "action": ("opened" if not lots else "added"),
+            "units": delta,
+            "detail": (f"broker {b_units:g} > book {book_units:g}; added "
+                       f"{delta:g} unit(s) @ A${implied:,.4f}{note}"),
+        })
+
+    # One watershed for the whole file: every fills-log row at or before this
+    # stamp is already reflected in the seed and must not be replayed.
+    for lot in out:
+        lot["SeedAsOf"] = as_of_iso
+    return out, actions
+
+
+def derive_fx_from_snapshot(snapshot: dict) -> dict:
+    """{CURRENCY: local->AUD rate} implied by a broker NAV snapshot row.
+
+    `mkt_value_base` IS A MISNOMER — it is the position's value in its own
+    TRADING currency, not the account base currency. ib_insync's
+    PortfolioItem.marketValue is local, and the log field was named "base"
+    anyway. Verified exactly against 2026-08-03: mkt_value_base equals
+    units * mark_local to the cent for the USD rows (PDBC, SMH, VEA) as well
+    as the AUD ones. So a per-row FX cannot be read off a single position —
+    dividing one by the other just yields 1.0 and silently books US cost bases
+    ~42% light. (That is the AUD-vs-local mixup this codebase keeps hitting.)
+
+    The account-level identity is what carries the rate: `gross_positions_aud`
+    IS genuine AUD, so once the AUD positions are subtracted the residual is
+    the foreign block's AUD value. Requires exactly ONE foreign currency to be
+    unambiguous — the universe is AUD + USD, and if a third ever appears this
+    returns {} rather than guessing.
+    """
+    out = {"AUD": 1.0}
+    snapshot = snapshot or {}
+    positions = snapshot.get("positions") or []
+    try:
+        gross_aud = float(snapshot.get("gross_positions_aud"))
+    except (TypeError, ValueError):
+        return out
+
+    aud_local = 0.0
+    foreign: dict = {}
+    for p in positions:
+        try:
+            local_val = float(p.get("units") or 0.0) * float(p.get("mark_local") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        ccy = str(p.get("currency") or "").upper()
+        if ccy == "AUD":
+            aud_local += local_val
+        elif ccy:
+            foreign[ccy] = foreign.get(ccy, 0.0) + local_val
+
+    if len(foreign) != 1:
+        return out
+    ccy, block = next(iter(foreign.items()))
+    if block <= 0:
+        return out
+    fx = (gross_aud - aud_local) / block
+    # A plausible-rate guard: a wrong FX corrupts a CGT cost base silently,
+    # so refuse rather than propagate a nonsense rate.
+    if 0.1 < fx < 10.0:
+        out[ccy] = fx
+    return out
+
+
 def _read_lots_from_path(xl_path, sheet="Lots") -> pd.DataFrame:
     """
     Lots sheet expected schema:
