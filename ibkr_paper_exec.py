@@ -78,6 +78,11 @@ LIMIT_COLLAR_PCT = 1.0
 FILLS_LOG_FILENAME = "ibkr_fills_log.jsonl"
 REC_LOG_FILENAME = "trade_recommendation_log.jsonl"
 DEFERRED_ORDERS_FILENAME = "deferred_orders.json"  # cash-deferred buys awaiting completion
+# Terminal verdicts already reported for pending orders, keyed by broker perm id.
+# Without this the same stale fills-log row is re-resolved every run, and once
+# its fill has been absorbed into the seed the units comparison flips FILLED ->
+# DID NOT FILL — telling the operator to re-place an order they already own.
+PENDING_WATCH_FILENAME = "pending_watch_resolved.json"
 
 # --- Guarded auto-completion of cash-deferred buys (2026-07-20) --------------
 # When a rebalance defers a buy (e.g. a US buy funded by US-sell proceeds while
@@ -1694,7 +1699,9 @@ def _run_reconcile_lots_mode(write: bool = False, email: bool = False) -> int:
     # Silence used to mean "nothing changed", which is indistinguishable from
     # "the step didn't run", and the outcome that needs action (the order
     # DIED unfilled) was the silent one.
-    watch = _pending_order_watch(_SCRIPT_DIR / FILLS_LOG_FILENAME, actions)
+    watch_path = _SCRIPT_DIR / PENDING_WATCH_FILENAME
+    watch = _pending_order_watch(_SCRIPT_DIR / FILLS_LOG_FILENAME, actions,
+                                 resolved=_load_resolved_watch(watch_path))
     if watch:
         print()
         print("  PENDING ORDER WATCH — orders logged qty_filled=0, resolved")
@@ -1707,6 +1714,8 @@ def _run_reconcile_lots_mode(write: bool = False, email: bool = False) -> int:
         print("\n[reconcile-lots] already reconciled — nothing to write.")
         if watch and email:
             _email_reconcile_outcome([], [], watch)
+            # Dispatched to a human — never re-derive it.
+            _mark_watch_resolved(watch_path, watch)
         return 0
 
     if not write:
@@ -1725,6 +1734,10 @@ def _run_reconcile_lots_mode(write: bool = False, email: bool = False) -> int:
     except Exception as e:
         print(f"[reconcile-lots][ERR] write failed ({e}); seed unchanged.")
         return 1
+
+    # Mark BEFORE emailing: the seed on disk now absorbs the fill, so these
+    # verdicts can no longer be re-derived correctly even if the mail fails.
+    _mark_watch_resolved(watch_path, watch)
 
     if email:
         _email_reconcile_outcome(changed, lost, watch)
@@ -1758,14 +1771,92 @@ def _session_has_closed(ticker: str, submitted_iso, now=None) -> bool:
     return now >= close
 
 
-def _pending_order_watch(fills_path, actions: list) -> list:
+def _watch_key(row: dict) -> str:
+    """Stable identity for a pending-order row.
+
+    ibkr_perm_id is the broker's own PERMANENT order id: unique per order and
+    stable across sessions, unlike order_id which restarts with the client
+    connection and would collide across days. Rows that predate perm_id logging
+    (or logged it as 0) fall back to the submission tuple, which is unique
+    within a batch and stable because those fields are never rewritten."""
+    try:
+        perm = int(row.get("ibkr_perm_id") or 0)
+    except (TypeError, ValueError):
+        perm = 0
+    if perm:
+        return f"perm:{perm}"
+    return "sub:{}|{}|{}|{}".format(
+        row.get("exec_timestamp"), str(row.get("ticker", "")).strip().upper(),
+        str(row.get("side", "")).strip().upper(),
+        int(float(row.get("qty_requested") or 0)))
+
+
+def _watch_is_terminal(verdict: str) -> bool:
+    """FILLED and DID NOT FILL are final — the order's session is over and the
+    answer cannot change. STILL WORKING and UNRESOLVED must be re-derived next
+    run: the first is waiting on a close, the second may yet gain a broker
+    position to compare against. Only terminal verdicts get marked."""
+    return str(verdict).startswith(("FILLED", "DID NOT FILL"))
+
+
+def _load_resolved_watch(path) -> dict:
+    """Read the resolved-verdict store. A missing or corrupt file reads as
+    empty: the cost is a repeated email, never a wrong verdict."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_resolved_watch(path, resolved: dict, keep: int = 500) -> None:
+    """Persist the store, newest `keep` entries. Non-fatal — a failed write
+    costs a duplicate report next run, not correctness."""
+    try:
+        if len(resolved) > keep:
+            resolved = dict(sorted(
+                resolved.items(),
+                key=lambda kv: str((kv[1] or {}).get("resolved_at", "")),
+                reverse=True)[:keep])
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(resolved, f, indent=2)
+    except OSError as e:
+        print(f"[reconcile-lots][WARN] could not persist pending-order "
+              f"verdicts ({e}); a resolved order may be re-reported.")
+
+
+def _mark_watch_resolved(path, watch: list) -> None:
+    """Record terminal verdicts so they are never re-derived. Call once the
+    verdict has been reported or the seed rewritten — after either, the units
+    comparison that produced it can no longer be trusted."""
+    terminal = [w for w in watch if _watch_is_terminal(w.get("verdict", ""))]
+    if not terminal:
+        return
+    resolved = _load_resolved_watch(path)
+    now = datetime.now().isoformat(timespec="seconds")
+    for w in terminal:
+        resolved[w["key"]] = {
+            "ticker": w["ticker"], "side": w["side"], "qty": w["qty"],
+            "verdict": w["verdict"], "batch": w["batch"], "resolved_at": now}
+    _save_resolved_watch(path, resolved)
+
+
+def _pending_order_watch(fills_path, actions: list, resolved=None) -> list:
     """Resolve the latest batch's unconfirmed orders against the reconcile.
 
     PURE-ish (one file read). An order logged qty_filled=0 either filled after
     the session died — in which case the reconcile moved that ticker's units —
     or it expired unfilled, in which case the units agree. DAY orders placed
     outside RTH die at the close of the next session and nothing retries them,
-    so 'did not fill' is the verdict that needs a human."""
+    so 'did not fill' is the verdict that needs a human.
+
+    `resolved` is the perm-id store of verdicts already reported. Rows in it are
+    skipped, because that units comparison is only meaningful BEFORE the fill is
+    absorbed into the seed — afterwards 'unchanged units' means 'already
+    accounted for', and re-deriving would flip FILLED into a bogus DID NOT FILL.
+    Each returned row carries its `key` so the caller can mark it."""
+    resolved = resolved or {}
     try:
         rows = []
         with open(fills_path, "r", encoding="utf-8") as f:
@@ -1790,6 +1881,9 @@ def _pending_order_watch(fills_path, actions: list) -> list:
     for r in batch:
         if float(r.get("qty_filled") or 0) > 0 or r.get("is_done"):
             continue
+        key = _watch_key(r)
+        if key in resolved:
+            continue
         tkr = str(r.get("ticker", "")).strip().upper()
         qty = int(float(r.get("qty_requested") or 0))
         a = by_tkr.get(tkr)
@@ -1810,7 +1904,8 @@ def _pending_order_watch(fills_path, actions: list) -> list:
         else:
             verdict = "UNRESOLVED — no broker position to compare against"
         out.append({"ticker": tkr, "side": str(r.get("side", "")),
-                    "qty": qty, "verdict": verdict, "batch": latest_ts})
+                    "qty": qty, "verdict": verdict, "batch": latest_ts,
+                    "key": key})
     return out
 
 

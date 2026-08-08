@@ -315,10 +315,10 @@ def test_unparseable_timestamp_still_gets_a_verdict():
     assert ex._session_has_closed("SMH", None)
 
 
-def _watch(tmp_path, rows, actions, now_row=None):
+def _watch(tmp_path, rows, actions, now_row=None, resolved=None):
     p = tmp_path / "fills.jsonl"
     p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
-    return ex._pending_order_watch(p, actions)
+    return ex._pending_order_watch(p, actions, resolved=resolved)
 
 
 def test_watch_reports_fill_when_units_moved(tmp_path):
@@ -363,3 +363,120 @@ def test_watch_ignores_rows_that_already_confirmed_a_fill(tmp_path):
 
 def test_watch_empty_when_no_fills_log(tmp_path):
     assert ex._pending_order_watch(tmp_path / "nope.jsonl", []) == []
+
+
+# --- perm-id resolution marker ------------------------------------------
+# The fills-log row for a post-session fill stays qty_filled=0 forever, so it
+# stays the "latest batch" and gets re-resolved every run. The units comparison
+# is only meaningful BEFORE the fill is absorbed into the seed; afterwards
+# "unchanged" means "already accounted for". Without a marker the verdict flips
+# FILLED -> DID NOT FILL and tells the operator to re-buy what they own.
+
+def _smh_row(ts, perm_id=634394398, order_id=97):
+    return {"exec_timestamp": ts, "ticker": "SMH", "side": "BUY",
+            "qty_requested": 31, "qty_filled": 0, "is_done": False,
+            "order_id": order_id, "ibkr_perm_id": perm_id}
+
+
+def test_watch_key_is_the_perm_id_not_the_session_order_id():
+    """order_id restarts with each client connection and would collide across
+    days; perm_id is the broker's permanent identity."""
+    a = _smh_row(MON_1300.isoformat(), order_id=97)
+    b = _smh_row(MON_1300.isoformat(), order_id=4)
+    assert ex._watch_key(a) == ex._watch_key(b) == "perm:634394398"
+
+
+def test_watch_key_falls_back_when_perm_id_missing_or_zero():
+    base = {"exec_timestamp": MON_1300.isoformat(), "ticker": "smh",
+            "side": "buy", "qty_requested": 31}
+    k = ex._watch_key(base)
+    assert k.startswith("sub:") and "SMH" in k and "BUY" in k
+    assert ex._watch_key({**base, "ibkr_perm_id": 0}) == k
+    assert ex._watch_key({**base, "ibkr_perm_id": None}) == k
+    # A different order in the same batch must not collide.
+    assert ex._watch_key({**base, "ticker": "VEA"}) != k
+
+
+def test_resolved_order_is_not_re_reported(tmp_path):
+    old = datetime(2026, 7, 20, 9, 35).isoformat()
+    rows = [_smh_row(old)]
+    actions = [{"ticker": "SMH", "action": "ok", "units": 0, "detail": ""}]
+    assert _watch(tmp_path, rows, actions)[0]["verdict"].startswith("DID NOT")
+    assert _watch(tmp_path, rows, actions,
+                  resolved={"perm:634394398": {"verdict": "x"}}) == []
+
+
+def test_absorbed_fill_never_flips_to_did_not_fill(tmp_path):
+    """THE regression (SMH order 97, 2026-08-03). Day 1 the reconcile moves the
+    units and reports FILLED. Day 2 the book already matches, so the same stale
+    row would re-derive as DID NOT FILL — a false alarm inviting a double buy.
+    Once marked, day 2 says nothing."""
+    store = tmp_path / "resolved.json"
+    rows = [_smh_row(MON_1300.isoformat())]
+
+    day1 = _watch(tmp_path, rows,
+                  [{"ticker": "SMH", "action": "added", "units": 31,
+                    "detail": ""}],
+                  resolved=ex._load_resolved_watch(store))
+    assert day1[0]["verdict"].startswith("FILLED")
+    ex._mark_watch_resolved(store, day1)
+
+    day2 = _watch(tmp_path, rows,
+                  [{"ticker": "SMH", "action": "ok", "units": 0, "detail": ""}],
+                  resolved=ex._load_resolved_watch(store))
+    assert day2 == []
+
+    saved = json.loads(store.read_text(encoding="utf-8"))
+    assert saved["perm:634394398"]["verdict"].startswith("FILLED")
+    assert saved["perm:634394398"]["resolved_at"]
+
+
+def test_non_terminal_verdicts_are_never_marked(tmp_path):
+    """STILL WORKING is waiting on a close and UNRESOLVED may yet gain a
+    position to compare against — marking either would bury a live order."""
+    store = tmp_path / "resolved.json"
+    ex._mark_watch_resolved(store, [
+        {"ticker": "SMH", "side": "BUY", "qty": 31, "batch": "b", "key": "k1",
+         "verdict": "STILL WORKING — its market has not closed"},
+        {"ticker": "VEA", "side": "BUY", "qty": 19, "batch": "b", "key": "k2",
+         "verdict": "UNRESOLVED — no broker position to compare against"}])
+    assert not store.exists()
+    assert ex._load_resolved_watch(store) == {}
+
+
+def test_did_not_fill_is_reported_once_then_marked(tmp_path):
+    store = tmp_path / "resolved.json"
+    old = datetime(2026, 7, 20, 9, 35).isoformat()
+    rows = [_smh_row(old)]
+    actions = [{"ticker": "SMH", "action": "ok", "units": 0, "detail": ""}]
+    first = _watch(tmp_path, rows, actions,
+                   resolved=ex._load_resolved_watch(store))
+    assert first[0]["verdict"].startswith("DID NOT FILL")
+    ex._mark_watch_resolved(store, first)
+    assert _watch(tmp_path, rows, actions,
+                  resolved=ex._load_resolved_watch(store)) == []
+
+
+def test_corrupt_or_missing_store_reads_empty_not_fatal(tmp_path):
+    """Fail toward re-reporting: a duplicate email is recoverable, a swallowed
+    non-fill is not."""
+    assert ex._load_resolved_watch(tmp_path / "nope.json") == {}
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert ex._load_resolved_watch(bad) == {}
+    notdict = tmp_path / "list.json"
+    notdict.write_text("[1, 2]", encoding="utf-8")
+    assert ex._load_resolved_watch(notdict) == {}
+
+
+def test_store_is_pruned_to_newest_entries(tmp_path):
+    store = tmp_path / "resolved.json"
+    entries = {f"perm:{i}": {"verdict": "FILLED", "resolved_at":
+                             f"2026-08-{(i % 28) + 1:02d}T09:00:00"}
+               for i in range(12)}
+    ex._save_resolved_watch(store, dict(entries), keep=5)
+    kept = json.loads(store.read_text(encoding="utf-8"))
+    assert len(kept) == 5
+    newest = sorted(entries.items(), key=lambda kv: kv[1]["resolved_at"],
+                    reverse=True)[:5]
+    assert set(kept) == {k for k, _ in newest}
