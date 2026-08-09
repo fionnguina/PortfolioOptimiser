@@ -35,7 +35,21 @@ $FlagPaths  = @(
     (Join-Path $ScriptDir "dist\engine_done.flag")
 )
 $LogPath    = Join-Path $ScriptDir "evidence_run.log"
-$TimeoutSec = 2400   # 40min — generous; the sweep runs ~25min and nothing waits
+# The budget is AWAKE seconds, not wall clock. Start-Sleep is suspended along
+# with the machine, so a laptop that sleeps at 18:03 and wakes at 09:59 used to
+# come back to "TIMEOUT after 57559s" and kill an engine that had barely run
+# (observed 2026-08-07 — that evening's evidence sample was lost). Sleep is now
+# measured and excluded.
+$TimeoutSec = 2400   # 40min AWAKE — generous; the sweep runs ~25min
+# But sleep is forgiven only so far: a resumed run must never still be going at
+# 09:30 when daily_auto starts its own engine — two of them contend for Excel
+# COM and the dist/ lock. 18:00 + 11h = 05:00 leaves clear air.
+$WallCeilingSec   = 39600
+$SuspendGapSec    = 60    # an inter-tick gap this far past the 5s we asked for
+                          # is the machine sleeping, not the engine working
+$SentinelGraceSec = 120   # post-sentinel the engine has DONE its work and is
+                          # only releasing child handles; the old 5s expired
+                          # first and logged every clean run as a TIMEOUT
 
 function Write-Log {
     param([string]$Msg)
@@ -68,27 +82,63 @@ try {
     Write-Log "Engine launch threw: $($_.Exception.Message)"
     exit 2
 }
-Write-Log "Engine launched (PID=$($proc.Id)); awaiting sentinel or exit (timeout ${TimeoutSec}s)."
+Write-Log ("Engine launched (PID=$($proc.Id)); awaiting sentinel or exit " +
+           "(${TimeoutSec}s awake budget, ${WallCeilingSec}s wall ceiling).")
 
-$deadline = $start.AddSeconds($TimeoutSec)
 $sentinel = $false
-while ((Get-Date) -lt $deadline) {
+$awake    = 0.0
+$slept    = 0.0
+$lastTick = Get-Date
+while ($true) {
     foreach ($fp in $FlagPaths) {
         if ((Test-Path $fp) -and ((Get-Item $fp).LastWriteTime -ge $start)) { $sentinel = $true; break }
     }
     if ($sentinel) { break }
     if ($proc.HasExited) { break }
+    if ($awake -ge $TimeoutSec) { break }
+    if (((Get-Date) - $start).TotalSeconds -ge $WallCeilingSec) { break }
     Start-Sleep -Seconds 5
+    $now = Get-Date
+    $gap = ($now - $lastTick).TotalSeconds
+    $lastTick = $now
+    if ($gap -gt $SuspendGapSec) { $slept += $gap } else { $awake += $gap }
 }
-if (-not $proc.HasExited) { [void]$proc.WaitForExit(5000) }
 
-$elapsed = [int]((Get-Date) - $start).TotalSeconds
+# A fired sentinel means the engine finished its work and is only tearing down
+# child handles — give it real time. No sentinel means it is genuinely stuck and
+# there is nothing to wait for.
+if (-not $proc.HasExited) {
+    if ($sentinel) { $graceMs = $SentinelGraceSec * 1000 } else { $graceMs = 5000 }
+    [void]$proc.WaitForExit($graceMs)
+}
+
+$wall      = [int]((Get-Date) - $start).TotalSeconds
+$awakeSec  = [int]$awake
+$sleptSec  = [int]$slept
+$sleptNote = ""
+if ($sleptSec -gt 0) { $sleptNote = " (+${sleptSec}s machine sleep, excluded)" }
+
 if ($proc.HasExited) {
-    Write-Log "Evidence run finished (exit=$($proc.ExitCode), sentinel=$sentinel) after ${elapsed}s."
+    Write-Log ("Evidence run finished (exit=$($proc.ExitCode), sentinel=$sentinel) " +
+               "after ${awakeSec}s awake / ${wall}s wall$sleptNote.")
 } else {
     # Kill the whole tree (multiprocessing workers) so it can't orphan and
-    # lock dist/ against the next build — the recurring 2026-07 gotcha.
-    Write-Log "Evidence run TIMEOUT after ${elapsed}s — killing process tree (PID=$($proc.Id))."
+    # lock dist/ against the next build — the recurring 2026-07 gotcha. The
+    # kill is the same in every branch; only the diagnosis differs, and it has
+    # to, because "finished but slow to reap" and "never ran" both used to read
+    # as TIMEOUT and were indistinguishable when triaging.
+    if ($sentinel) {
+        $why = ("COMPLETE (sentinel fired, evidence written) but still holding " +
+                "child handles after ${SentinelGraceSec}s grace — reaping tree")
+    } elseif ($wall -ge $WallCeilingSec) {
+        $why = ("ABANDONED — machine slept past the ${WallCeilingSec}s wall ceiling " +
+                "(${awakeSec}s awake / ${wall}s wall$sleptNote). NO evidence sample " +
+                "this run — reaping tree")
+    } else {
+        $why = ("HUNG — no sentinel after ${awakeSec}s awake$sleptNote. NO evidence " +
+                "sample this run — reaping tree")
+    }
+    Write-Log "Evidence run $why (PID=$($proc.Id))."
     try { & taskkill /PID $proc.Id /T /F 2>$null | Out-Null; Write-Log "Process tree killed." }
     catch { Write-Log "taskkill failed: $($_.Exception.Message)" }
 }
