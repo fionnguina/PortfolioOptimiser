@@ -7387,6 +7387,9 @@ if USE_XLWINGS:
                       f"n_trades={_n_trades}")
                 globals()["REBAL_TRIGGER_VERDICT"] = _verdict
                 globals()["REBAL_TRIGGER_SUMMED_DW"] = _summed_abs_dw
+                # Stamped into the recommendation log below so the executor can
+                # refuse a plan the engine gated, and SAY WHY.
+                globals()["REBAL_TRIGGER_SKIP_REASON"] = _skip_why
                 # Broker-vs-engine mark reconciliation (READ-ONLY, informs
                 # nothing downstream — the verdict above is already final).
                 # Uses the latest --snapshot-nav row if it's fresh (<3 days):
@@ -7407,6 +7410,8 @@ if USE_XLWINGS:
                 print(f"[rebal-trigger] verdict computation failed: {_e_rebal_trig}")
                 globals()["REBAL_TRIGGER_VERDICT"] = "UNKNOWN"
                 globals()["REBAL_TRIGGER_SUMMED_DW"] = float("nan")
+                globals()["REBAL_TRIGGER_SKIP_REASON"] = (
+                    f"verdict computation failed: {_e_rebal_trig}")
 
             # Persist labels/weights for PPT + achieved-tilts table
             globals()["TRADEPLAN_LABEL"] = _tp_mode
@@ -7497,6 +7502,12 @@ if USE_XLWINGS:
                     cgt_mtr=float(CGT_CONFIG.get("marginal_tax_rate", 0.30)),
                     universe_size=int(len(w_tradeplan)),
                     tlh_events=globals().get("LIVE_TLH_EVENTS", []) or [],
+                    # Absent globals mean the verdict block never ran (a mode
+                    # that skips it, or it raised) — UNKNOWN, not approval.
+                    verdict=str(globals().get("REBAL_TRIGGER_VERDICT")
+                                or "UNKNOWN"),
+                    skip_reason=str(globals().get("REBAL_TRIGGER_SKIP_REASON")
+                                    or ""),
                 )
             except Exception as _e_drift:
                 print(f"[drift] recommendation log skipped: {_e_drift}")

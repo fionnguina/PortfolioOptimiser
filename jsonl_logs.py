@@ -48,12 +48,22 @@ def append_trade_recommendation_log(
     cgt_mtr: float,
     universe_size: int,
     tlh_events: list[dict] | None = None,
+    verdict: str = "UNKNOWN",
+    skip_reason: str = "",
 ) -> None:
     """Append one JSONL entry recording the engine's current recommendation.
 
     Foundation for the live vs backtest drift tracker (Tier-1 #3). Each run
     appends one line. Once trading starts, a separate sheet of actual fills
     will be joined against this log to compute slippage + adherence.
+
+    verdict / skip_reason: the [rebal-trigger] decision this plan was born
+    under. Recorded because the plan and the permission to execute it must
+    travel TOGETHER. They used to live in different places — the trades here,
+    the verdict only as a line in run.log that daily_auto.ps1 grepped — so a
+    human running `--execute` by hand submitted whatever was in the file with
+    no idea the engine had said SKIP. Defaults to UNKNOWN so an entry written
+    by an older engine is treated as unproven rather than approved.
 
     tlh_events (optional): list of TLH swap dicts from _run_tlh_pass on the
     live lot book. When non-empty, the rebalance delta in recommended_trades
@@ -65,6 +75,8 @@ def append_trade_recommendation_log(
     entry = {
         "run_at": pd.Timestamp.now().isoformat(timespec="seconds"),
         "selected_mode": str(selected_mode),
+        "verdict": str(verdict or "UNKNOWN"),
+        "skip_reason": str(skip_reason or ""),
         "broker": str(broker_name),
         "cgt_mtr": float(cgt_mtr),
         "portfolio_value_aud": float(portfolio_value_aud),

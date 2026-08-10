@@ -1771,6 +1771,69 @@ def _session_has_closed(ticker: str, submitted_iso, now=None) -> bool:
     return now >= close
 
 
+def _verdict_gate(rec_entry: dict, *, execute: bool, override: str = "") -> tuple:
+    """Decide whether this plan is CLEARED to be submitted. Returns (ok, lines).
+
+    The [rebal-trigger] verdict is the engine's decision about whether to trade
+    at all — drift over threshold AND the 6W cadence satisfied. It used to exist
+    only as a line in run.log that daily_auto.ps1 grepped, which meant the
+    automated path was gated and the manual path was not: running `--execute` by
+    hand submitted whatever was in the rec log. On 2026-08-10 that was 8 trades
+    and $71k of volume the engine had gated as within-cadence.
+
+    So the gate moves next to the money. RUN clears. SKIP refuses and says why.
+    A plan with no verdict at all (written by an engine predating the stamp) is
+    UNKNOWN, which also refuses — an unproven plan is not an approved one, and
+    the cost of being wrong is asymmetric.
+
+    PREVIEW is never blocked: reading the plan is how you decide. Only actual
+    submission is gated, so `--execute` is the trigger.
+
+    override is the deliberate escape hatch. It does not suppress the finding —
+    the reason is echoed and lands in the fills log context, because overriding
+    a gate silently is how gates stop meaning anything.
+
+    COVERAGE (check this if the mode dispatch in main() is ever reordered):
+      --execute        gated — the manual path this was written for.
+      --auto-execute   gated — it sets args.execute=True before the dispatch,
+                       so the unattended wrapper path lands here too.
+      --shadow-execute NOT gated; returns earlier and places no orders. Its job
+                       is to report what WOULD happen.
+      --complete-deferred  NOT gated; returns earlier. A deferred buy belongs to
+                       an OLDER plan that was already cleared, so judging it
+                       against today's verdict would block a legitimate leg."""
+    verdict = str((rec_entry or {}).get("verdict") or "UNKNOWN").upper()
+    reason = str((rec_entry or {}).get("skip_reason") or "").strip()
+    run_at = (rec_entry or {}).get("run_at", "?")
+    lines = []
+
+    if verdict == "RUN":
+        return (True, [f"[exec] verdict gate: RUN (plan @ {run_at}) — cleared."])
+
+    detail = f"verdict={verdict}" + (f", {reason}" if reason else "")
+    if verdict == "UNKNOWN":
+        detail += (" — this entry predates verdict stamping, or the engine's "
+                   "verdict step failed; re-run the engine to get a stamped plan")
+
+    if not execute:
+        lines.append(f"[exec] verdict gate: {detail}.")
+        lines.append("[exec] PREVIEW is not gated; --execute would REFUSE this plan.")
+        return (True, lines)
+
+    if override:
+        lines.append(f"[exec][OVERRIDE] verdict gate bypassed: {detail}.")
+        lines.append(f"[exec][OVERRIDE] operator reason: {override}")
+        lines.append("[exec][OVERRIDE] proceeding against the engine's decision.")
+        return (True, lines)
+
+    lines.append(f"[exec] REFUSING TO EXECUTE — {detail}.")
+    lines.append(f"[exec]   plan @ {run_at}")
+    lines.append("[exec]   The engine did not clear this plan for execution. Re-run "
+                 "the engine for a fresh verdict, or, if you intend to trade")
+    lines.append("[exec]   anyway, re-run with: --override-verdict \"<why>\"")
+    return (False, lines)
+
+
 def _watch_key(row: dict) -> str:
     """Stable identity for a pending-order row.
 
@@ -2466,6 +2529,13 @@ def main() -> int:
                         help="Override the broker-truth pre-trade validation gate "
                              "(reconciliation / no-short / turnover / cash). Only "
                              "use for a deliberate manual correction you understand.")
+    parser.add_argument("--override-verdict", type=str, default="", metavar="REASON",
+                        help="Execute a plan the engine did NOT clear (verdict "
+                             "SKIP or UNKNOWN). Requires a written reason, which "
+                             "is echoed to the log. Separate from "
+                             "--skip-validation: that overrides the broker-truth "
+                             "safety checks, this overrides the decision to trade "
+                             "at all.")
     parser.add_argument("--check-fills", action="store_true",
                         help="Read the most recent batch from ibkr_fills_log.jsonl, "
                              "query IBKR for the current status of each orderId, "
@@ -2665,6 +2735,16 @@ def main() -> int:
     if not trades_recs:
         print("[exec] latest run has no recommended_trades. Nothing to do.")
         return 0
+
+    # Gate BEFORE contracts, connection or preview work: if the engine did not
+    # clear this plan there is nothing further worth doing.
+    _gate_ok, _gate_lines = _verdict_gate(
+        rec_entry, execute=bool(args.execute),
+        override=str(args.override_verdict or ""))
+    for _l in _gate_lines:
+        print(_l)
+    if not _gate_ok:
+        return 3
 
     # --only-tickers filter: keep only the requested tickers from the rec
     # log so we can retry specific orders (e.g. after a permission rejection
