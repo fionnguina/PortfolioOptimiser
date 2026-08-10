@@ -317,10 +317,27 @@ def _ref_local_price(ib, contract) -> "float | None":
     fallback is what makes a US name priceable during an ASX-hours run (US market
     shut → no top-of-book quote); without it US legs are silently dropped. Mirrors
     the --flatten pricing chain. Returns None only if BOTH sources fail."""
+    return _ref_local_price_sourced(ib, contract)[0]
+
+
+def _ref_local_price_sourced(ib, contract) -> tuple:
+    """As _ref_local_price, but returns (price, source) where source is
+    'live' | 'hist' | None.
+
+    The caller usually does not care. The US-session re-pricing pass DOES: its
+    whole premise is re-solving units against a LIVE price, and this account has
+    no US real-time market-data subscription (verified 2026-07-30 — reqTickers
+    on SMH/PDBC/VEA returns Error 10089/10168), so the live leg returns None for
+    US names and the HMDS fallback quietly supplies a historical bar instead.
+    That degradation is invisible in the price alone, which is exactly why it
+    has to be reported rather than assumed."""
     ref = _current_local_price(ib, contract)
-    if ref is None or ref <= 0:
-        ref = _last_close_via_history(ib, contract)
-    return ref if (ref is not None and ref > 0) else None
+    if ref is not None and ref > 0:
+        return (ref, "live")
+    ref = _last_close_via_history(ib, contract)
+    if ref is not None and ref > 0:
+        return (ref, "hist")
+    return (None, None)
 
 
 def _marketable_limit_price(ref_local: float, side: str, collar_pct: float) -> float:
@@ -3098,10 +3115,11 @@ def main() -> int:
         # the same dict objects back trades_recs, so the validation gate and the
         # fills log see exactly what gets submitted, not the morning's numbers.
         if args.reprice_to_targets and plan:
-            _prices_aud, _sigma, _fx_missing = {}, {}, []
+            _prices_aud, _sigma, _fx_missing, _src = {}, {}, [], {}
             for _rec, _c, _o in plan:
                 _tk = _rec["ticker"]
-                _pl = _ref_local_price(ib, _c)
+                _pl, _psrc = _ref_local_price_sourced(ib, _c)
+                _src[_tk] = _psrc
                 _fx = _fx_local_to_aud(ib, getattr(_c, "currency", "AUD"))
                 if _pl and _fx:
                     _prices_aud[_tk] = float(_pl) * float(_fx)
@@ -3113,6 +3131,18 @@ def main() -> int:
             if _fx_missing:
                 print(f"[exec][WARN] no FX rate for {sorted(set(_fx_missing))} — "
                       f"those legs cannot be re-sized and are dropped.")
+            # Say plainly which price each leg was re-solved against. A 'hist'
+            # source during the venue's own session means there is no real-time
+            # subscription for it, so this pass is re-solving against a stale
+            # bar and delivers far less than it appears to.
+            _stale = sorted(t for t, s in _src.items() if s == "hist")
+            print("[exec][reprice] price source: "
+                  + ", ".join(f"{t}={s or 'none'}" for t, s in sorted(_src.items())))
+            if _stale:
+                print(f"[exec][WARN] {len(_stale)} leg(s) re-solved against a "
+                      f"HISTORICAL bar, not a live quote: {_stale}. No real-time "
+                      f"market data for that venue — re-pricing is degraded and "
+                      f"the limit collar is set off a stale reference.")
             if _sigma:
                 print("[exec][reprice] daily vol: "
                       + ", ".join(f"{k} {v*100:.1f}%"
