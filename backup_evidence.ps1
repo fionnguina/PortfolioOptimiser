@@ -33,6 +33,7 @@ $files = @(
     "ibkr_nav_log.jsonl",              # REAL broker NAV record
     "ibkr_fills_log.jsonl",            # executed fills since seed
     "pending_watch_resolved.json",     # settled verdicts for qty_filled=0 orders
+    "run_ledger.jsonl",                # which scheduled jobs actually ran
     "trade_recommendation_log.jsonl",  # every engine recommendation
     "lots_seed.json",                  # lot book seed
     "portfolio_state.json",            # NAV / net-invested state

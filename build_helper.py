@@ -94,6 +94,19 @@ def _free_dist_exe(root: Path) -> None:
         )
 
 
+# Tracked files the ENGINE rewrites on every run. They are checked in on
+# purpose — lots_seed is the CGT lot book and portfolio_state drives OOS
+# starting NAV, so losing them loses history — but they are not code, and
+# counting them as drift is what made "-dirty" meaningless. Keep this list
+# tight: anything added here stops being able to make a build dirty.
+RUNTIME_STATE = {
+    "lots_seed.json",
+    "portfolio_state.json",
+    "pending_watch_resolved.json",
+    "Stock Analysis.xlsm",
+}
+
+
 def _write_version_file(root: Path) -> tuple[str, str]:
     """Write _version.py with git SHA + build timestamp. Returns (sha, ts)."""
     import datetime
@@ -103,16 +116,34 @@ def _write_version_file(root: Path) -> tuple[str, str]:
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=str(root), stderr=subprocess.DEVNULL
         ).decode("utf-8").strip()
-        # Mark dirty if the tree differs from HEAD. Use `diff --quiet HEAD`, NOT
-        # bare `diff --quiet`: the latter compares tree-vs-INDEX only, so a
-        # `git add`-ed-but-uncommitted change reports clean and the exe gets
-        # stamped as matching a clean sha while actually containing staged,
-        # never-committed edits — silently defeating the [build] drift check.
-        dirty = subprocess.call(
-            ["git", "diff", "--quiet", "HEAD"], cwd=str(root)
-        ) != 0
-        if dirty:
+        # Mark dirty if the tree differs from HEAD. Use `diff HEAD`, NOT bare
+        # `diff`: the latter compares tree-vs-INDEX only, so a `git add`-ed-but-
+        # uncommitted change reports clean and the exe gets stamped as matching
+        # a clean sha while actually containing staged, never-committed edits —
+        # silently defeating the [build] drift check.
+        #
+        # But RUNTIME_STATE is excluded, because those tracked files are
+        # rewritten by every engine run. With them counted, the tree was never
+        # clean and EVERY build stamped "-dirty" — so the marker carried no
+        # information and "is my exe stale?" became a manual diff every time
+        # (2026-08-10). Dirty now means CODE drift, which is the only kind that
+        # changes what the binary does.
+        changed = subprocess.check_output(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=str(root), stderr=subprocess.DEVNULL
+        ).decode("utf-8", errors="replace").splitlines()
+        code_changed = sorted(
+            f for f in (c.strip() for c in changed)
+            if f and f not in RUNTIME_STATE
+        )
+        if code_changed:
             sha += "-dirty"
+            print(f"[build][WARN] stamping {sha} — {len(code_changed)} "
+                  f"uncommitted code file(s); this exe maps to no commit:")
+            for f in code_changed[:10]:
+                print(f"[build][WARN]     {f}")
+            if len(code_changed) > 10:
+                print(f"[build][WARN]     ... and {len(code_changed) - 10} more")
     except Exception:
         pass
     ts = datetime.datetime.now().isoformat(timespec="seconds")

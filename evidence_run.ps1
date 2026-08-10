@@ -64,6 +64,21 @@ if (-not (Test-Path $ExePath)) {
 }
 
 Write-Log "Starting evening evidence run (SCALE_SENSITIVITY=1)."
+
+# Block idle sleep for the run. The awake-budget logic below DIAGNOSES a slept
+# machine; this is what PREVENTS it. Non-fatal — a run that can't hold the
+# machine up is still worth attempting, it just risks the ABANDONED path.
+$PowerHelper = Join-Path $ScriptDir "ops_power.ps1"
+$SleepHeld = $false
+if (Test-Path $PowerHelper) {
+    . $PowerHelper
+    $SleepHeld = Suspend-IdleSleep
+    if ($SleepHeld) { Write-Log "Idle sleep blocked for the duration of this run." }
+    else { Write-Log "WARN: could not block idle sleep; a nap may cost this sample." }
+} else {
+    Write-Log "WARN: ops_power.ps1 not found; idle sleep NOT blocked."
+}
+
 foreach ($fp in $FlagPaths) {
     if (Test-Path $fp) { Remove-Item $fp -Force -ErrorAction SilentlyContinue }
 }
@@ -119,8 +134,9 @@ $sleptNote = ""
 if ($sleptSec -gt 0) { $sleptNote = " (+${sleptSec}s machine sleep, excluded)" }
 
 if ($proc.HasExited) {
-    Write-Log ("Evidence run finished (exit=$($proc.ExitCode), sentinel=$sentinel) " +
-               "after ${awakeSec}s awake / ${wall}s wall$sleptNote.")
+    $why = "finished (exit=$($proc.ExitCode), sentinel=$sentinel)"
+    $outcome = "ok"
+    Write-Log ("Evidence run $why after ${awakeSec}s awake / ${wall}s wall$sleptNote.")
 } else {
     # Kill the whole tree (multiprocessing workers) so it can't orphan and
     # lock dist/ against the next build — the recurring 2026-07 gotcha. The
@@ -128,13 +144,19 @@ if ($proc.HasExited) {
     # to, because "finished but slow to reap" and "never ran" both used to read
     # as TIMEOUT and were indistinguishable when triaging.
     if ($sentinel) {
+        # The evidence WAS written — this is a success that reaped slowly, and
+        # the ledger must not record it as a failure or the heartbeat cries
+        # wolf on a run that did its job.
+        $outcome = "ok"
         $why = ("COMPLETE (sentinel fired, evidence written) but still holding " +
                 "child handles after ${SentinelGraceSec}s grace — reaping tree")
     } elseif ($wall -ge $WallCeilingSec) {
+        $outcome = "fail"
         $why = ("ABANDONED — machine slept past the ${WallCeilingSec}s wall ceiling " +
                 "(${awakeSec}s awake / ${wall}s wall$sleptNote). NO evidence sample " +
                 "this run — reaping tree")
     } else {
+        $outcome = "fail"
         $why = ("HUNG — no sentinel after ${awakeSec}s awake$sleptNote. NO evidence " +
                 "sample this run — reaping tree")
     }
@@ -142,5 +164,17 @@ if ($proc.HasExited) {
     try { & taskkill /PID $proc.Id /T /F 2>$null | Out-Null; Write-Log "Process tree killed." }
     catch { Write-Log "taskkill failed: $($_.Exception.Message)" }
 }
+# Stamp the run ledger so a missing evening run becomes visible tomorrow
+# morning instead of being indistinguishable from a healthy quiet night.
+# No --check here: the 09:30/10:20 run owns the reporting.
+try {
+    $opsPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $opsScript = Join-Path $ScriptDir "ops_assertions.py"
+    if ((Test-Path $opsPy) -and (Test-Path $opsScript)) {
+        & $opsPy $opsScript --record evidence_run --outcome $outcome --detail $why | Out-Null
+    }
+} catch { Write-Log "Ledger stamp failed (non-fatal): $($_.Exception.Message)" }
+
+if ($SleepHeld) { Resume-IdleSleep }
 Write-Log "Done."
 exit 0

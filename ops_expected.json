@@ -1,0 +1,73 @@
+{
+  "_README": [
+    "Declared INTENT for the live pipeline. ops_assertions.py --check compares",
+    "the running system against this file and reports every disagreement.",
+    "This file is the source of truth: if reality is right and this is wrong,",
+    "change this file deliberately — do not let the two silently diverge,",
+    "which is the exact failure it exists to catch."
+  ],
+
+  "scheduled_tasks": {
+    "Portfolio Optimiser Daily": {
+      "_why": "10:20 is LOAD-BEARING (daily_auto.ps1 .NOTES, 2026-08-03): at 09:30 the run fires before the ASX opens, so --wait-for-funds expires and the largest buy defers every rebalance.",
+      "start_time": "10:20",
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+      "must_be_enabled": true
+    },
+    "Portfolio Optimiser Evidence": {
+      "_why": "Evening scale-sensitivity sweep; must run AFTER any morning execution.",
+      "start_time": "18:00",
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+      "must_be_enabled": true
+    }
+  },
+
+  "jobs": {
+    "daily_auto": {
+      "start_time": "10:20",
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+      "grace_minutes": 120
+    },
+    "evidence_run": {
+      "start_time": "18:00",
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+      "grace_minutes": 180
+    }
+  },
+
+  "required_files": [
+    "lots_seed.json",
+    "portfolio_state.json",
+    "ibkr_nav_log.jsonl",
+    "trade_recommendation_log.jsonl",
+    "pending_watch_resolved.json",
+    "tlh_pairs.json"
+  ],
+
+  "exe": {
+    "_why": "engine_sources are the files COMPILED INTO the binary. ibkr_paper_exec.py is deliberately absent: it runs from source, so editing it must not flag the exe as stale.",
+    "path": "dist/Portfolio Optimiser.exe",
+    "engine_sources": [
+      "Main.py",
+      "Portfolio_Optimiser.py",
+      "cgt.py",
+      "jsonl_logs.py",
+      "metrics.py",
+      "ensemble.py",
+      "tlh.py",
+      "brokerage.py",
+      "drift.py",
+      "factors.py",
+      "dialogs.py",
+      "solvers.py",
+      "lots.py",
+      "nav.py",
+      "excel_sheets.py",
+      "fx.py",
+      "ppt_utils.py",
+      "ppt_export.py",
+      "oos_engine.py",
+      "research_modes.py"
+    ]
+  }
+}

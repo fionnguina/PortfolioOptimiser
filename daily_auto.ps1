@@ -264,6 +264,19 @@ Write-Log "Starting daily auto run."
 Write-Log "  Engine: $ExePath"
 Write-Log "  Log:    $LogPath"
 
+# Block idle sleep for the whole run. This path can place ORDERS, so a machine
+# napping mid-run is worse here than in evidence_run.ps1: it can suspend
+# between submitting sells and re-reading funds. Non-fatal if unavailable.
+$PowerHelper = Join-Path $ScriptDir "ops_power.ps1"
+$SleepHeld = $false
+if (Test-Path $PowerHelper) {
+    . $PowerHelper
+    $SleepHeld = Suspend-IdleSleep
+    if (-not $SleepHeld) { Write-Log "WARN: could not block idle sleep for this run." }
+} else {
+    Write-Log "WARN: ops_power.ps1 not found; idle sleep NOT blocked."
+}
+
 # --- Ensure TWS is up before running the engine ---
 [void](Start-TwsIfNeeded)
 
@@ -844,5 +857,25 @@ try {
     Write-Log "Evidence backup failed (non-fatal): $($_.Exception.Message)"
 }
 
+# --- Ops ledger + assertions (2026-08-10) -----------------------------------
+# Stamp THIS run, then compare the whole pipeline against ops_expected.json.
+# Recording first means the check sees today as present and only reports what
+# is genuinely absent. Nothing here can fail the run — but silence from this
+# block is itself meaningful, so it logs either way.
+try {
+    $opsPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $opsScript = Join-Path $ScriptDir "ops_assertions.py"
+    if ((Test-Path $opsPy) -and (Test-Path $opsScript)) {
+        & $opsPy $opsScript --record daily_auto --outcome ok --detail "verdict=$verdict" | Out-Null
+        $opsOut = & $opsPy $opsScript --check --email 2>&1 | Select-Object -Last 10
+        Write-Log "Ops assertions: $opsOut"
+    } else {
+        Write-Log "Ops assertions skipped: ops_assertions.py or venv python not found."
+    }
+} catch {
+    Write-Log "Ops assertions failed (non-fatal): $($_.Exception.Message)"
+}
+
+if ($SleepHeld) { Resume-IdleSleep }
 Write-Log "Done."
 exit 0
