@@ -19,6 +19,12 @@
       "start_time": "18:00",
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
       "must_be_enabled": true
+    },
+    "Portfolio Optimiser US Session": {
+      "_why": "02:00 is the only clock time inside US RTH under all three AEST/AEDT x EDT/EST combinations, so it never needs seasonal adjustment. TUE-SAT because Monday's plan trades in the US session still open at 02:00 Tuesday, and Friday's at 02:00 Saturday.",
+      "start_time": "02:00",
+      "days": ["Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+      "must_be_enabled": true
     }
   },
 
@@ -32,6 +38,11 @@
       "start_time": "18:00",
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
       "grace_minutes": 180
+    },
+    "us_session": {
+      "start_time": "02:00",
+      "days": ["Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+      "grace_minutes": 120
     }
   },
 

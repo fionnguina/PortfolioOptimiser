@@ -276,6 +276,41 @@ def _last_close_via_history(ib, contract) -> "float | None":
     return None
 
 
+def _daily_vol_via_history(ib, contract, lookback: int = 40) -> "float | None":
+    """Fractional daily return vol from HMDS daily bars, or None.
+
+    Computed here rather than read off the engine's Sigma deliberately: Sigma is
+    annualised and lives in the frozen exe, so consuming it would couple this
+    guard to a rebuild AND to an annualisation convention that has to be got
+    right silently. Daily bars are unambiguous and come from the same
+    subscription-independent farm the price fallback already uses.
+
+    None means 'unknown' — the caller must NOT read that as 'no drift'."""
+    try:
+        bars = ib.reqHistoricalData(
+            contract, endDateTime="", durationStr=f"{int(lookback)} D",
+            barSizeSetting="1 day", whatToShow="TRADES",
+            useRTH=True, formatDate=1)
+        closes = []
+        for b in bars or []:
+            try:
+                px = float(b.close)
+                if px == px and px > 0:
+                    closes.append(px)
+            except (TypeError, ValueError):
+                continue
+        if len(closes) < 10:
+            return None
+        rets = [closes[i] / closes[i - 1] - 1.0 for i in range(1, len(closes))]
+        n = len(rets)
+        mean = sum(rets) / n
+        var = sum((r - mean) ** 2 for r in rets) / (n - 1)
+        sd = var ** 0.5
+        return sd if sd > 0 else None
+    except Exception:
+        return None
+
+
 def _ref_local_price(ib, contract) -> "float | None":
     """Local-ccy reference price with a subscription-independent fallback: live/
     delayed top-of-book first, then the last daily close from the HMDS farm. The
@@ -496,6 +531,52 @@ def validate_pre_trade(trades: list, assumed_positions: dict, broker_positions: 
                      f"— the feed is down; orders would sit unfilled. Not trading.")
 
     return (len(fails) == 0, fails)
+
+
+def _fx_local_to_aud(ib, currency: str) -> "float | None":
+    """Rate converting one unit of `currency` into AUD, or None.
+
+    Primary source is IBKR's own ExchangeRate tag, which is quoted to the
+    account's base (AUD). Fallback is the rate implied by the latest logged NAV
+    snapshot — the same account-identity derivation the lot reconcile trusts,
+    and deliberately NOT anything derived from mkt_value_base, which is local
+    currency despite its name and yields exactly 1.0 for USD rows.
+
+    Returns None rather than a guess: a wrong FX rate silently mis-sizes every
+    US leg, and refusing costs one skipped pass."""
+    ccy = str(currency or "").strip().upper()
+    if ccy in ("AUD", ""):
+        return 1.0
+    try:
+        for v in ib.accountValues():
+            if (str(getattr(v, "tag", "")) == "ExchangeRate"
+                    and str(getattr(v, "currency", "")).upper() == ccy):
+                r = float(v.value)
+                if 0.1 < r < 10.0:
+                    return r
+    except Exception:
+        pass
+    try:
+        from lots import derive_fx_from_snapshot
+        path = _SCRIPT_DIR / "ibkr_nav_log.jsonl"
+        snap = None
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        snap = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+        if snap:
+            r = float((derive_fx_from_snapshot(snap) or {}).get(ccy, 0) or 0)
+            if 0.1 < r < 10.0:
+                print(f"[exec][WARN] FX {ccy}->AUD from the last NAV snapshot "
+                      f"({r:.4f}); live ExchangeRate was unavailable.")
+                return r
+    except Exception:
+        pass
+    return None
 
 
 def _broker_positions(ib) -> dict:
@@ -1771,6 +1852,132 @@ def _session_has_closed(ticker: str, submitted_iso, now=None) -> bool:
     return now >= close
 
 
+def _venue_of(ticker: str) -> str:
+    """ASX for .AX, US for everything else. The universe is exactly two venues,
+    and they are NEVER open at the same time: ASX 10:00-16:00 AEST, US RTH
+    23:30-06:00 AEST. That disjointness is the whole reason a single daily run
+    cannot trade both well."""
+    return "ASX" if str(ticker).strip().upper().endswith(".AX") else "US"
+
+
+def _scope_open_orders(open_orders: dict, venue: str) -> dict:
+    """Narrow the open-order guard to one venue.
+
+    The guard exists to stop a new batch STACKING on working orders. Stacking is
+    per-instrument, and the two venues never trade simultaneously — so a leftover
+    ASX order must not veto the US pass hours later. Unscoped (venue falsy) it
+    returns everything, preserving single-pass behaviour exactly."""
+    if not venue:
+        return dict(open_orders or {})
+    return {k: v for k, v in (open_orders or {}).items()
+            if _venue_of(k) == str(venue).upper()}
+
+
+def _rederive_to_targets(target_weights: dict, current_units: dict,
+                         prices_aud: dict, nav_aud: float,
+                         approved: dict, *, sigma: dict = None,
+                         max_sigma: float = 3.0,
+                         min_trade_aud: float = 0.0,
+                         fallback_sigma: float = 0.02) -> tuple:
+    """Re-solve units so each leg hits its APPROVED WEIGHT at the LIVE price.
+
+    Returns (rows, findings).
+
+    WHY this and not the approved unit count: what the morning run approved is a
+    target WEIGHT vector; the unit count is just that weight divided by a price
+    which, for a US name priced off the previous close, is ~13h stale by the
+    time the US opens. Executing fixed units through a 5% gap-up overshoots the
+    target twice — the existing holding is worth more AND the same unit count
+    costs more. Re-solving is also self-financing: a gap up means proportionally
+    fewer units, so the AUD spend stays roughly flat and the cash budget holds.
+
+    This is NOT re-optimising. target_weights are frozen from the approved plan;
+    only the arithmetic that turns them into units is redone.
+
+    Three refusals, because self-correcting is not the same as always-correct:
+      - SIGN FLIP: if the re-derived trade reverses the approved direction, the
+        morning's decision is stale. Drop the leg; never reverse it silently.
+      - DRIFT: past max_sigma of the name's own overnight move, something
+        regime-changing happened. sigma is per-ticker fractional daily vol, so
+        2% on HBRD and 2% on SMH are not treated as the same event.
+      - UNPRICEABLE: no live price, no trade. Never size a leg blind.
+    """
+    rows, findings = [], []
+    sigma = sigma or {}
+    try:
+        nav = float(nav_aud)
+    except (TypeError, ValueError):
+        nav = 0.0
+    if not (nav > 0):
+        return ([], ["REPRICE ABORT: NAV unavailable or non-positive — cannot "
+                     "convert target weights into units."])
+
+    for tkr in sorted(prices_aud):
+        px = prices_aud.get(tkr)
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            px = 0.0
+        if not (px > 0):
+            findings.append(f"{tkr}: DROPPED — no usable live price.")
+            continue
+
+        w = float(target_weights.get(tkr, 0.0) or 0.0)
+        cur = float(current_units.get(tkr, 0.0) or 0.0)
+        appr = approved.get(tkr) or {}
+        appr_delta = int(float(appr.get("delta_units", 0) or 0))
+
+        # Drift: compare the live price against the one the plan was built on.
+        # An unknown vol falls back to a flat ceiling and SAYS SO — silently
+        # skipping the check would leave the guard permanently inert, which is
+        # indistinguishable from not having written it.
+        appr_px = float(appr.get("px_aud", 0) or 0)
+        sig = float(sigma.get(tkr, 0.0) or 0.0)
+        est = ""
+        if sig <= 0:
+            sig = float(fallback_sigma)
+            est = f" (vol unknown — flat {sig*100:.1f}%/day assumed)"
+        if appr_px > 0 and sig > 0:
+            move = abs(px / appr_px - 1.0)
+            if move > max_sigma * sig:
+                findings.append(
+                    f"{tkr}: DROPPED — moved {move*100:.1f}% since the plan "
+                    f"({max_sigma:g}x its {sig*100:.1f}% daily vol{est}); the "
+                    f"approved decision may no longer hold.")
+                continue
+        elif appr_px <= 0:
+            findings.append(f"{tkr}: drift UNCHECKED — the approved plan "
+                            f"recorded no reference price for it.")
+
+        delta = int(round((w * nav - cur * px) / px))
+        if delta == 0:
+            continue
+        if appr_delta and (delta > 0) != (appr_delta > 0):
+            findings.append(
+                f"{tkr}: DROPPED — re-derived trade ({delta:+d}u) reverses the "
+                f"approved direction ({appr_delta:+d}u); plan is stale.")
+            continue
+        value = abs(delta) * px
+        if min_trade_aud and value < float(min_trade_aud):
+            findings.append(f"{tkr}: skipped — ${value:,.0f} below the "
+                            f"${float(min_trade_aud):,.0f} minimum parcel.")
+            continue
+
+        rows.append({
+            "ticker": tkr,
+            "side": "buy" if delta > 0 else "sell",
+            "delta_units": delta,
+            "px_aud": round(px, 4),
+            "delta_value_aud": round(delta * px, 2),
+            # Carried from the approved plan: brokerage here is a fixed-minimum
+            # fee that a small unit change does not move, and it feeds the
+            # preview total only — never an order field.
+            "brokerage_aud": float(appr.get("brokerage_aud", 0.0) or 0.0),
+            "approved_delta_units": appr_delta,
+        })
+    return (rows, findings)
+
+
 def _verdict_gate(rec_entry: dict, *, execute: bool, override: str = "") -> tuple:
     """Decide whether this plan is CLEARED to be submitted. Returns (ok, lines).
 
@@ -2529,6 +2736,22 @@ def main() -> int:
                         help="Override the broker-truth pre-trade validation gate "
                              "(reconciliation / no-short / turnover / cash). Only "
                              "use for a deliberate manual correction you understand.")
+    parser.add_argument("--venue", type=str, default="", choices=["ASX", "US"],
+                        help="Trade only this venue's legs of the approved plan, "
+                             "and scope the open-order guard to it. The two "
+                             "venues are never open together, so each is best "
+                             "traded in its own session.")
+    parser.add_argument("--reprice-to-targets", action="store_true",
+                        help="Re-solve units from the plan's APPROVED TARGET "
+                             "WEIGHTS at live prices, instead of executing the "
+                             "approved unit counts. Use when executing a plan "
+                             "hours after it was built (the US pass). Requires "
+                             "live quotes — do NOT use while the venue is shut.")
+    parser.add_argument("--drift-sigma-max", type=float, default=3.0,
+                        metavar="N",
+                        help="With --reprice-to-targets: drop a leg that has "
+                             "moved more than N times its daily vol since the "
+                             "plan was built (default 3).")
     parser.add_argument("--override-verdict", type=str, default="", metavar="REASON",
                         help="Execute a plan the engine did NOT clear (verdict "
                              "SKIP or UNKNOWN). Requires a written reason, which "
@@ -2776,6 +2999,18 @@ def main() -> int:
         print("[exec] ib_insync not installed. Run: pip install ib_insync")
         return 1
 
+    # --venue filter: execute one venue's legs in its own session. Applied
+    # after --only-tickers so the two compose.
+    if args.venue:
+        _before = len(trades_recs)
+        trades_recs = [r for r in trades_recs
+                       if _venue_of(r["ticker"]) == args.venue]
+        print(f"[exec] --venue {args.venue}: {_before} -> {len(trades_recs)} "
+              f"leg(s). Kept: {[r['ticker'] for r in trades_recs]}")
+        if not trades_recs:
+            print(f"[exec] no {args.venue} legs in this plan. Nothing to do.")
+            return 0
+
     # === Build contracts + orders ===
     # Marketable LIMIT orders (lmtPrice set after connect+qualify, from the live
     # quote — see _price_orders_as_limits). LIMIT not MARKET so an unattended
@@ -2857,6 +3092,64 @@ def main() -> int:
                   f"and will be skipped: {', '.join(unqualified)}")
             plan = [(r, c, o) for (r, c, o) in plan if getattr(c, "conId", 0)]
 
+        # === Re-solve units from the approved TARGET WEIGHTS at live prices ===
+        # Runs after qualify (needs contracts) and BEFORE limit pricing, so the
+        # collar is applied to corrected quantities. Mutates each rec in place —
+        # the same dict objects back trades_recs, so the validation gate and the
+        # fills log see exactly what gets submitted, not the morning's numbers.
+        if args.reprice_to_targets and plan:
+            _prices_aud, _sigma, _fx_missing = {}, {}, []
+            for _rec, _c, _o in plan:
+                _tk = _rec["ticker"]
+                _pl = _ref_local_price(ib, _c)
+                _fx = _fx_local_to_aud(ib, getattr(_c, "currency", "AUD"))
+                if _pl and _fx:
+                    _prices_aud[_tk] = float(_pl) * float(_fx)
+                elif not _fx:
+                    _fx_missing.append(_tk)
+                _sv = _daily_vol_via_history(ib, _c)
+                if _sv:
+                    _sigma[_tk] = _sv
+            if _fx_missing:
+                print(f"[exec][WARN] no FX rate for {sorted(set(_fx_missing))} — "
+                      f"those legs cannot be re-sized and are dropped.")
+            if _sigma:
+                print("[exec][reprice] daily vol: "
+                      + ", ".join(f"{k} {v*100:.1f}%"
+                                  for k, v in sorted(_sigma.items())))
+            _approved = {r["ticker"]: dict(r) for r, _c, _o in plan}
+            _rows, _findings = _rederive_to_targets(
+                rec_entry.get("target_weights", {}) or {},
+                _broker_positions(ib),
+                _prices_aud,
+                _broker_net_liquidation_aud(ib),
+                _approved,
+                sigma=_sigma,
+                max_sigma=float(args.drift_sigma_max))
+            for _f in _findings:
+                print(f"[exec][reprice] {_f}")
+            _by_tkr = {r["ticker"]: r for r in _rows}
+            _new_plan = []
+            for _rec, _c, _o in plan:
+                _row = _by_tkr.get(_rec["ticker"])
+                if _row is None:
+                    continue
+                _was = int(_rec.get("delta_units", 0))
+                _rec.update(_row)
+                _o.action = "BUY" if _row["delta_units"] > 0 else "SELL"
+                _o.totalQuantity = abs(int(_row["delta_units"]))
+                if _was != _row["delta_units"]:
+                    print(f"[exec][reprice] {_rec['ticker']}: {_was:+d}u -> "
+                          f"{_row['delta_units']:+d}u at live "
+                          f"${_row['px_aud']:,.2f} (same target weight)")
+                _new_plan.append((_rec, _c, _o))
+            plan = _new_plan
+            # Validate exactly what will be submitted.
+            trades_recs = [r for r, _c, _o in plan]
+            if not plan:
+                print("[exec] no legs survived re-pricing. Nothing to submit.")
+                return 0
+
         # === Price the marketable LIMIT orders from live quotes ===
         # Sets each order.lmtPrice at the current touch ± LIMIT_COLLAR_PCT. An
         # order whose price can't be verified is DROPPED (never submit a limit
@@ -2913,7 +3206,11 @@ def main() -> int:
                 _val_trades, _assumed_pos, _broker_pos,
                 available_cash_aud=_available_funds_aud(ib),
                 nav_aud=_broker_net_liquidation_aud(ib),
-                open_orders=_broker_open_orders(ib),
+                # Scoped to the venue being traded: a leftover ASX order must
+                # not veto the US pass hours later, when the ASX is shut and
+                # that order can no longer stack with anything here.
+                open_orders=_scope_open_orders(_broker_open_orders(ib),
+                                               args.venue),
                 data_farm_broken=(not _df_ok), data_farm_reason=_df_reason)
         except Exception as _e_val:
             _val_errored = True
