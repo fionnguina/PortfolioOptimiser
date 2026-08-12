@@ -47,6 +47,41 @@ def test_missing_and_disabled_tasks_are_caught():
         {"T": {"start_time": "10:20", "must_be_enabled": True}})[0]
 
 
+def test_unquoted_script_path_is_caught():
+    """THE 2026-08-12 miss. The US Session task was registered with an UNQUOTED
+    -File path over a home directory containing a space. It fired correctly at
+    02:00 for two days, died at 0xFFFD0000 before writing a log, and passed
+    every time/day/enabled check. Only the heartbeat noticed, and only
+    indirectly."""
+    quoted = '"C:\\Users\\Fionn Guina\\Portfolio_Optimiser\\us_session_run.ps1"'
+    broken = ("powershell -ExecutionPolicy Bypass -File "
+              "C:\\Users\\Fionn Guina\\Portfolio_Optimiser\\us_session_run.ps1")
+    found = ops.check_task_schedule(
+        {"T": {"start_time": "02:00", "enabled": True, "days": None,
+               "action": broken}},
+        {"T": {"start_time": "02:00", "must_be_enabled": True,
+               "action_contains": quoted}})
+    assert len(found) == 1 and found[0].startswith("TASK ACTION")
+
+
+def test_correctly_quoted_action_passes():
+    quoted = '"C:\\Users\\Fionn Guina\\Portfolio_Optimiser\\us_session_run.ps1"'
+    ok = "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File " + quoted
+    assert ops.check_task_schedule(
+        {"T": {"start_time": "02:00", "enabled": True, "days": None,
+               "action": ok}},
+        {"T": {"start_time": "02:00", "must_be_enabled": True,
+               "action_contains": quoted}}) == []
+
+
+def test_action_is_only_checked_when_declared():
+    """Tasks that don't declare a command line keep passing on schedule alone."""
+    assert ops.check_task_schedule(
+        {"T": {"start_time": "02:00", "enabled": True, "days": None,
+               "action": "anything at all"}},
+        {"T": {"start_time": "02:00", "must_be_enabled": True}}) == []
+
+
 def test_day_set_drift_is_caught():
     found = ops.check_task_schedule(
         {"T": {"start_time": "10:20", "enabled": True,

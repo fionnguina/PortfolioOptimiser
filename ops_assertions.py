@@ -67,6 +67,17 @@ def check_task_schedule(actual: dict, expected: dict) -> list:
         if want_d and got_d is not None and sorted(want_d) != sorted(got_d):
             out.append(f"TASK DAYS: '{name}' runs {sorted(got_d)}, "
                        f"expected {sorted(want_d)}.")
+        # The command line matters as much as the schedule. On 2026-08-10 the US
+        # Session task was registered with an UNQUOTED -File path over a home
+        # directory containing a space; it fired correctly at 02:00 for two days,
+        # returned 0xFFFD0000 before the script could log anything, and passed
+        # every time/day check above. Declare the quoted path and the assertion
+        # names the cause instead of leaving the heartbeat to imply it.
+        want_a = want.get("action_contains")
+        got_a = str(got.get("action", "") or "")
+        if want_a and want_a not in got_a:
+            out.append(f"TASK ACTION: '{name}' command line does not contain "
+                       f"{want_a!r} — got {got_a!r}.")
     return out
 
 
@@ -233,7 +244,9 @@ def observe_scheduled_tasks(names: list) -> dict:
         "$dow = $null; if ($tr -and $tr.DaysOfWeek) { $m=@(); "
         "$names2=@('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'); "
         "for($i=0;$i -lt 7;$i++){ if ((([int]$tr.DaysOfWeek) -band [math]::Pow(2,$i)) -ne 0){ $m+=$names2[$i] } } $dow=$m }; "
-        "$out[$n]=@{ start_time=$hm; enabled=[bool]$t.Settings.Enabled; days=$dow } } }; "
+        "$ac = $t.Actions[0]; "
+        "$cmd = if ($ac) { (''+$ac.Execute+' '+$ac.Arguments).Trim() } else { '' }; "
+        "$out[$n]=@{ start_time=$hm; enabled=[bool]$t.Settings.Enabled; days=$dow; action=$cmd } } }; "
         "$out | ConvertTo-Json -Depth 5 -Compress"
     )
     try:

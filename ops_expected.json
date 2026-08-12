@@ -3,49 +3,86 @@
     "Declared INTENT for the live pipeline. ops_assertions.py --check compares",
     "the running system against this file and reports every disagreement.",
     "This file is the source of truth: if reality is right and this is wrong,",
-    "change this file deliberately — do not let the two silently diverge,",
+    "change this file deliberately \u2014 do not let the two silently diverge,",
     "which is the exact failure it exists to catch."
   ],
-
   "scheduled_tasks": {
     "Portfolio Optimiser Daily": {
       "_why": "10:20 is LOAD-BEARING (daily_auto.ps1 .NOTES, 2026-08-03): at 09:30 the run fires before the ASX opens, so --wait-for-funds expires and the largest buy defers every rebalance.",
       "start_time": "10:20",
-      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
-      "must_be_enabled": true
+      "days": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "must_be_enabled": true,
+      "action_contains": "\"C:\\Users\\Fionn Guina\\Portfolio_Optimiser\\daily_auto.ps1\""
     },
     "Portfolio Optimiser Evidence": {
       "_why": "Evening scale-sensitivity sweep; must run AFTER any morning execution.",
       "start_time": "18:00",
-      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
-      "must_be_enabled": true
+      "days": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "must_be_enabled": true,
+      "action_contains": "\"C:\\Users\\Fionn Guina\\Portfolio_Optimiser\\evidence_run.ps1\""
     },
     "Portfolio Optimiser US Session": {
       "_why": "02:00 is the only clock time inside US RTH under all three AEST/AEDT x EDT/EST combinations, so it never needs seasonal adjustment. TUE-SAT because Monday's plan trades in the US session still open at 02:00 Tuesday, and Friday's at 02:00 Saturday.",
       "start_time": "02:00",
-      "days": ["Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
-      "must_be_enabled": true
+      "days": [
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday"
+      ],
+      "must_be_enabled": true,
+      "action_contains": "\"C:\\Users\\Fionn Guina\\Portfolio_Optimiser\\us_session_run.ps1\"",
+      "_why_action": "The QUOTES are the assertion. Registered unquoted on 2026-08-10, this task fired at 02:00 for two days and died at 0xFFFD0000 before logging, because the home directory contains a space."
     }
   },
-
   "jobs": {
     "daily_auto": {
       "start_time": "10:20",
-      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+      "days": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
       "grace_minutes": 120
     },
     "evidence_run": {
       "start_time": "18:00",
-      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+      "days": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
       "grace_minutes": 180
     },
     "us_session": {
       "start_time": "02:00",
-      "days": ["Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+      "days": [
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday"
+      ],
       "grace_minutes": 120
     }
   },
-
   "required_files": [
     "lots_seed.json",
     "portfolio_state.json",
@@ -54,7 +91,6 @@
     "pending_watch_resolved.json",
     "tlh_pairs.json"
   ],
-
   "exe": {
     "_why": "engine_sources are the files COMPILED INTO the binary. ibkr_paper_exec.py is deliberately absent: it runs from source, so editing it must not flag the exe as stale.",
     "path": "dist/Portfolio Optimiser.exe",
