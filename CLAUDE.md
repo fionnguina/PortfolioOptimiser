@@ -7,10 +7,17 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
 
 ## Runtime — non-negotiable
 - Python: `./.venv/Scripts/python.exe` (3.12). NEVER bare `python`.
-- Production runs use the PyInstaller exe in `dist/` — **rebuild required after any .py change**.
-  The exe logs its build sha/time; check `[build]` in run.log for code/exe drift.
+- Production runs the PyInstaller exe in `dist/` (`./.venv/Scripts/python.exe build_helper.py`)
+  — **rebuild after changing anything in `ops_expected.json → exe.engine_sources`**.
+  NOT everything needs one: `ibkr_paper_exec.py`, `ops_assertions.py` and every `*.ps1`
+  wrapper run from SOURCE and are live on the next scheduled run. Getting this wrong in
+  either direction costs a day — a stale exe silently runs old logic; an unnecessary
+  rebuild is 5 minutes and a new sha.
+- `[build]` in run.log carries the sha/time. `-dirty` now means real CODE drift: runtime
+  state files that churn every run are excluded (`build_helper.RUNTIME_STATE`), and the
+  offending files are listed by name at build time.
 - Syntax check after edits: `./.venv/Scripts/python.exe -m py_compile Portfolio_Optimiser.py cgt.py`
-- Tests: `./.venv/Scripts/python.exe -m pytest tests/` (~62 tests).
+- Tests: `./.venv/Scripts/python.exe -m pytest tests/` (469 tests).
 
 ## File map
 - `Portfolio_Optimiser.py` — the monolith (~16k lines). Config constants ~400-700,
@@ -39,6 +46,17 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
   (`IVV.AX` not `IVV`); substitutes must be in the sheet to be priced/buyable.
 - `lots_seed.json` + `ibkr_fills_log.jsonl` — lot book truth (rebuilt fresh every run).
 - `portfolio_state.json` — NAV state; drives OOS starting NAV. `regions.json` — FF5 region overrides.
+- **Live-ops (all run from SOURCE — no rebuild):**
+  `ibkr_paper_exec.py` (the executor: order build/price/submit, reconcile, deferrals),
+  `jsonl_logs.py` (rec-log writer — carries the verdict, see below),
+  `ops_assertions.py` + `ops_expected.json` (declared intent vs reality + run-ledger
+  heartbeat — **`ops_expected.json` is the source of truth**; if reality is right and it
+  is wrong, change it deliberately), `ops_power.ps1` (blocks idle sleep for a run),
+  and the three wrappers `daily_auto.ps1` / `evidence_run.ps1` / `us_session_run.ps1`.
+- `pending_watch_resolved.json` — terminal verdicts for orders logged `qty_filled=0`,
+  keyed on `ibkr_perm_id`. Without it the same stale row is re-resolved every run and
+  flips FILLED → DID NOT FILL once the fill is absorbed into the seed.
+- `run_ledger.jsonl` — which scheduled jobs actually ran (gitignored, backed up).
 - `.cache/oos/` — OOS backtest cache. Fingerprint = data shape/cols/dates + NAV + kwargs
   + git sha + caps + sector caps + tlh_pairs bytes + μ-shrink λ + LT-defer window.
 
@@ -46,6 +64,41 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
 `--walk-forward-cv` (fold table + FULL-PERIOD block + JSON), `--dev-validation`
 (dev 2015→Feb 2020 / validation Feb 2020→now), `--stress-test` (GFC, 7-ticker),
 `--scale-analysis`, `--attribution`, `--preflight`, `--auto-pipeline` (scheduled runs).
+
+## Live pipeline — three scheduled tasks (2026-08-10)
+| when | task | does |
+|---|---|---|
+| 10:20 AEST MON–FRI | `daily_auto.ps1` | engine → verdict → **ASX** execution → reconcile → ops check |
+| 18:00 AEST MON–FRI | `evidence_run.ps1` | scale-sensitivity sweep. Places NO orders. |
+| 02:00 local TUE–SAT | `us_session_run.ps1` | **US** legs of the morning's approved plan |
+
+- **10:20 is load-bearing** — at 09:30 the run fires before the ASX opens, `--wait-for-funds`
+  expires and the largest buy defers every rebalance.
+- **02:00 / TUE–SAT is not a typo.** The US session in AU local time moves with two DST
+  switches (23:30–06:00, 00:30–07:00, or 01:30–08:00); 02:00 is the only hour inside RTH
+  in all three. And Monday's plan trades in the session still open at 02:00 **Tuesday**,
+  so Friday's runs at 02:00 **Saturday**.
+- The US pass **never runs the engine** — no re-optimisation, no new verdict. It reloads
+  the morning's rec-log entry so both halves of the day chase the same target.
+- `ops_assertions.py --check` is the first thing to run when anything looks off: it answers
+  "is the pipeline configured as intended" in one command. Changing a Windows task? See
+  the memory note — always via `/XML`, never flag-based `/Create` (it silently defaults
+  `WakeToRun=False`), and **quote the script path** (this repo's home dir has a space).
+
+## Executor flags (`ibkr_paper_exec.py`; source-run, no rebuild)
+- `--execute` / `--auto-execute` — the latter is a headless `--execute` (validation gate
+  replaces the typed prompt). Both are **verdict-gated**.
+- `--override-verdict "<why>"` — execute a plan the engine did NOT clear. Requires a
+  written reason, echoed loudly. Distinct from `--skip-validation`, which overrides the
+  broker-truth safety checks; this overrides the decision to trade at all.
+- `--venue ASX|US` — trade one venue's legs; also scopes the open-order guard to it, so a
+  leftover ASX order can't veto the US pass hours later.
+- `--reprice-to-targets` — re-solve units from the plan's frozen `target_weights` at live
+  prices. Use ONLY while the venue is open. Refuses a leg on sign-flip, on drift past
+  `--drift-sigma-max` (default 3) × its daily vol, or if unpriceable.
+- Read-only/repair: `--shadow-execute`, `--check-fills --write`, `--reconcile-lots`,
+  `--snapshot-nav`, `--sync-holdings`, `--cancel-open-orders`, `--flatten`,
+  `--complete-deferred`, `--only-tickers`.
 
 ## Env overrides (sweeps without code edits; all cache-fingerprint aware)
 - `PORTOPT_CAP_OVERRIDES='{"SOXX":0.08}'` — merge into PER_ASSET_WEIGHT_CAPS
@@ -81,6 +134,21 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
 - `[data] Dropped N return outlier(s)` — 30% filter is the canonical yfinance guard.
 - Health summary block at end = quickest run triage.
 
+Live-ops lines (`daily_auto.log`, `us_session_run.log`, `evidence_run.log`):
+- `[exec] REFUSING TO EXECUTE — verdict=…` — the verdict gate. Exit 3. On a SKIP day this
+  is the CORRECT outcome, not a failure; the wrappers record it as `ok`.
+- `[exec][reprice] price source: SMH=live|hist` — **read this on any US run.** `hist` means
+  no real-time subscription for that venue, so units were re-solved against a stale bar
+  and the pass delivers far less than it appears to.
+- `[exec][reprice] <TKR>: +31u -> +22u at live $… (same target weight)` — normal; a gap-up
+  buys proportionally fewer units, which is the point.
+- `OPS ASSERTIONS` / `OPS DRIFT` email — reality disagrees with `ops_expected.json`.
+  `TASK TIME/DAYS/ACTION` name the cause directly; `NO RUN RECORDED` is the heartbeat and
+  means a job did not run at all (check the task's `LastTaskResult` — `0xFFFD0000` = the
+  action failed to launch, usually an unquoted path).
+- Evidence run: `finished … Ns awake / Ns wall` is healthy. `ABANDONED` = the machine slept
+  past the ceiling; `HUNG` = no sentinel. Machine sleep is excluded from the budget.
+
 ## Domain doctrine
 - **The portfolio pays its own tax at lodgement** per the Tax_Ledger sheet figure (sim
   models FY-end settlement inside NAV via `_apply_fy_tax`; keep live on the same convention).
@@ -88,6 +156,12 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
   Solver exclusion = cap 0.0.
 - Holdings dialog Cancel still runs the full pipeline on sheet seeds.
 - Never execute a trade plan generated under a config you're about to change.
+- **The plan and the permission to execute it travel together.** The rec-log entry carries
+  `verdict` + `skip_reason`; a missing verdict reads as UNKNOWN and refuses. Don't add a
+  path that consumes `recommended_trades` without passing it through `_verdict_gate`.
+- **What was approved is a WEIGHT, not a unit count.** Units are that weight over a price
+  that may be hours stale. Executing fixed units through a gap overshoots the target twice;
+  re-solving is self-financing and is why no extra liquidity reserve was needed.
 - The engine's identity: Sharpe/drawdown machine (10Y ~0.94 vs SPY 0.83, MaxDD -26% vs
   -37% AORD), trails SPY ~2%/yr absolute in exchange. Pre-tax it beats SPY — the gap is
   mostly CGT drag. Levers tested and killed: thematics, μ-shrinkage, LT-deferral.
