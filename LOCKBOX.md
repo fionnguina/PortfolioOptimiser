@@ -12,23 +12,45 @@ for the original framework + first results.
 
 ---
 
-## Current state — as of 2026-07-03 (REFRESH #1 executed)
+## Current state — as of 2026-08-13 (REFRESH #2 executed)
 
 | Item | Value |
 |---|---|
-| Dev window | 2015 → 2026-06-30 (= data lockbox date) |
-| Buffer | July 2026 |
-| Validation window | 2026-08-01 → 2028-08-01 (**forward — live evidence only**) |
+| Dev window | 2015 → 2026-07-30 (= data lockbox date) |
+| Buffer | August 2026 |
+| Validation window | 2026-09-01 → 2028-09-01 (**forward — live evidence only**) |
 | Peek budget | 7 (reset at refresh) |
 | Peeks used | 0 |
-| Last refresh | 2026-07-03 — trigger: peek budget exhausted (7/7) |
+| Last refresh | 2026-08-13 — trigger: **user directive** (see below) |
 | Prior window record | [LOCKBOX_HISTORY.md](LOCKBOX_HISTORY.md) |
 | Live trading start | **2026-06-22 (paper)** |
 | Real-money start | TBC, blocked on AFSL |
 
+### Two lockboxes, different jobs
+
+| Constant | Governs | Default | Why |
+|---|---|---|---|
+| `DATA_LOCKBOX_DATE` | the 15 research CLI modes | 2026-07-30 | research honesty — no parameter selected off post-boundary data |
+| `REPORT_LOCKBOX_DATE` | the **published** backtest: deck chart, metrics table, Excel | 2026-07-30 | what you show investors must not creep forward into sealed dates |
+| *(neither)* | the **live solve** — regime score, crash-hedge check, trade plan | full current data | blinding this is what forced the 2026-07-06 revert |
+
+The live solve and the published backtest now read **different frames**:
+`oos_prices_aud_long` (full) vs `oos_prices_report` (truncated). The engine
+prints both ranges each run. Override with `PORTOPT_REPORT_LOCKBOX=YYYY-MM-DD`,
+or `PORTOPT_REPORT_LOCKBOX=""` to publish a to-today backtest again.
+
+**Refresh #2 trigger was a user directive, not one of the three documented
+conditions.** It followed a 2026-08-13 review of the headline performance
+slide which established that the published backtest ran to *today* — i.e.
+outside the lockbox, and 12 days into this window's own sealed dates. The
+boundary moved 2026-06-30 → 2026-07-30 and the reporting scope was added.
+Note the cost, deliberately accepted: the July 2026 buffer is consumed, and
+one month of already-observed paper evidence is now inside the dev window.
+The new August buffer restores the seam.
+
 **The new validation window has no backtest.** Every val "peek" is now a
 read of accumulated live/paper evidence, not a backtest run. Shipping
-decisions must be justified purely from dev-window (2015→2026-06)
+decisions must be justified purely from dev-window (2015→2026-07-30)
 evidence: full-window CV + full-period MaxDD + the regime-split harness.
 
 **`--dev-validation` harness reinterpretation:** its two windows
@@ -49,9 +71,9 @@ cites live-window performance.
 
 ### Peek history (current window)
 
-_None yet. Window opened 2026-08-01; evidence accumulates from paper
+_None yet. Window opened 2026-09-01; evidence accumulates from paper
 trading. See [LOCKBOX_HISTORY.md](LOCKBOX_HISTORY.md) for the 7 peeks
-spent on the retired 2020-2026 window._
+spent on the retired 2020-2026 window, and for Window 2 (retired unpeeked)._
 
 ---
 
@@ -95,14 +117,23 @@ decision** triggers a refresh.
 - Peeks: reset to 7
 - Old-window snapshot: [LOCKBOX_HISTORY.md](LOCKBOX_HISTORY.md)
 
+**Refresh #2 executed 2026-08-13** (trigger: user directive after the
+headline-slide review — the published backtest was running to today):
+- Dev: 2015 → 2026-07-30 (aligned to DATA_LOCKBOX_DATE)
+- Buffer: August 2026
+- Val: 2026-09-01 → 2028-09-01
+- Peeks: reset to 7
+- New: `REPORT_LOCKBOX_DATE` scopes the lockbox to the PUBLISHED backtest
+- Old-window snapshot: [LOCKBOX_HISTORY.md](LOCKBOX_HISTORY.md) (Window 2)
+
 Caveat: the new val window does not have observed data yet — every
 peek is **waiting for live evidence to accumulate** rather than running
 a backtest. This is by design. The discipline shifts from "don't peek
 at backtest" to "don't make engine changes that you cannot justify
 purely from dev/in-sample evidence."
 
-The DATA_LOCKBOX_DATE stays at 2026-06-30 for all backtest work. When the
-val window matures (2028-08) or a refresh trigger fires, the next refresh
+The DATA_LOCKBOX_DATE stays at 2026-07-30 for all backtest work. When the
+val window matures (2028-09) or a refresh trigger fires, the next refresh
 moves the lockbox forward in the same step — never in between.
 
 ### Lockbox scope (2026-07-06 directive)
@@ -113,7 +144,10 @@ trading week-old regimes (Stretch 68% solved before a semis selloff).
 Scope as implemented:
 
 - **Research CLI modes** (`--walk-forward-cv`, `--dev-validation`, sweeps,
-  stress/attribution/tilt tests) → data truncated at 2026-06-30.
+  stress/attribution/tilt tests) → data truncated at 2026-07-30.
+- **Published backtest** (deck chart + metrics table + Excel) → truncated at
+  `REPORT_LOCKBOX_DATE` (2026-07-30). Added 2026-08-13; before that the deck
+  ran to today.
 - **Live pipeline, `--auto-pipeline`, diagnostics** (preflight,
   factor-recs, metrics-history) → full current data.
 - Kernel workers inherit the parent's resolved state via env, never

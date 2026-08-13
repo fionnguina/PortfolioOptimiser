@@ -16,8 +16,11 @@ its faithfulness to hard-won doctrine — NOT ops plumbing. Real savings ride on
 - NEVER run mutating git. This is analysis, not implementation.
 
 ## The engine's identity (what "correct" means here)
-A Sharpe/drawdown machine: ~0.94 10Y Sharpe vs SPY 0.83, MaxDD ~-26% vs -37% AORD,
-trading ~2%/yr of absolute return for that. Net of IBKR brokerage + AU CGT
+A Sharpe/drawdown machine. **RESTATED 2026-08-13** after the back-fill look-ahead
+fix: full-period **+11.44%/yr, Sharpe 0.85, MaxDD -22.27%, alpha vs SPY -3.49%/yr**
+(lockbox 2026-07-30). The old ~0.94 Sharpe / ~2%/yr-trailing figures were inflated by
+that look-ahead — do NOT quote them. Note '-37% AORD' was the PRICE index; investable
+AU equities total-return did +9.35%/yr, MaxDD -34.31%. Net of IBKR brokerage + AU CGT
 (personal_30pc: 30% MTR + 2% Medicare, 50% LT discount, FY netting). The two
 shipped edges are BOTH Σ-side: Ledoit-Wolf covariance + vol-targeting. The μ-side
 is measured ERROR-MAXIMISING — do not endorse any μ-tilt/thematic without new

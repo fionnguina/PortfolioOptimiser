@@ -64,8 +64,11 @@ says "that's noise" is the job — not a failure to be helpful.
   covariance (wrong concentration regime: c≈0.09, lw_cc's mild shrinkage is right-sized),
   low-vol diversifier expansion (FLOT/TIP/DBMF/GDX — existing bonds/gold/REITs + vol-target
   already saturate it; GDX net-negative).
-- **Engine identity:** a Sharpe/drawdown machine (10Y ~0.94-0.97 vs SPY 0.83; MaxDD ~-21%
-  vs SPY -24%), trailing SPY ~2%/yr absolute in exchange. Pre-tax it beats SPY; the gap is
+- **Engine identity (RESTATED 2026-08-13, back-fill look-ahead fixed):** full-period
+  **+11.44%/yr, Sharpe 0.85, MaxDD -22.27%**, trailing SPY **-3.49%/yr** absolute
+  (lockbox 2026-07-30). dev/val STABLE post-fix (dev 0.90 -> val 0.90). The old
+  0.94-0.97 Sharpe figures were inflated by the look-ahead (worth ~1.7%/yr, 0.11
+  Sharpe) — treat any citation of them as stale. Pre-tax it beats SPY; the gap is
   mostly CGT drag (~312bps/yr total, CGT ≈92% of it). The user REJECTED a SPY-buy-and-hold
   slot — risk-optimised only.
 - **Live-vs-backtest fidelity is a gate too.** A live behaviour the backtest doesn't model

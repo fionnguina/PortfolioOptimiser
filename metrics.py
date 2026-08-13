@@ -24,17 +24,46 @@ import pandas as pd
 ANNUAL_TRADING_DAYS = 252
 
 
-def _annualized_sharpe(returns: pd.Series, rf_annual: float) -> float:
-    """Calculate annualized Sharpe ratio."""
+def _periods_per_year(r: pd.Series) -> float:
+    """Observations per year implied by the series' OWN index.
+
+    The OOS panel is the UNION of the AU and US trading calendars, so a
+    "year" there is ~258 rows, not 252. Assuming 252 inflates the implied
+    year count (2579 rows read as 10.23y for a 10.0y window) and silently
+    understates every annualised figure. Derive it from elapsed time and
+    fall back to the constant when the index can't support it (non-datetime
+    index, <2 points, or an implausible result from a degenerate span).
+    """
+    idx = getattr(r, "index", None)
+    if not isinstance(idx, pd.DatetimeIndex) or len(r) < 2:
+        return float(ANNUAL_TRADING_DAYS)
+    span_years = (idx[-1] - idx[0]).days / 365.25
+    if span_years <= 0:
+        return float(ANNUAL_TRADING_DAYS)
+    ppy = len(r) / span_years
+    # Sanity band: real daily calendars land ~250-262. Anything outside it
+    # means a gappy or sub-daily index — trust the constant instead.
+    return float(ppy) if 200.0 <= ppy <= 400.0 else float(ANNUAL_TRADING_DAYS)
+
+
+def _annualized_sharpe(returns: pd.Series, rf_annual: float,
+                       periods_per_year: float | None = None) -> float:
+    """Calculate annualized Sharpe ratio.
+
+    `periods_per_year` defaults to ANNUAL_TRADING_DAYS so existing callers
+    keep the 252 convention; _series_metrics passes the calendar-derived
+    value so the table agrees with its own chart.
+    """
     r = pd.to_numeric(returns, errors="coerce").dropna()
     if r.empty:
         return np.nan
-    rf_daily = (1.0 + rf_annual) ** (1.0 / ANNUAL_TRADING_DAYS) - 1.0
+    ppy = float(periods_per_year) if periods_per_year else float(ANNUAL_TRADING_DAYS)
+    rf_daily = (1.0 + rf_annual) ** (1.0 / ppy) - 1.0
     excess = r - rf_daily
     vol = excess.std(ddof=1)
     if vol <= 0 or not np.isfinite(vol):
         return np.nan
-    return excess.mean() / vol * np.sqrt(ANNUAL_TRADING_DAYS)
+    return excess.mean() / vol * np.sqrt(ppy)
 
 
 def _series_metrics(ret: pd.Series, rf_annual: float = 0.0) -> dict:
@@ -45,20 +74,21 @@ def _series_metrics(ret: pd.Series, rf_annual: float = 0.0) -> dict:
                 "Sortino Ratio": np.nan, "Max Drawdown": np.nan}
     cum = (1.0 + r).cumprod()
     total = float(cum.iloc[-1] - 1.0)
-    n_years = len(r) / ANNUAL_TRADING_DAYS
+    ppy = _periods_per_year(r)
+    n_years = len(r) / ppy
     ann_ret = (1.0 + total) ** (1.0 / n_years) - 1.0 if n_years > 0 else np.nan
-    ann_vol = float(r.std(ddof=1) * np.sqrt(ANNUAL_TRADING_DAYS))
-    sharpe = _annualized_sharpe(r, rf_annual)
+    ann_vol = float(r.std(ddof=1) * np.sqrt(ppy))
+    sharpe = _annualized_sharpe(r, rf_annual, periods_per_year=ppy)
 
     # Sortino: penalise only downside vol (MAR = 0). Annualised mean / annualised
     # downside semi-deviation. Uses sqrt(mean(min(r,0)^2)) so flat days don't
     # inflate the denominator.
-    rf_daily = (1.0 + rf_annual) ** (1.0 / ANNUAL_TRADING_DAYS) - 1.0
+    rf_daily = (1.0 + rf_annual) ** (1.0 / ppy) - 1.0
     excess = r - rf_daily
     downside = np.minimum(excess, 0.0)
     dd_dev = float(np.sqrt(np.mean(downside ** 2)))
     if dd_dev > 0 and np.isfinite(dd_dev):
-        sortino = float(excess.mean() * ANNUAL_TRADING_DAYS / (dd_dev * np.sqrt(ANNUAL_TRADING_DAYS)))
+        sortino = float(excess.mean() * ppy / (dd_dev * np.sqrt(ppy)))
     else:
         sortino = np.nan
 

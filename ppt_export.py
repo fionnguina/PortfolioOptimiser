@@ -1307,7 +1307,11 @@ def export_to_ppt(results, trades, charts=None):
         try:
             oos_rets = globals().get("oos_returns_daily", pd.Series(dtype=float))
             oos_mtx = globals().get("oos_metrics_table", pd.DataFrame())
-            oos_px_long = globals().get("oos_prices_aud_long", pd.DataFrame())
+            # Reporting-lockboxed frame so the CHART ends on the same date as
+            # the metrics table; falls back to the full panel if absent.
+            oos_px_long = globals().get("oos_prices_report", pd.DataFrame())
+            if not isinstance(oos_px_long, pd.DataFrame) or oos_px_long.empty:
+                oos_px_long = globals().get("oos_prices_aud_long", pd.DataFrame())
 
             if (isinstance(oos_rets, pd.Series) and not oos_rets.empty and
                 isinstance(oos_mtx, pd.DataFrame) and not oos_mtx.empty):
@@ -1329,8 +1333,16 @@ def export_to_ppt(results, trades, charts=None):
                         return pd.Series(dtype=float)
                     px = pd.to_numeric(oos_px_long[col], errors="coerce").dropna()
                     return px.pct_change().dropna()
+                # AU benchmark: total-return series (VAS.AX) not the price-only
+                # ^AORD, which excludes dividends and understated the AU
+                # alternative by ~4.2%/yr on this very chart.
+                _au_tkr = globals().get("AU_BENCH_TICKER", "VAS.AX")
+                _au_lbl = globals().get("AU_BENCH_LABEL", "AU equities (TR)")
+                if _au_tkr not in oos_px_long.columns:
+                    _au_tkr = globals().get("AU_BENCH_FALLBACK", "^AORD")
+                    _au_lbl = "^AORD (price only)"
                 spy_rs = _bench_rets("SPY").reindex(rs_strat.index).fillna(0.0)
-                aord_rs = _bench_rets("^AORD").reindex(rs_strat.index).fillna(0.0)
+                aord_rs = _bench_rets(_au_tkr).reindex(rs_strat.index).fillna(0.0)
 
                 # Normalized cumulative-return curves (all series start at
                 # 100%). This is the apples-to-apples view requested by
@@ -1359,7 +1371,7 @@ def export_to_ppt(results, trades, charts=None):
                 _series_health = [
                     _is_degenerate(rs_strat, "Fund returns"),
                     _is_degenerate(spy_rs, "SPY returns"),
-                    _is_degenerate(aord_rs, "AORD returns"),
+                    _is_degenerate(aord_rs, f"{_au_lbl} returns"),
                 ]
                 _bad = [m for m in _series_health if m]
                 if _bad:
@@ -1438,7 +1450,7 @@ def export_to_ppt(results, trades, charts=None):
                 ax.plot(w_spy.index, w_spy.values, linewidth=1.6,
                         label="SPY (AUD)", color="#c53030", alpha=0.85)
                 ax.plot(w_aord.index, w_aord.values, linewidth=1.6,
-                        label="^AORD", color="#2f855a", alpha=0.85)
+                        label=_au_lbl, color="#2f855a", alpha=0.85)
                 ax.set_xlim(w_strat.index.min(), w_strat.index.max())
                 ax.xaxis.set_major_locator(mdates.YearLocator())
                 ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -1452,14 +1464,43 @@ def export_to_ppt(results, trades, charts=None):
                 else:
                     _scale_note = f"Fund @ {_nav_label(_user_nav)}"
                 ax.set_title(
-                    f"Cumulative return — normalised to 0% start    "
-                    f"({_scale_note}; net of {BROKER_CONFIG['name']} "
-                    f"brokerage + AU CGT [{ACTIVE_CGT_PROFILE}])",
+                    f"SIMULATED BACKTEST — not a live track record    "
+                    f"({_scale_note}, net of {BROKER_CONFIG['name']} "
+                    f"brokerage + AU CGT [{ACTIVE_CGT_PROFILE}]; "
+                    f"benchmarks GROSS of tax and costs)",
                     fontsize=10,
                 )
                 ax.set_ylabel("Cumulative return")
                 ax.legend(loc="upper left", frameon=False)
                 ax.grid(True, linestyle="--", alpha=0.4)
+
+                # Standing disclosures. These are the three things a reader
+                # cannot infer from the curves and would otherwise misread:
+                # what the backtest is NOT, how concentrated the live book is,
+                # and that a third of the universe post-dates the start.
+                try:
+                    _n_late = int(globals().get("_universe_post_start_count", 0) or 0)
+                    _n_univ = int(globals().get("_universe_total_count", 0) or 0)
+                    _live_top = globals().get("TRADEPLAN_WEIGHTS_SER", None)
+                    _conc = ""
+                    if _live_top is not None and len(_live_top):
+                        _t2 = _live_top.sort_values(ascending=False).head(2)
+                        _conc = ("  •  Live book is concentrated: "
+                                 + " + ".join(f"{k} {v*100:.0f}%" for k, v in _t2.items())
+                                 + f" = {_t2.sum()*100:.0f}% in two positions.")
+                    _uni = (f"  •  {_n_late} of {_n_univ} universe tickers began trading "
+                            f"AFTER the backtest start, so early years ran on a smaller "
+                            f"universe." if _n_late and _n_univ else "")
+                    ax.text(
+                        0.0, -0.16,
+                        "Simulated results. Past simulated performance does not predict "
+                        "future returns.  •  Live/paper trading began 2026-06-22."
+                        + _conc + _uni,
+                        transform=ax.transAxes, fontsize=7, color="#555555",
+                        va="top", ha="left", wrap=True,
+                    )
+                except Exception as _e:
+                    print(f"[pptx] disclosure footnote skipped: {_e}")
 
                 # Terminal-value annotations on right edge: show final %.
                 _annotations = [(w_strat, "Fund", "#1f4e8a")]
@@ -1467,7 +1508,7 @@ def export_to_ppt(results, trades, charts=None):
                     _annotations.append((w_strat_rs, "Fund(RS)", "#1f4e8a"))
                 _annotations.extend([
                     (w_spy, "SPY", "#c53030"),
-                    (w_aord, "^AORD", "#2f855a"),
+                    (w_aord, _au_lbl, "#2f855a"),
                 ])
                 for s, lbl, col in _annotations:
                     if not s.empty:
@@ -1558,7 +1599,7 @@ def export_to_ppt(results, trades, charts=None):
                 rows = []
                 row_labels = []
                 for h in ("3Y", "5Y", "10Y"):
-                    for series_name in ("Strategy", "SPY (AUD)", "^AORD"):
+                    for series_name in ("Strategy", "SPY (AUD)", _au_lbl):
                         col_key = (h, series_name)
                         if col_key not in oos_mtx.columns:
                             continue

@@ -105,6 +105,24 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
 - `PORTOPT_SECTOR_CAPS_DISABLE=1` — empty SECTOR_GROUP_CAPS
 - `PORTOPT_MU_SHRINKAGE=0.5` — μ→median shrinkage (prod 0; FAILED dev/val 2026-07-02)
 - `PORTOPT_LT_DEFER_DAYS=126` — LT-discount sell deferral (prod 0; FAILED dev/val 2026-07-02)
+- `PORTOPT_REPORT_LOCKBOX=YYYY-MM-DD` — truncate the PUBLISHED backtest (deck +
+  Excel). Default = the lockbox boundary. `=""` publishes a to-today backtest.
+- `PORTOPT_LEGACY_BACKFILL=1` — restore the pre-inception price back-fill.
+  **A/B ONLY — it is a known look-ahead** (see PREREG_backfill_lookahead_fix.md).
+
+## Data lockbox — THREE scopes, not one (Refresh #2, 2026-08-13)
+| scope | governs | boundary |
+|---|---|---|
+| `DATA_LOCKBOX_DATE` | the 15 research CLI modes | 2026-07-30 |
+| `REPORT_LOCKBOX_DATE` | the **published** backtest: deck chart, metrics table, Excel | 2026-07-30 |
+| *(neither)* | the **live solve** — regime score, crash-hedge, trade plan | full current data |
+
+Two frames: `oos_prices_aud_long` (full — live regime/crash-hedge read it;
+blinding them forced the 2026-07-06 revert) vs `oos_prices_report` (truncated
+— the published backtest and its benchmark rows). Both ranges print each run.
+`LOCKBOX_BOUNDARY` is the single constant; no other hardcoded date.
+**A lockbox scoped to research modes does NOT govern what you publish** — for
+six weeks the deck's backtest ran to today, outside the boundary. See LOCKBOX.md.
 
 ## Validation protocol (hard-won; do not shortcut)
 1. Gate on the PRODUCTION frame (exe slide metrics at user NAV), not the CV harness alone.
@@ -162,9 +180,17 @@ Live-ops lines (`daily_auto.log`, `us_session_run.log`, `evidence_run.log`):
 - **What was approved is a WEIGHT, not a unit count.** Units are that weight over a price
   that may be hours stale. Executing fixed units through a gap overshoots the target twice;
   re-solving is self-financing and is why no extra liquidity reserve was needed.
-- The engine's identity: Sharpe/drawdown machine (10Y ~0.94 vs SPY 0.83, MaxDD -26% vs
-  -37% AORD), trails SPY ~2%/yr absolute in exchange. Pre-tax it beats SPY — the gap is
-  mostly CGT drag. Levers tested and killed: thematics, μ-shrinkage, LT-deferral.
+- The engine's identity — **RESTATED 2026-08-13** after the back-fill look-ahead fix
+  (PREREG_backfill_lookahead_fix.md). Full-period CV, lockbox 2026-07-30:
+  **+11.44%/yr, Sharpe 0.85, MaxDD -22.27%, α vs SPY -3.49%/yr.**
+  Superseded figures (~0.94 Sharpe, +13%/yr, trails SPY ~2%/yr) were inflated by the
+  look-ahead — worth ~1.7%/yr and 0.11 Sharpe, 6-8x the noise floor. DO NOT quote them.
+  Still a Sharpe/drawdown machine (SPY(AUD) 10Y Sharpe ~0.84 at far higher vol), and
+  dev/val remains STABLE post-fix (dev 0.90 -> val 0.90). It trails SPY in ABSOLUTE
+  terms — a "+7.31% alpha" row is CAPM alpha at beta~0.35 and reads backwards to a
+  non-quant. Benchmark note: the old "-37% AORD" is the PRICE index; investable AU
+  equities (total return) did +9.35%/yr with MaxDD -34.31%.
+  Levers tested and killed: thematics, μ-shrinkage, LT-deferral.
   User rejected SPY-buy-and-hold slot (wants risk-optimised only).
 
 ## Session habits

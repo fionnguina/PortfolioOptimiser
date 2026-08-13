@@ -80,6 +80,7 @@ MU_PRIOR_METHOD = "median"   # 'median'(legacy) | 'bl' | 'ff5' — structured-pr
 MU_FF5_PRIOR = None          # optional pd.Series (FF5 μ) for method='ff5'; set per-run by the caller
 PER_ASSET_WEIGHT_CAPS = None
 RETURN_OUTLIER_THRESHOLD = None
+LEGACY_BACKFILL = False  # injected by the engine; see _sync_oos_engine
 SKIP_REBAL_DELTA = None
 SKIP_REBAL_DELTA_CALM = None
 STRETCH_FLOOR_CALM = None
@@ -456,7 +457,16 @@ def run_oos_ensemble_walk_forward(
     """
     px = prices_aud.copy()
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    # ffill carries the last REAL price across a non-trading day (legitimate).
+    # bfill would synthesise a flat series backwards to the panel start, so a
+    # ticker that had not yet listed produced pct_change()==0.0 instead of NaN
+    # and sailed through the coverage gate below as a zero-vol, zero-return
+    # phantom asset — catnip to a long-only max-Sharpe solver. See
+    # PREREG_backfill_lookahead_fix.md. LEGACY_BACKFILL restores the old
+    # behaviour for A/B only; it is a KNOWN LOOK-AHEAD, never for production.
+    px = px.sort_index().ffill()
+    if LEGACY_BACKFILL:
+        px = px.bfill()
     px = px.drop(columns=[c for c in ["PortfolioValue"] if c in px.columns], errors="ignore")
 
     oos_end = px.index.max()

@@ -227,6 +227,7 @@ from ppt_utils import (
 # (see ppt_export.py caveat). Names are AST-derived from the function body.
 import ppt_export as _ppt_export
 _PPT_EXPORT_INJECT = (
+    "AU_BENCH_TICKER", "AU_BENCH_LABEL", "AU_BENCH_FALLBACK",
     "ACTIVE_CGT_PROFILE", "ANNUAL_TRADING_DAYS", "APP_DIR", "BROKER_CONFIG",
     "CGT_CONFIG", "ENSEMBLE_SLOT_NAMES", "EXPORT_DIR", "FUND_FEES_ACTIVE",
     "FY_TAX_LEDGER_DF", "LIVE_TLH_EVENTS", "MANAGEMENT_FEE_PCT_ANN",
@@ -239,7 +240,9 @@ _PPT_EXPORT_INJECT = (
     "_nearest_on_or_before", "_oos_starting_nav_aud", "_period_total_return",
     "_ppt_anchor", "_roadshow_nav_aud", "_trade_delta_col", "_window_compound_total",
     "compute_actual_nav_series_spliced", "ensemble_mix_live", "ff5_raw",
+    "_universe_post_start_count", "_universe_total_count",
     "oos_metrics_table", "oos_metrics_table_roadshow", "oos_prices_aud_long",
+    "oos_prices_report",
     "oos_rebalance_costs", "oos_rebalance_taxes", "oos_returns_daily",
     "oos_returns_daily_roadshow", "oos_scale_metrics", "oos_scale_results",
     "oos_softmax_history", "oos_tlh_events", "portfolio_value_series", "prices",
@@ -287,7 +290,7 @@ _OOS_ENGINE_INJECT = (
     "CRISIS_HEDGE_MA_DAYS", "CRISIS_HEDGE_TICKER", "CRISIS_HEDGE_WEIGHT",
     "EARLY_TRIGGER_DD_DEEPEN", "EARLY_TRIGGER_MIN_DAYS", "ENSEMBLE_SLOT_NAMES",
     "LT_DEFER_DD_CONDITIONAL", "LT_DEFER_RELEASE_DD", "LT_DEFER_WINDOW_DAYS", "LOT_MATCH_METHOD",
-    "MU_SHRINKAGE_LAMBDA", "MU_PRIOR_METHOD", "PER_ASSET_WEIGHT_CAPS", "RETURN_OUTLIER_THRESHOLD",
+    "MU_SHRINKAGE_LAMBDA", "MU_PRIOR_METHOD", "PER_ASSET_WEIGHT_CAPS", "RETURN_OUTLIER_THRESHOLD", "LEGACY_BACKFILL",
     "SKIP_REBAL_DELTA", "SKIP_REBAL_DELTA_CALM", "STRETCH_FLOOR_CALM",
     "STRETCH_FLOOR_PREDICTIVE", "TLH_PAIRS", "TREND_SLEEVE_WEIGHT", "VOL_TARGET_ANNUAL",
 )
@@ -326,6 +329,7 @@ from research_modes import (
     _run_variant_comparison,
 )
 _RESEARCH_INJECT = (
+    "LEGACY_BACKFILL",
     "_apply_data_lockbox", "_evaluate_sweep_result", "_normalize_yfinance_close",
     "_print_sweep_verdict", "compute_oos_metrics",
     "ANNUAL_TRADING_DAYS", "APP_DIR", "CRASH_HEDGE_BASKET", "CRASH_HEDGE_DD_RELEASE",
@@ -2180,6 +2184,17 @@ def _append_metrics_snapshot(metrics_table, ensemble_mix_live, w_ensemble_live,
                 "crash_hedge_release_dd": CRASH_HEDGE_DD_RELEASE,
                 "broker_profile": ACTIVE_BROKER_PROFILE,
                 "cgt_profile": ACTIVE_CGT_PROFILE,
+                # Data-hygiene provenance. Without these a stored metric row
+                # cannot be attributed to a lockbox state or to the
+                # pre-inception back-fill, which is exactly what made the
+                # 2026-08-13 audit slow. Cheap to record, impossible to
+                # reconstruct later.
+                "lockbox": (None if globals().get("DATA_LOCKBOX_DATE") is None
+                            else pd.Timestamp(DATA_LOCKBOX_DATE).date().isoformat()),
+                "report_lockbox": (None if globals().get("REPORT_LOCKBOX_DATE") is None
+                                   else pd.Timestamp(REPORT_LOCKBOX_DATE).date().isoformat()),
+                "legacy_backfill": bool(globals().get("LEGACY_BACKFILL", False)),
+                "au_benchmark": str(globals().get("AU_BENCH_TICKER", "")),
             },
             "horizons": horizons,
             "per_nav_horizons": per_nav_horizons,
@@ -2557,13 +2572,15 @@ _DATA_LOCKBOX_RESEARCH_MODE = (_STRESS_TEST_MODE or _SCALE_ANALYSIS_MODE
                                or _VARIANT_COMPARISON_MODE
                                or _META_OPT_MIXING_MODE
                                or _MIXING_DIAG_MODE)
+# Refresh #2 (2026-08-13): boundary moved 2026-06-30 -> 2026-07-30. See LOCKBOX.md.
+LOCKBOX_BOUNDARY = "2026-07-30"
 _lockbox_env = os.environ.get("DATA_LOCKBOX_DATE")
 if _lockbox_env is None:
     if _DATA_LOCKBOX_RESEARCH_MODE:
-        DATA_LOCKBOX_DATE = pd.Timestamp("2026-06-30")
+        DATA_LOCKBOX_DATE = pd.Timestamp(LOCKBOX_BOUNDARY)
     else:
         DATA_LOCKBOX_DATE = None
-        print("[lockbox] live/diagnostic run — full current data "
+        print("[lockbox] live/diagnostic run — full current data for the LIVE SOLVE "
               "(lockbox scoped to research modes; directive 2026-07-06)")
 elif _lockbox_env.strip() == "":
     DATA_LOCKBOX_DATE = None
@@ -2573,8 +2590,37 @@ else:
         DATA_LOCKBOX_DATE = pd.Timestamp(_lockbox_env.strip())
     except Exception:
         print(f"[lockbox] env var DATA_LOCKBOX_DATE={_lockbox_env!r} unparseable; "
-              f"falling back to 2026-06-30")
-        DATA_LOCKBOX_DATE = pd.Timestamp("2026-06-30")
+              f"falling back to {LOCKBOX_BOUNDARY}")
+        DATA_LOCKBOX_DATE = pd.Timestamp(LOCKBOX_BOUNDARY)
+
+# --- REPORTING lockbox (2026-08-13 directive) -------------------------------
+# Distinct from the research lockbox above, and deliberately narrower than a
+# global one. The deck's "Fund Performance vs Benchmarks" backtest ran to
+# TODAY, so every published metric sat outside the lockbox and crept forward
+# daily into the sealed forward validation window. But the SAME OOS price
+# panel also feeds the live regime score and crash-hedge check, and blinding
+# those is what forced the 2026-07-06 revert (the engine traded a week-old
+# Stretch 68% into a semis selloff).
+# So: truncate the frame that feeds the REPORTED backtest and its benchmark
+# rows; leave the live-decision reads on full current data.
+#   PORTOPT_REPORT_LOCKBOX=""  disables (publishes a to-today backtest again)
+_report_env = os.environ.get("PORTOPT_REPORT_LOCKBOX")
+if _report_env is not None and _report_env.strip() == "":
+    REPORT_LOCKBOX_DATE = None
+elif _report_env:
+    try:
+        REPORT_LOCKBOX_DATE = pd.Timestamp(_report_env.strip())
+    except Exception:
+        REPORT_LOCKBOX_DATE = pd.Timestamp(LOCKBOX_BOUNDARY)
+else:
+    REPORT_LOCKBOX_DATE = (DATA_LOCKBOX_DATE if DATA_LOCKBOX_DATE is not None
+                           else pd.Timestamp(LOCKBOX_BOUNDARY))
+if REPORT_LOCKBOX_DATE is not None:
+    print(f"[lockbox] REPORTED backtest truncated at "
+          f"{REPORT_LOCKBOX_DATE.date().isoformat()} "
+          f"(live solve still sees current data)")
+else:
+    print("[lockbox] REPORTING lockbox DISABLED — published backtest runs to today")
 
 # Propagate the RESOLVED state to child processes: scale-sensitivity kernel
 # workers re-exec this script and must inherit the parent's lockbox view,
@@ -2684,6 +2730,22 @@ BENCHMARK_INDICES = ["^AORD", "^GSPC", "^IXIC"]  # ASX, S&P500, NASDAQ
 STATIC_STARTERS = ["^AORD"]
 EXCLUDE_FROM_OPT = {"^AORD"}
 
+# --- Reported AU benchmark ---------------------------------------------------
+# ^AORD is the All Ordinaries PRICE index — it excludes dividends, and Yahoo
+# carries no dividend actions for an index so auto_adjust=True is a no-op on
+# it. Reporting it beside the fund's own total-return, net-of-tax NAV
+# understated the Australian alternative by ~4.2%/yr: over 2016-08 -> 2026-08
+# ^AORD shows +5.27%/yr (+67% cumulative) where investable AU equities
+# actually returned ~+9.3%/yr (+144%). That roughly HALVED the fund's
+# apparent outperformance vs Australia — the comparison super funds are
+# judged on. VAS.AX (Vanguard ASX 300) is already in the OOS price panel,
+# is dividend-adjusted by auto_adjust, and covers the full window.
+# ^AORD stays in the universe: factors.py maps it for region betas and it is
+# EXCLUDE_FROM_OPT, so this changes REPORTING only, never the solver.
+AU_BENCH_TICKER = "VAS.AX"
+AU_BENCH_LABEL = "AU equities (TR)"
+AU_BENCH_FALLBACK = "^AORD"
+
 # Initialize data storage
 data_dict = {}
 
@@ -2752,6 +2814,22 @@ def _normalize_yfinance_close(dl) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+# --- Pre-inception back-fill (look-ahead) ------------------------------------
+# FALSE is correct. Price panels used to be .ffill().bfill()-ed before returns
+# were computed, which back-filled a flat series to the panel start: a ticker
+# that had not yet listed produced pct_change()==0.0 rather than NaN, so the
+# 80% coverage gate in oos_engine never fired and the solver saw a synthetic
+# zero-return / zero-vol asset. Measured at a 2018 rebalance: VLUE.AX (listed
+# 2021-03) and MTUM.AX (listed 2024-07) both scored coverage 1.0000.
+# PORTOPT_LEGACY_BACKFILL=1 restores it for A/B comparison ONLY — it is a
+# known look-ahead and must never be set in production.
+LEGACY_BACKFILL = bool(os.environ.get("PORTOPT_LEGACY_BACKFILL", "").strip()
+                       not in ("", "0", "false", "False"))
+if LEGACY_BACKFILL:
+    print("[data][WARN] LEGACY_BACKFILL=1 — pre-inception prices are back-filled; "
+          "this REINTRODUCES the look-ahead. A/B only, never production.")
+
+
 dl = yf.download(
     tickers,
     period=PRICE_DOWNLOAD_PERIOD,
@@ -2764,7 +2842,9 @@ prices = _normalize_yfinance_close(dl)
 # Clean: ensure datetime index, fill gaps, dedupe columns
 prices.index = pd.to_datetime(prices.index)
 idx = pd.date_range(start=prices.index.min(), end=prices.index.max(), freq="B")
-prices = prices.reindex(idx).ffill().bfill()
+prices = prices.reindex(idx).ffill()
+if LEGACY_BACKFILL:
+    prices = prices.bfill()
 prices.index.name = "Date"
 prices = prices.loc[:, ~prices.columns.duplicated()]
 
@@ -3431,7 +3511,9 @@ def _run_ff5_and_frontier_setup(new_prices: pd.DataFrame) -> None:
         fx_reidx = _fx_usdaud.reindex(px.index).ffill()
         if usd_cols:
             px.update(px.loc[:, usd_cols].mul(fx_reidx, axis=0))
-    px = px.ffill().bfill()
+    px = px.ffill()
+    if LEGACY_BACKFILL:
+        px = px.bfill()
     # Drop columns that are entirely NaN (failed yfinance fetch — e.g. ticker
     # was delisted, renamed, or doesn't exist on Yahoo). Without this, the
     # downstream `dropna(how="any")` would drop EVERY row that has any NaN
@@ -5054,7 +5136,9 @@ def _rebuild_core_from_prices(prices, fx_ticker="USDAUD=X", period="5y"):
         prices_aud.update(prices.loc[:, usd_cols].mul(fx, axis=0))
 
     # FIX: fill missing values AFTER FX conversion but BEFORE returns
-    prices_aud = prices_aud.ffill().bfill()
+    prices_aud = prices_aud.ffill()
+    if LEGACY_BACKFILL:
+        prices_aud = prices_aud.bfill()
 
     # Melt into long format
     d = (prices_aud.reset_index()
@@ -5104,7 +5188,9 @@ def run_oos_walk_forward(
     """
     px = prices_aud.copy()
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = px.sort_index().ffill()
+    if LEGACY_BACKFILL:
+        px = px.bfill()
     # PortfolioValue is a derived column — exclude from the asset universe.
     px = px.drop(columns=[c for c in ["PortfolioValue"] if c in px.columns], errors="ignore")
 
@@ -5338,6 +5424,15 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
     # silently returns stale results (nearly invalidated the 2026-07-02
     # TLH-pairs A/B: lockboxed data → same key → HIT on the old config).
     try:
+        # Lockbox state. The truncated frame already changes shape+dates, so
+        # this was previously safe by ACCIDENT. Now that a lockboxed reporting
+        # run and an unlockboxed live run share one cache dir, hash it
+        # explicitly so the two can never collide on a key.
+        h.update(f"legacy_bfill:{bool(globals().get('LEGACY_BACKFILL', False))}".encode())
+        _lb = globals().get("DATA_LOCKBOX_DATE")
+        _rlb = globals().get("REPORT_LOCKBOX_DATE")
+        h.update(f"lockbox:{'' if _lb is None else pd.Timestamp(_lb).date().isoformat()}".encode())
+        h.update(f"rlockbox:{'' if _rlb is None else pd.Timestamp(_rlb).date().isoformat()}".encode())
         h.update(f"caps:{json.dumps(globals().get('PER_ASSET_WEIGHT_CAPS', {}), sort_keys=True)}".encode())
         h.update(f"gcaps:{json.dumps(globals().get('SECTOR_GROUP_CAPS', {}), sort_keys=True)}".encode())
         h.update(f"mu_shrink:{float(globals().get('MU_SHRINKAGE_LAMBDA', 0.0) or 0.0)}".encode())
@@ -5508,9 +5603,13 @@ def compute_oos_metrics(strat_returns: pd.Series,
         aord_returns = aord_returns[~aord_returns.index.duplicated(keep="last")]
 
     end_dt = strat_returns.index.max()
+    # Column label for the AU benchmark. Named from config so the slide says
+    # what the series actually is — the old hardcoded "^AORD" outlived the
+    # switch to a total-return series and would have mislabelled it.
+    _AU_LBL = str(globals().get("AU_BENCH_LABEL", "AU equities (TR)"))
 
     metric_order = ["Cumulative Return", "Annualised Return", "Annualised Volatility",
-                    "Sharpe Ratio", "Sortino Ratio", "Max Drawdown", "IR vs ^AORD",
+                    "Sharpe Ratio", "Sortino Ratio", "Max Drawdown", "IR vs AU",
                     "Beta vs SPY", "Alpha vs SPY (ann)", "Alpha vs FF5 (ann)",
                     "Annual Turnover"]
 
@@ -5522,12 +5621,32 @@ def compute_oos_metrics(strat_returns: pd.Series,
         s = strat_returns[(strat_returns.index >= start_dt) & (strat_returns.index <= end_dt)]
         if s.empty:
             continue
-        sp = spy_returns.reindex(s.index).fillna(0.0)
-        ao = aord_returns.reindex(s.index).fillna(0.0)
+        # Slice each benchmark to the SAME DATE WINDOW but leave it on its OWN
+        # trading calendar. The previous reindex-onto-the-strategy-index +
+        # fillna(0.0) injected a phantom flat day into a benchmark for every
+        # holiday the other venue didn't share (~70 for SPY, ~54 for the AU
+        # index over 10y), which deflated benchmark vol and Sharpe ~1-1.4%
+        # while the strategy — which trades both venues — kept real returns
+        # every day. Metrics are per-series by construction; _series_metrics
+        # derives its own periods-per-year, and the pairwise stats below
+        # (_ir_vs_bench / _capm_alpha_beta) already inner-join internally.
+        sp = spy_returns[(spy_returns.index >= start_dt) & (spy_returns.index <= end_dt)]
+        ao = aord_returns[(aord_returns.index >= start_dt) & (aord_returns.index <= end_dt)]
 
-        m_s = _series_metrics(s)
-        m_sp = _series_metrics(sp)
-        m_ao = _series_metrics(ao)
+        # Same 30% outlier guard the strategy's own constituent returns get
+        # (oos_engine RETURN_OUTLIER_THRESHOLD) — without it a yfinance
+        # corporate-action glitch hits the benchmark rows but not the fund's.
+        _thr = float(globals().get("RETURN_OUTLIER_THRESHOLD", 0.30))
+        sp = sp.where(sp.abs() <= _thr).dropna()
+        ao = ao.where(ao.abs() <= _thr).dropna()
+
+        # rf: Sharpe/Sortino were computed at rf=0 for every series, which
+        # inflates the headline level (10Y 0.94 -> ~0.87 at a real AU cash
+        # rate). Same rate for all three series, so the ranking is unchanged.
+        _rf = float(globals().get("rf_annual", 0.0) or 0.0)
+        m_s = _series_metrics(s, _rf)
+        m_sp = _series_metrics(sp, _rf)
+        m_ao = _series_metrics(ao, _rf)
 
         ir = _ir_vs_bench(s, ao)
         alpha_spy, beta_spy = _capm_alpha_beta(s, sp)
@@ -5548,7 +5667,7 @@ def compute_oos_metrics(strat_returns: pd.Series,
                     np.nan, np.nan, np.nan, np.nan, np.nan]
 
         block = pd.DataFrame({"Strategy": strat_col, "SPY (AUD)": spy_col,
-                              "^AORD": aord_col}, index=metric_order)
+                              _AU_LBL: aord_col}, index=metric_order)
         block.columns = pd.MultiIndex.from_tuples(
             [(f"{h}Y", c) for c in block.columns]
         )
@@ -5762,6 +5881,7 @@ globals()["returns_wide_df"] = df_cov_wide.copy()
 oos_returns_daily = pd.Series(dtype=float)
 oos_weights_history = pd.DataFrame()
 oos_prices_aud_long = pd.DataFrame()
+oos_prices_report = pd.DataFrame()
 if bool(CFG.get("oos_validation", True)):
     try:
         _oos_t0 = time.perf_counter()
@@ -5776,7 +5896,33 @@ if bool(CFG.get("oos_validation", True)):
         )
         _oos_long_px = _normalize_yfinance_close(_oos_long_raw)
         _oos_long_px.index = pd.to_datetime(_oos_long_px.index).tz_localize(None)
-        _oos_long_px = _oos_long_px.sort_index().ffill().bfill()
+        # Inception census BEFORE the ffill/bfill — after it every column has a
+        # value on day 1 and real first-trade dates are unrecoverable. Feeds
+        # the deck's disclosure footnote.
+        try:
+            _oos_long_px = _oos_long_px.sort_index()
+            _panel_start = _oos_long_px.index.min()
+            _fv = {c: _oos_long_px[c].first_valid_index() for c in _oos_long_px.columns}
+            _late = [c for c, f in _fv.items() if f is not None and f > _panel_start]
+            _universe_total_count = len(_oos_long_px.columns)
+            _universe_post_start_count = len(_late)
+            if _late:
+                _late_show = sorted(_late, key=lambda c: _fv[c], reverse=True)[:5]
+                print(f"[oos][universe] {len(_late)}/{_universe_total_count} tickers "
+                      f"began trading after the panel start "
+                      f"({_panel_start.date()}); latest: "
+                      + ", ".join(f"{c}@{_fv[c].date()}" for c in _late_show))
+                print("[oos][universe][WARN] prices are back-filled before returns "
+                      "are computed, so a pre-inception ticker reads as 0.00% return "
+                      "at 0.00% vol and PASSES the coverage gate — see review "
+                      "2026-08-13; not yet fixed (changes backtest results).")
+        except Exception as _e:
+            _universe_total_count = 0
+            _universe_post_start_count = 0
+            print(f"[oos][universe] census failed: {_e}")
+        _oos_long_px = _oos_long_px.ffill()
+        if LEGACY_BACKFILL:
+            _oos_long_px = _oos_long_px.bfill()
         # FX-adjust USD tickers into AUD (same recipe as _rebuild_core_from_prices).
         _fx_raw = yf.download("USDAUD=X", period="12y", interval="1d",
                               auto_adjust=True, threads=False, progress=False)
@@ -5789,7 +5935,27 @@ if bool(CFG.get("oos_validation", True)):
         oos_prices_aud_long = _oos_long_px.copy()
         if _usd_cols:
             oos_prices_aud_long.update(_oos_long_px.loc[:, _usd_cols].mul(_fx, axis=0))
-        oos_prices_aud_long = oos_prices_aud_long.ffill().bfill()
+        oos_prices_aud_long = oos_prices_aud_long.ffill()
+        if LEGACY_BACKFILL:
+            oos_prices_aud_long = oos_prices_aud_long.bfill()
+
+        # REPORTING lockbox: the frame the PUBLISHED backtest + its benchmark
+        # rows are computed from. oos_prices_aud_long itself stays full-length
+        # because the live regime score / crash-hedge check read it.
+        oos_prices_report = oos_prices_aud_long
+        if REPORT_LOCKBOX_DATE is not None:
+            oos_prices_report = oos_prices_aud_long[
+                oos_prices_aud_long.index <= REPORT_LOCKBOX_DATE]
+            if oos_prices_report.empty:
+                print("[lockbox][WARN] reporting lockbox left no rows — "
+                      "falling back to full panel")
+                oos_prices_report = oos_prices_aud_long
+            else:
+                print(f"[lockbox] reported backtest panel: "
+                      f"{oos_prices_report.index.min().date()} -> "
+                      f"{oos_prices_report.index.max().date()} "
+                      f"({len(oos_prices_report)} rows; live panel has "
+                      f"{len(oos_prices_aud_long)})")
 
         # Use the investor's actual NAV so brokerage friction (IBKR $5 min)
         # scales correctly — at $100k the min binds, at $1M the rate
@@ -5802,7 +5968,7 @@ if bool(CFG.get("oos_validation", True)):
                        and portfolio_value_override > 0
                     else 1_000_000.0)
         ensemble_out = run_oos_ensemble_walk_forward_cached(
-            oos_prices_aud_long,
+            oos_prices_report,
             train_window_months=24,
             rebalance=REBALANCE_FREQ,
             benchmark_ticker="SPY",
@@ -5836,7 +6002,7 @@ if bool(CFG.get("oos_validation", True)):
                 print(f"[oos-roadshow] running second backtest at "
                       f"${ROADSHOW_BASE_NAV:,.0f} for dual-NAV chart...")
                 ensemble_out_rs = run_oos_ensemble_walk_forward_cached(
-                    oos_prices_aud_long,
+                    oos_prices_report,
                     train_window_months=24,
                     rebalance=REBALANCE_FREQ,
                     benchmark_ticker="SPY",
@@ -6040,7 +6206,7 @@ if bool(CFG.get("oos_validation", True)):
                         try:
                             print(f"[scale] running OOS at ${_nav:,.0f} (sequential)...")
                             _scale_out = run_oos_ensemble_walk_forward_cached(
-                                oos_prices_aud_long,
+                                oos_prices_report,
                                 starting_nav_aud=float(_nav),
                                 **_common_kwargs,
                             )
@@ -6058,7 +6224,7 @@ if bool(CFG.get("oos_validation", True)):
                     try:
                         print(f"[scale] running OOS at ${_nav:,.0f} (sequential)...")
                         _scale_out = run_oos_ensemble_walk_forward_cached(
-                            oos_prices_aud_long,
+                            oos_prices_report,
                             starting_nav_aud=float(_nav),
                             **_common_kwargs,
                         )
@@ -6370,14 +6536,36 @@ except Exception as _e:
 globals()["W_ENSEMBLE_SER"] = w_ensemble_live
 globals()["ensemble_mix_live"] = ensemble_mix_live
 
+def _au_bench_returns(panel: pd.DataFrame) -> pd.Series:
+    """Daily returns of the reported AU benchmark, total-return where possible.
+
+    Prefers AU_BENCH_TICKER (dividend-adjusted, so comparable with the fund's
+    own total-return NAV). Falls back to ^AORD — the price-only All Ords —
+    only if the TR series is absent or too short, and says so loudly, because
+    that fallback silently understates the AU alternative by ~4%/yr.
+    """
+    want = globals().get("AU_BENCH_TICKER", "VAS.AX")
+    back = globals().get("AU_BENCH_FALLBACK", "^AORD")
+    for tkr, is_tr in ((want, True), (back, False)):
+        if tkr not in panel.columns:
+            continue
+        ser = pd.to_numeric(panel.get(tkr), errors="coerce").dropna()
+        if len(ser) < 60:
+            continue
+        if not is_tr:
+            print(f"[oos][WARN] AU benchmark fell back to {tkr} — PRICE index, "
+                  f"excludes dividends (~4%/yr understated vs a total-return series)")
+        return ser.pct_change().dropna()
+    return pd.Series(dtype=float)
+
+
 # Metrics table (Phase 2): horizons × series, written to Excel + Slide 2 later.
 oos_metrics_table = pd.DataFrame()
 if not oos_returns_daily.empty and not oos_prices_aud_long.empty:
     try:
-        _spy_aud = oos_prices_aud_long.get("SPY") if "SPY" in oos_prices_aud_long.columns else None
-        _aord = oos_prices_aud_long.get("^AORD") if "^AORD" in oos_prices_aud_long.columns else None
+        _spy_aud = oos_prices_report.get("SPY") if "SPY" in oos_prices_report.columns else None
         _spy_ret = _spy_aud.pct_change().dropna() if _spy_aud is not None else pd.Series(dtype=float)
-        _aord_ret = _aord.pct_change().dropna() if _aord is not None else pd.Series(dtype=float)
+        _aord_ret = _au_bench_returns(oos_prices_report)
         _ff5 = globals().get("ff5_raw", None)
         oos_metrics_table = compute_oos_metrics(
             strat_returns=oos_returns_daily,
@@ -6401,9 +6589,8 @@ _oos_rets_rs = globals().get("oos_returns_daily_roadshow", pd.Series(dtype=float
 if isinstance(_oos_rets_rs, pd.Series) and not _oos_rets_rs.empty:
     try:
         _spy_aud_rs = oos_prices_aud_long.get("SPY") if "SPY" in oos_prices_aud_long.columns else None
-        _aord_rs = oos_prices_aud_long.get("^AORD") if "^AORD" in oos_prices_aud_long.columns else None
         _spy_ret_rs = _spy_aud_rs.pct_change().dropna() if _spy_aud_rs is not None else pd.Series(dtype=float)
-        _aord_ret_rs = _aord_rs.pct_change().dropna() if _aord_rs is not None else pd.Series(dtype=float)
+        _aord_ret_rs = _au_bench_returns(oos_prices_report)
         _ff5_rs = globals().get("ff5_raw", None)
         oos_metrics_table_roadshow = compute_oos_metrics(
             strat_returns=_oos_rets_rs,
@@ -6427,9 +6614,8 @@ _scale_results_local = globals().get("oos_scale_results", {})
 if _scale_results_local:
     try:
         _spy_aud_sc = oos_prices_aud_long.get("SPY") if "SPY" in oos_prices_aud_long.columns else None
-        _aord_sc = oos_prices_aud_long.get("^AORD") if "^AORD" in oos_prices_aud_long.columns else None
         _spy_ret_sc = _spy_aud_sc.pct_change().dropna() if _spy_aud_sc is not None else pd.Series(dtype=float)
-        _aord_ret_sc = _aord_sc.pct_change().dropna() if _aord_sc is not None else pd.Series(dtype=float)
+        _aord_ret_sc = _au_bench_returns(oos_prices_report)
         _ff5_sc = globals().get("ff5_raw", None)
         for _nav, _payload in _scale_results_local.items():
             _rets_for_nav = _payload.get("returns", pd.Series(dtype=float))
@@ -8173,7 +8359,7 @@ if USE_XLWINGS:
                     pct_rows = {"Cumulative Return", "Annualised Return", "Annualised Volatility",
                                 "Max Drawdown", "Alpha vs SPY (ann)", "Alpha vs FF5 (ann)",
                                 "Annual Turnover"}
-                    ratio_rows = {"Sharpe Ratio", "Sortino Ratio", "IR vs ^AORD", "Beta vs SPY"}
+                    ratio_rows = {"Sharpe Ratio", "Sortino Ratio", "IR vs AU", "Beta vs SPY"}
                     n_cols = len(_oos_flat.columns)
                     _fmts_oos = {}
                     for i, metric in enumerate(_oos_flat.index):

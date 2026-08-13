@@ -37,6 +37,23 @@ from oos_engine import (run_oos_ensemble_walk_forward,
                         max_sharpe_constructor, max_sharpe_tilted_constructor)
 
 # Injected by the engine's _sync_research_modes() before the first dispatch.
+LEGACY_BACKFILL = False
+
+
+def _fill_px(df):
+    """Forward-fill a price panel; back-fill ONLY under the legacy flag.
+
+    bfill synthesises a flat price back to the panel start, so a ticker that
+    had not yet listed yields pct_change()==0.0 instead of NaN and defeats the
+    coverage gate in oos_engine — a zero-vol phantom asset the solver loves.
+    See PREREG_backfill_lookahead_fix.md. Every research mode builds its own
+    panel, so the fix has to live here too or --dev-validation would still be
+    measuring the buggy engine.
+    """
+    out = df.ffill()
+    return out.bfill() if LEGACY_BACKFILL else out
+
+
 _apply_data_lockbox = None
 _evaluate_sweep_result = None
 _normalize_yfinance_close = None
@@ -87,7 +104,7 @@ def _run_gfc_stress_test() -> int:
                       interval="1d", auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     missing = [t for t in STRESS_TICKERS if t not in px.columns]
     if missing:
         print(f"[stress] WARNING: missing tickers from yfinance: {missing}")
@@ -108,7 +125,7 @@ def _run_gfc_stress_test() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[stress] AUD-adjusted USD tickers: {usd_cols}")
 
     print(f"[stress] Running ensemble walk-forward (train=24mo, rebal={REBALANCE_FREQ})...")
@@ -427,7 +444,7 @@ def _run_scale_analysis() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="12y", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -439,7 +456,7 @@ def _run_scale_analysis() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[scale] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -631,7 +648,7 @@ def _run_dev_validation() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -643,7 +660,7 @@ def _run_dev_validation() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[devval] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers, "
           f"{px_aud.index.min().date()} → {px_aud.index.max().date()}) "
           f"in {time.perf_counter()-t0:.1f}s")
@@ -885,7 +902,7 @@ def _run_rebal_skip_sweep() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -897,7 +914,7 @@ def _run_rebal_skip_sweep() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[skip-sweep] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -1113,7 +1130,7 @@ def _run_turnover_penalty_sweep() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -1125,7 +1142,7 @@ def _run_turnover_penalty_sweep() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[turnover-sweep] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -1345,7 +1362,7 @@ def _run_walk_forward_cv() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -1357,7 +1374,7 @@ def _run_walk_forward_cv() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[wf-cv] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers, "
           f"{px_aud.index.min().date()} → {px_aud.index.max().date()}) "
           f"in {time.perf_counter()-t0:.1f}s")
@@ -1731,7 +1748,7 @@ def _run_meta_opt_mixing() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -1743,7 +1760,7 @@ def _run_meta_opt_mixing() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[meta-opt] data ready ({px_aud.shape[0]}d × {px_aud.shape[1]}t) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -1867,7 +1884,7 @@ def _run_mixing_diagnostic() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -1879,7 +1896,7 @@ def _run_mixing_diagnostic() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
 
     def _run(lam):
         return run_oos_ensemble_walk_forward(
@@ -1945,7 +1962,7 @@ def _run_attribution() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -1957,7 +1974,7 @@ def _run_attribution() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[attr] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -2264,7 +2281,7 @@ def _run_crash_hedge_test() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -2276,7 +2293,7 @@ def _run_crash_hedge_test() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[hedge-test] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -2526,7 +2543,7 @@ def _run_crash_hedge_release_sweep() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -2538,7 +2555,7 @@ def _run_crash_hedge_release_sweep() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[hedge-rel] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -2762,7 +2779,7 @@ def _run_stretch_only_test() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -2774,7 +2791,7 @@ def _run_stretch_only_test() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[stretch] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -2996,7 +3013,7 @@ def _run_stretch_hedge_sweep() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -3008,7 +3025,7 @@ def _run_stretch_hedge_sweep() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[stretch-hedge] data ready ({px_aud.shape[0]} days × {px_aud.shape[1]} tickers) "
           f"in {time.perf_counter()-t0:.1f}s")
 
@@ -3245,7 +3262,7 @@ def _run_tilted_ensemble_test() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="max", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -3257,7 +3274,7 @@ def _run_tilted_ensemble_test() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     print(f"[tilted-ens] data ready ({px_aud.shape[0]} days × "
           f"{px_aud.shape[1]} tickers) in {time.perf_counter()-t0:.1f}s")
 
@@ -3508,7 +3525,7 @@ def _run_variant_comparison() -> int:
                       auto_adjust=True, threads=False, progress=False)
     px = _normalize_yfinance_close(raw)
     px.index = pd.to_datetime(px.index).tz_localize(None)
-    px = px.sort_index().ffill().bfill()
+    px = _fill_px(px.sort_index())
     fx_raw = yf.download("USDAUD=X", period="12y", interval="1d",
                          auto_adjust=True, threads=False, progress=False)
     fx = fx_raw["Close"] if isinstance(fx_raw, pd.DataFrame) else fx_raw
@@ -3520,7 +3537,7 @@ def _run_variant_comparison() -> int:
     px_aud = px.copy()
     if usd_cols:
         px_aud.update(px.loc[:, usd_cols].mul(fx, axis=0))
-    px_aud = px_aud.ffill().bfill().dropna(how="all")
+    px_aud = _fill_px(px_aud).dropna(how="all")
     spy_ret = (px_aud["SPY"].pct_change().dropna()
                if "SPY" in px_aud.columns else pd.Series(dtype=float))
     print(f"[variant] data ready ({px_aud.shape[0]}d x {px_aud.shape[1]}t) "
