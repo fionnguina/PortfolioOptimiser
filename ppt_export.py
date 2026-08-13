@@ -1463,12 +1463,23 @@ def export_to_ppt(results, trades, charts=None):
                                    f"Fund @ {_nav_label(_rs_base)}")
                 else:
                     _scale_note = f"Fund @ {_nav_label(_user_nav)}"
+                # State the risk-free rate. It is the CURRENT RBA cash rate
+                # applied flat across the whole window, which is harsh on the
+                # near-zero-rate years (2020-21 cash was 0.10%) — a reader
+                # cannot judge a Sharpe without knowing which rf produced it.
+                _rf_note = ""
+                try:
+                    _rf_v = float(globals().get("rf_annual", 0.0) or 0.0)
+                    _rf_note = (f"; Sharpe/Sortino at rf={_rf_v*100:.2f}% "
+                                f"(current RBA cash rate, applied flat)")
+                except Exception:
+                    pass
                 ax.set_title(
                     f"SIMULATED BACKTEST — not a live track record    "
                     f"({_scale_note}, net of {BROKER_CONFIG['name']} "
                     f"brokerage + AU CGT [{ACTIVE_CGT_PROFILE}]; "
-                    f"benchmarks GROSS of tax and costs)",
-                    fontsize=10,
+                    f"benchmarks GROSS of tax and costs{_rf_note})",
+                    fontsize=9,
                 )
                 ax.set_ylabel("Cumulative return")
                 ax.legend(loc="upper left", frameon=False)

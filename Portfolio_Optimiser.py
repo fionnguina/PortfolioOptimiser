@@ -227,7 +227,7 @@ from ppt_utils import (
 # (see ppt_export.py caveat). Names are AST-derived from the function body.
 import ppt_export as _ppt_export
 _PPT_EXPORT_INJECT = (
-    "AU_BENCH_TICKER", "AU_BENCH_LABEL", "AU_BENCH_FALLBACK",
+    "AU_BENCH_TICKER", "AU_BENCH_LABEL", "AU_BENCH_FALLBACK", "rf_annual",
     "ACTIVE_CGT_PROFILE", "ANNUAL_TRADING_DAYS", "APP_DIR", "BROKER_CONFIG",
     "CGT_CONFIG", "ENSEMBLE_SLOT_NAMES", "EXPORT_DIR", "FUND_FEES_ACTIVE",
     "FY_TAX_LEDGER_DF", "LIVE_TLH_EVENTS", "MANAGEMENT_FEE_PCT_ANN",
@@ -5901,21 +5901,27 @@ if bool(CFG.get("oos_validation", True)):
         # the deck's disclosure footnote.
         try:
             _oos_long_px = _oos_long_px.sort_index()
+            # Reference is the BACKTEST start, not the panel start. The panel
+            # is downloaded with a 12y period and the walk-forward burns the
+            # first train_window (24m) as its training lead, so counting from
+            # the panel start overstates the figure (33/48 vs the true 16/47)
+            # and the slide footnote would misreport it.
             _panel_start = _oos_long_px.index.min()
+            _bt_start = _panel_start + pd.DateOffset(months=24)
             _fv = {c: _oos_long_px[c].first_valid_index() for c in _oos_long_px.columns}
-            _late = [c for c, f in _fv.items() if f is not None and f > _panel_start]
+            _late = [c for c, f in _fv.items() if f is not None and f > _bt_start]
             _universe_total_count = len(_oos_long_px.columns)
             _universe_post_start_count = len(_late)
             if _late:
                 _late_show = sorted(_late, key=lambda c: _fv[c], reverse=True)[:5]
                 print(f"[oos][universe] {len(_late)}/{_universe_total_count} tickers "
-                      f"began trading after the panel start "
-                      f"({_panel_start.date()}); latest: "
+                      f"began trading after the backtest start "
+                      f"({_bt_start.date()}); latest: "
                       + ", ".join(f"{c}@{_fv[c].date()}" for c in _late_show))
-                print("[oos][universe][WARN] prices are back-filled before returns "
-                      "are computed, so a pre-inception ticker reads as 0.00% return "
-                      "at 0.00% vol and PASSES the coverage gate — see review "
-                      "2026-08-13; not yet fixed (changes backtest results).")
+                print("[oos][universe] pre-inception prices are NOT back-filled "
+                      "(fixed 2026-08-13, PREREG_backfill_lookahead_fix.md): a "
+                      "ticker enters the opportunity set only once it has >=80% "
+                      "real observations in the trailing window.")
         except Exception as _e:
             _universe_total_count = 0
             _universe_post_start_count = 0
