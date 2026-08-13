@@ -79,6 +79,60 @@ def get_rba_cash_rate_target_current(default: float = 0.04) -> float:
 
     return default
 
+def get_rba_cash_rate_series(default_current: float = 0.04) -> "pd.Series | None":
+    """Historical RBA Cash Rate Target as a decimal series (monthly, ffill-able).
+
+    A Sharpe ratio must net off the risk-free rate that actually prevailed on
+    each day. Charging today's 4.35% against 2020-21 — when the cash rate was
+    0.10% — understates a decade of excess return and was worth ~0.2 Sharpe on
+    the reported figures (see the 2026-08-13 review).
+
+    Source: RBA table F1.1, series FIRMMCRT (Cash Rate Target, monthly avg).
+    Returns None on failure so callers can fall back to the scalar rate —
+    a missing series must degrade to the old behaviour, never to a silent 0.
+    """
+    url_csv = "https://www.rba.gov.au/statistics/tables/csv/f1.1-data.csv"
+    cache = _CACHE_DIR / "rba_cash_rate_target.csv"
+
+    def _parse(text: str) -> "pd.Series | None":
+        try:
+            df = pd.read_csv(io.StringIO(text), skiprows=10)
+        except Exception:
+            return None
+        date_col = df.columns[0]
+        if "FIRMMCRT" not in df.columns:
+            return None
+        idx = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+        vals = pd.to_numeric(df["FIRMMCRT"], errors="coerce")
+        ser = pd.Series(vals.values, index=idx).dropna().sort_index()
+        ser = ser[~ser.index.duplicated(keep="last")]
+        return (ser / 100.0) if len(ser) >= 24 else None
+
+    # Fresh fetch, then disk cache, then give up.
+    try:
+        text = requests.get(url_csv, timeout=30).text
+        ser = _parse(text)
+        if ser is not None:
+            try:
+                cache.write_text(text, encoding="utf-8")
+            except Exception:
+                pass
+            return ser
+    except Exception:
+        pass
+    try:
+        if cache.exists():
+            ser = _parse(cache.read_text(encoding="utf-8"))
+            if ser is not None:
+                print("[rf] RBA cash-rate series served from disk cache")
+                return ser
+    except Exception:
+        pass
+    print("[rf][WARN] RBA cash-rate series unavailable — Sharpe/Sortino will "
+          "fall back to a flat current rate")
+    return None
+
+
 # ---------------------------------------------------------------------
 # Caching for FF5 + MOM Data
 # ---------------------------------------------------------------------

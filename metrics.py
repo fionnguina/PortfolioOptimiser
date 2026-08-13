@@ -46,7 +46,26 @@ def _periods_per_year(r: pd.Series) -> float:
     return float(ppy) if 200.0 <= ppy <= 400.0 else float(ANNUAL_TRADING_DAYS)
 
 
-def _annualized_sharpe(returns: pd.Series, rf_annual: float,
+def _rf_daily(index, rf_annual, ppy: float):
+    """Per-period risk-free rate, from either a scalar or a dated series.
+
+    A Series is reindexed onto `index` and forward-filled, so each return is
+    netted against the rate that actually prevailed that day. The RBA publishes
+    monthly; ffill is the correct carry for a policy rate that only moves on
+    decision dates. Any leading gap is back-filled — the series starts 1990, so
+    in practice there is none, and it cannot reach forward into the window.
+    """
+    if isinstance(rf_annual, pd.Series):
+        rf = pd.to_numeric(rf_annual, errors="coerce").dropna().sort_index()
+        if rf.empty:
+            return 0.0
+        rf = (rf.reindex(rf.index.union(index)).sort_index()
+                .ffill().reindex(index).bfill())
+        return (1.0 + rf) ** (1.0 / ppy) - 1.0
+    return (1.0 + float(rf_annual or 0.0)) ** (1.0 / ppy) - 1.0
+
+
+def _annualized_sharpe(returns: pd.Series, rf_annual,
                        periods_per_year: float | None = None) -> float:
     """Calculate annualized Sharpe ratio.
 
@@ -58,15 +77,14 @@ def _annualized_sharpe(returns: pd.Series, rf_annual: float,
     if r.empty:
         return np.nan
     ppy = float(periods_per_year) if periods_per_year else float(ANNUAL_TRADING_DAYS)
-    rf_daily = (1.0 + rf_annual) ** (1.0 / ppy) - 1.0
-    excess = r - rf_daily
+    excess = r - _rf_daily(r.index, rf_annual, ppy)
     vol = excess.std(ddof=1)
     if vol <= 0 or not np.isfinite(vol):
         return np.nan
     return excess.mean() / vol * np.sqrt(ppy)
 
 
-def _series_metrics(ret: pd.Series, rf_annual: float = 0.0) -> dict:
+def _series_metrics(ret: pd.Series, rf_annual=0.0) -> dict:
     r = pd.to_numeric(ret, errors="coerce").dropna()
     if r.empty:
         return {"Cumulative Return": np.nan, "Annualised Return": np.nan,
@@ -83,8 +101,7 @@ def _series_metrics(ret: pd.Series, rf_annual: float = 0.0) -> dict:
     # Sortino: penalise only downside vol (MAR = 0). Annualised mean / annualised
     # downside semi-deviation. Uses sqrt(mean(min(r,0)^2)) so flat days don't
     # inflate the denominator.
-    rf_daily = (1.0 + rf_annual) ** (1.0 / ppy) - 1.0
-    excess = r - rf_daily
+    excess = r - _rf_daily(r.index, rf_annual, ppy)
     downside = np.minimum(excess, 0.0)
     dd_dev = float(np.sqrt(np.mean(downside ** 2)))
     if dd_dev > 0 and np.isfinite(dd_dev):

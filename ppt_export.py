@@ -1469,9 +1469,16 @@ def export_to_ppt(results, trades, charts=None):
                 # cannot judge a Sharpe without knowing which rf produced it.
                 _rf_note = ""
                 try:
-                    _rf_v = float(globals().get("rf_annual", 0.0) or 0.0)
-                    _rf_note = (f"; Sharpe/Sortino at rf={_rf_v*100:.2f}% "
-                                f"(current RBA cash rate, applied flat)")
+                    _rfs = globals().get("rf_series")
+                    if isinstance(_rfs, pd.Series) and len(_rfs):
+                        _w = _rfs[_rfs.index >= (end_dt_rs - pd.DateOffset(years=10))]
+                        _rf_note = (f"; Sharpe/Sortino net of the RBA cash rate "
+                                    f"as it stood each day (10Y avg "
+                                    f"{_w.mean()*100:.2f}%)")
+                    else:
+                        _rf_v = float(globals().get("rf_annual", 0.0) or 0.0)
+                        _rf_note = (f"; Sharpe/Sortino at rf={_rf_v*100:.2f}% "
+                                    f"(current RBA cash rate, applied flat)")
                 except Exception:
                     pass
                 ax.set_title(

@@ -205,3 +205,52 @@ def test_coverage_gate_excludes_a_pre_inception_ticker():
     assert cov_legacy["LATE"] >= 0.8, "sanity: the bug should show full coverage"
     assert cov_fixed["LATE"] < 0.8, "fixed panel must fail the coverage gate"
     assert cov_fixed["OLD"] >= 0.8, "a genuinely-present ticker must still pass"
+
+
+# ------------------------------------------------ contemporaneous risk-free rate
+
+def _rf_series_flat_then_high():
+    """Cheap stand-in for the RBA series: 0.10% for 5y, then 4.35%."""
+    idx = pd.date_range("2016-01-31", "2026-07-31", freq="ME")
+    vals = np.where(idx < pd.Timestamp("2022-05-01"), 0.001, 0.0435)
+    return pd.Series(vals, index=idx)
+
+
+def test_rf_daily_accepts_a_dated_series_and_forward_fills():
+    idx = pd.bdate_range("2020-01-01", periods=400)
+    rf = _rf_series_flat_then_high()
+    out = _m._rf_daily(idx, rf, 258.0)
+    assert isinstance(out, pd.Series) and len(out) == len(idx)
+    assert out.notna().all(), "no NaN may reach the excess-return calculation"
+    # 2020 sat at the 0.10% policy rate, so the daily rf must be ~0.
+    assert out.max() < (1.0 + 0.002) ** (1 / 258.0) - 1.0
+
+
+def test_rf_daily_scalar_path_unchanged():
+    idx = pd.bdate_range("2020-01-01", periods=50)
+    got = _m._rf_daily(idx, 0.0435, 252.0)
+    assert got == pytest.approx((1.0 + 0.0435) ** (1 / 252.0) - 1.0)
+
+
+def test_dated_rf_lands_between_zero_and_flat_current_rate():
+    """The whole point: charging today's rate across a decade is too harsh."""
+    idx = pd.bdate_range("2016-08-16", "2026-07-30")
+    rng = np.random.default_rng(4)
+    r = pd.Series(rng.normal(0.00055, 0.0088, len(idx)), index=idx)
+    s_zero = _m._series_metrics(r, 0.0)["Sharpe Ratio"]
+    s_flat = _m._series_metrics(r, 0.0435)["Sharpe Ratio"]
+    s_ser = _m._series_metrics(r, _rf_series_flat_then_high())["Sharpe Ratio"]
+    assert s_flat < s_ser < s_zero, (s_flat, s_ser, s_zero)
+
+
+def test_empty_rf_series_degrades_to_zero_not_crash():
+    idx = pd.bdate_range("2020-01-01", periods=60)
+    assert _m._rf_daily(idx, pd.Series(dtype=float), 252.0) == 0.0
+
+
+def test_engine_prefers_the_series_and_falls_back_to_the_scalar():
+    assert "rf_series = get_rba_cash_rate_series()" in _SRC
+    # The metrics call site must pick the Series when present...
+    assert '_rfs = globals().get("rf_series")' in _SRC
+    # ...and fall back to the scalar rather than a silent 0.
+    assert 'else float(globals().get("rf_annual", 0.0) or 0.0))' in _SRC

@@ -227,7 +227,7 @@ from ppt_utils import (
 # (see ppt_export.py caveat). Names are AST-derived from the function body.
 import ppt_export as _ppt_export
 _PPT_EXPORT_INJECT = (
-    "AU_BENCH_TICKER", "AU_BENCH_LABEL", "AU_BENCH_FALLBACK", "rf_annual",
+    "AU_BENCH_TICKER", "AU_BENCH_LABEL", "AU_BENCH_FALLBACK", "rf_annual", "rf_series",
     "ACTIVE_CGT_PROFILE", "ANNUAL_TRADING_DAYS", "APP_DIR", "BROKER_CONFIG",
     "CGT_CONFIG", "ENSEMBLE_SLOT_NAMES", "EXPORT_DIR", "FUND_FEES_ACTIVE",
     "FY_TAX_LEDGER_DF", "LIVE_TLH_EVENTS", "MANAGEMENT_FEE_PCT_ANN",
@@ -2676,6 +2676,7 @@ else:
 import factors as _factors
 from factors import (
     get_rba_cash_rate_target_current,
+    get_rba_cash_rate_series,
     FF5_REGION_URLS, EUROPEAN_EXCHANGE_SUFFIXES, FF5_DAILY_ZIP, MOM_DAILY_ZIP,
     TICKER_REGION_OVERRIDES, USER_REGION_OVERRIDES, region_for_ticker,
     _load_regions_json, _save_regions_json,
@@ -2755,6 +2756,15 @@ data_dict = {}
 _XL_PATH = globals().get("filename", _default_excel_path())
 rf_annual = get_rba_cash_rate_target_current()
 rf_label = f"{rf_annual * 100:.2f}%"
+# Dated cash-rate series for Sharpe/Sortino. rf_annual is TODAY's rate; using
+# it flat across a decade charged 4.35% against 2020-21, when the cash rate was
+# 0.10%, and understated a decade of excess return. None => fall back to the
+# scalar, which is the old (wrong but disclosed) behaviour, never a silent 0.
+rf_series = get_rba_cash_rate_series()
+if rf_series is not None and len(rf_series):
+    print(f"[rf] RBA cash-rate series {rf_series.index.min().date()} -> "
+          f"{rf_series.index.max().date()} (current {rf_annual*100:.2f}%; "
+          f"10Y avg {rf_series[rf_series.index >= (pd.Timestamp.today() - pd.DateOffset(years=10))].mean()*100:.2f}%)")
 
 
 def _extract_tickers_from_holdings(xl_path: str, sheet: str = "Holdings") -> list[str]:
@@ -5643,7 +5653,9 @@ def compute_oos_metrics(strat_returns: pd.Series,
         # rf: Sharpe/Sortino were computed at rf=0 for every series, which
         # inflates the headline level (10Y 0.94 -> ~0.87 at a real AU cash
         # rate). Same rate for all three series, so the ranking is unchanged.
-        _rf = float(globals().get("rf_annual", 0.0) or 0.0)
+        _rfs = globals().get("rf_series")
+        _rf = (_rfs if isinstance(_rfs, pd.Series) and len(_rfs)
+               else float(globals().get("rf_annual", 0.0) or 0.0))
         m_s = _series_metrics(s, _rf)
         m_sp = _series_metrics(sp, _rf)
         m_ao = _series_metrics(ao, _rf)
