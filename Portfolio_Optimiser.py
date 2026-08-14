@@ -310,6 +310,7 @@ def _sync_oos_engine():
 # (incl. the conditional-def _apply_data_lockbox). The engine injects 6 SHARED
 # helper fns + 9 config/runtime values via _sync_research_modes() before dispatch
 # (all defined before the first `if flag:` block). Re-exported for the dispatch.
+import validation as _validation
 import research_modes as _research_modes
 from research_modes import (
     _run_gfc_stress_test,
@@ -329,7 +330,7 @@ from research_modes import (
     _run_variant_comparison,
 )
 _RESEARCH_INJECT = (
-    "LEGACY_BACKFILL",
+    "LEGACY_BACKFILL", "UNIVERSE_VINTAGE",
     "_apply_data_lockbox", "_evaluate_sweep_result", "_normalize_yfinance_close",
     "_print_sweep_verdict", "compute_oos_metrics",
     "ANNUAL_TRADING_DAYS", "APP_DIR", "CRASH_HEDGE_BASKET", "CRASH_HEDGE_DD_RELEASE",
@@ -2833,6 +2834,23 @@ def _normalize_yfinance_close(dl) -> pd.DataFrame:
 # 2021-03) and MTUM.AX (listed 2024-07) both scored coverage 1.0000.
 # PORTOPT_LEGACY_BACKFILL=1 restores it for A/B comparison ONLY — it is a
 # known look-ahead and must never be set in production.
+# --- Universe vintage (hindsight-selection test) ---------------------------
+# The 47-ticker list was written in 2026 knowing which ETFs worked; 16 of them
+# did not exist at the backtest start. The coverage gate fixes a ticker's
+# TIMING, not the fact that the candidate list is hindsight. Setting
+# PORTOPT_UNIVERSE_VINTAGE=2016-08-16 restricts the panel to instruments
+# already trading then, which answers "could this have been run in 2016?".
+# Research/diagnostic only; unset in production.
+_vintage_env = os.environ.get("PORTOPT_UNIVERSE_VINTAGE", "").strip()
+UNIVERSE_VINTAGE = None
+if _vintage_env:
+    try:
+        UNIVERSE_VINTAGE = pd.Timestamp(_vintage_env)
+        print(f"[universe-vintage] restricting to tickers trading as at "
+              f"{UNIVERSE_VINTAGE.date()} — hindsight-selection test, not production")
+    except Exception:
+        print(f"[universe-vintage][WARN] unparseable {_vintage_env!r} — ignored")
+
 LEGACY_BACKFILL = bool(os.environ.get("PORTOPT_LEGACY_BACKFILL", "").strip()
                        not in ("", "0", "false", "False"))
 if LEGACY_BACKFILL:
@@ -5438,6 +5456,7 @@ def _oos_cache_fingerprint(prices_aud: pd.DataFrame,
         # this was previously safe by ACCIDENT. Now that a lockboxed reporting
         # run and an unlockboxed live run share one cache dir, hash it
         # explicitly so the two can never collide on a key.
+        h.update(f"vintage:{globals().get('UNIVERSE_VINTAGE') and pd.Timestamp(globals()['UNIVERSE_VINTAGE']).date().isoformat()}".encode())
         h.update(f"legacy_bfill:{bool(globals().get('LEGACY_BACKFILL', False))}".encode())
         _lb = globals().get("DATA_LOCKBOX_DATE")
         _rlb = globals().get("REPORT_LOCKBOX_DATE")
@@ -5938,6 +5957,14 @@ if bool(CFG.get("oos_validation", True)):
             _universe_total_count = 0
             _universe_post_start_count = 0
             print(f"[oos][universe] census failed: {_e}")
+
+        if UNIVERSE_VINTAGE is not None:
+            _oos_long_px, _dropped = _validation.apply_universe_vintage(
+                _oos_long_px, UNIVERSE_VINTAGE, keep=("^AORD",))
+            if _dropped:
+                print(f"[universe-vintage] dropped {len(_dropped)} of "
+                      f"{len(_dropped) + len(_oos_long_px.columns)}: "
+                      + ", ".join(_dropped))
         _oos_long_px = _oos_long_px.ffill()
         if LEGACY_BACKFILL:
             _oos_long_px = _oos_long_px.bfill()

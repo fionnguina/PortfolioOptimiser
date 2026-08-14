@@ -38,6 +38,7 @@ from oos_engine import (run_oos_ensemble_walk_forward,
 
 # Injected by the engine's _sync_research_modes() before the first dispatch.
 LEGACY_BACKFILL = False
+UNIVERSE_VINTAGE = None
 
 
 def _fill_px(df):
@@ -50,6 +51,11 @@ def _fill_px(df):
     panel, so the fix has to live here too or --dev-validation would still be
     measuring the buggy engine.
     """
+    if UNIVERSE_VINTAGE is not None:
+        import validation as _v
+        df, _dropped = _v.apply_universe_vintage(df, UNIVERSE_VINTAGE, keep=("^AORD",))
+        if _dropped:
+            print(f"[universe-vintage] dropped {len(_dropped)} pre-vintage ticker(s)")
     out = df.ffill()
     return out.bfill() if LEGACY_BACKFILL else out
 

@@ -254,3 +254,64 @@ def test_engine_prefers_the_series_and_falls_back_to_the_scalar():
     assert '_rfs = globals().get("rf_series")' in _SRC
     # ...and fall back to the scalar rather than a silent 0.
     assert 'else float(globals().get("rf_annual", 0.0) or 0.0))' in _SRC
+
+
+# ------------------------------------------------------- validation statistics
+
+def test_psr_rises_with_sample_length():
+    """More data on the same Sharpe => more confidence it is real."""
+    import validation as _v
+    a = _v.probabilistic_sharpe_ratio(0.05, 250, 0.0, 3.0)
+    b = _v.probabilistic_sharpe_ratio(0.05, 2500, 0.0, 3.0)
+    assert b > a
+
+
+def test_psr_penalises_negative_skew_and_fat_tails():
+    import validation as _v
+    clean = _v.probabilistic_sharpe_ratio(0.05, 2500, 0.0, 3.0)
+    ugly = _v.probabilistic_sharpe_ratio(0.05, 2500, -0.8, 8.0)
+    assert ugly < clean, "negative skew + fat tails must discount a Sharpe"
+
+
+def test_expected_max_sharpe_grows_with_trials():
+    """Search harder over a null and the best result looks better for free."""
+    import validation as _v
+    assert (_v.expected_max_sharpe(0.04 ** 2, 200)
+            > _v.expected_max_sharpe(0.04 ** 2, 10) > 0)
+    assert _v.expected_max_sharpe(0.0, 100) == 0.0
+
+
+def test_deflated_sharpe_is_below_undeflated_psr():
+    import validation as _v
+    idx = pd.bdate_range("2016-08-16", periods=2500)
+    rng = np.random.default_rng(9)
+    r = pd.Series(rng.normal(0.0006, 0.009, len(idx)), index=idx)
+    m = _v.sharpe_moments(r)
+    psr = _v.probabilistic_sharpe_ratio(m["sr"], m["n"], m["skew"], m["kurt"])
+    dsr = _v.deflated_sharpe_ratio(r, np.random.default_rng(2).normal(0.9, 0.04, 47))
+    assert dsr["dsr"] < psr, "deflation must raise the bar, never lower it"
+
+
+def test_min_track_record_length_is_infinite_without_an_edge():
+    import validation as _v
+    assert _v.min_track_record_length(0.0, 1000, 0.0, 3.0) == float("inf")
+    finite = _v.min_track_record_length(0.05, 1000, 0.0, 3.0)
+    assert np.isfinite(finite) and finite > 1
+
+
+def test_universe_vintage_drops_only_late_listers_and_keeps_protected():
+    import validation as _v
+    idx = pd.bdate_range("2014-01-01", periods=800)
+    old = pd.Series(np.linspace(10, 20, 800), index=idx)
+    late = old.copy(); late.iloc[:600] = np.nan
+    panel = pd.DataFrame({"OLD": old, "LATE": late, "^AORD": old})
+    out, dropped = _v.apply_universe_vintage(panel, idx[500], keep=("^AORD",))
+    assert dropped == ["LATE"]
+    assert list(out.columns) == ["OLD", "^AORD"]
+    # No vintage => untouched.
+    same, none_dropped = _v.apply_universe_vintage(panel, None)
+    assert none_dropped == [] and same.shape == panel.shape
+
+
+def test_vintage_state_is_in_the_cache_fingerprint():
+    assert 'h.update(f"vintage:' in _SRC
