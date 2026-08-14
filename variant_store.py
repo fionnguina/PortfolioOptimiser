@@ -62,13 +62,28 @@ def config_key(config: dict) -> str:
     return _hash(config)
 
 
-def data_key(returns: pd.Series) -> str:
-    """Hash of the evaluation window, so PBO can hold data fixed."""
+def data_key(returns: pd.Series, nav_aud=None) -> str:
+    """Hash of the EVALUATION SETUP — window plus NAV — so PBO holds it fixed.
+
+    NAV belongs here, not in config_key. The nightly evidence run sweeps
+    100k/250k/500k/1M with an identical strategy: same config, same window,
+    but genuinely different returns because IBKR's $5 minimum bites hardest at
+    small scale. Keying on the window alone made all four collide, so the
+    store kept whichever ran first and mislabelled one NAV's series as the
+    config's. Putting NAV here separates them AND keeps PBO honest — it fixes
+    one data_key, so it compares configs at a single scale rather than
+    mistaking a brokerage-drag difference for a strategy difference.
+    """
     if returns is None or len(returns) == 0:
         return "empty"
     idx = returns.index
-    return _hash({"n": int(len(returns)),
-                  "start": str(idx.min()), "end": str(idx.max())})
+    d = {"n": int(len(returns)), "start": str(idx.min()), "end": str(idx.max())}
+    if nav_aud is not None:
+        try:
+            d["nav"] = round(float(nav_aud), 2)
+        except Exception:
+            d["nav"] = str(nav_aud)
+    return _hash(d)
 
 
 def summarise(returns: pd.Series, ppy: float | None = None) -> dict:
@@ -112,7 +127,7 @@ def persist_variant(returns: pd.Series, config: dict, meta: dict | None = None,
         if returns is None or len(returns) < 30:
             return None
         d = _store_dir(app_dir)
-        ck, dk = config_key(config), data_key(returns)
+        ck, dk = config_key(config), data_key(returns, (meta or {}).get("nav_aud"))
         key = f"{ck}_{dk}"
         path = d / f"{key}.pkl"
         index = d / INDEX_NAME

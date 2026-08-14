@@ -441,3 +441,29 @@ def test_pbo_flags_underpowered_trial_counts():
     assert few["underpowered"] is True and "reason" in few
     many = _v.probability_of_backtest_overfitting(_pbo_matrix(N=20))
     assert many["underpowered"] is False and "reason" not in many
+
+
+def test_scale_sweep_variants_do_not_collide(tmp_path):
+    """The nightly evidence run sweeps NAV with one config. Keying on the
+    window alone made all four collide and kept only the first."""
+    import variant_store as vs
+    r = _fake_returns()
+    cfg = {"VOL_TARGET_ANNUAL": 0.16}
+    keys = [vs.persist_variant(r * (1 - i * 0.01), cfg, {"nav_aud": nav},
+                               app_dir=tmp_path)
+            for i, nav in enumerate((100_000, 250_000, 500_000, 1_000_000))]
+    assert len(set(keys)) == 4, "each NAV is a distinct evaluation"
+    idx = vs.load_index(app_dir=tmp_path)
+    assert idx["config_key"].nunique() == 1, "same strategy throughout"
+    assert idx["data_key"].nunique() == 4, "NAV must live in the data key"
+
+
+def test_trial_matrix_compares_configs_at_one_scale(tmp_path):
+    import variant_store as vs
+    r = _fake_returns()
+    for nav in (250_000, 1_000_000):
+        for vt in (0.12, 0.16, 0.20):
+            vs.persist_variant(r * (1 + vt), {"VOL_TARGET_ANNUAL": vt},
+                               {"nav_aud": nav}, app_dir=tmp_path)
+    m = vs.load_trial_matrix(app_dir=tmp_path)
+    assert m.shape[1] == 3, "3 configs at ONE nav, not 6 across two"
