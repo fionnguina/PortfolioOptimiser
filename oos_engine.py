@@ -81,6 +81,7 @@ MU_FF5_PRIOR = None          # optional pd.Series (FF5 μ) for method='ff5'; set
 PER_ASSET_WEIGHT_CAPS = None
 RETURN_OUTLIER_THRESHOLD = None
 LEGACY_BACKFILL = False  # injected by the engine; see _sync_oos_engine
+VARIANT_SINK = None      # injected by the engine; see _variant_sink
 SKIP_REBAL_DELTA = None
 SKIP_REBAL_DELTA_CALM = None
 STRETCH_FLOOR_CALM = None
@@ -1282,7 +1283,7 @@ def run_oos_ensemble_walk_forward(
               f"rebalances SKIP-but-TLH-fired ({(_n_skip_tlh/_n_total*100 if _n_total else 0):.1f}%); "
               f"mean drift on those = {_skip_tlh_mean*100:.2f}% (= extra turnover a live "
               f"full re-trim would execute; CGT cost ~ that x gain-frac x MTR)")
-    return {
+    _out = {
         "n_skip_with_tlh": _n_skip_tlh,
         "skip_tlh_mean_drift": _skip_tlh_mean,
         "blended_returns": blended_returns,
@@ -1302,3 +1303,17 @@ def run_oos_ensemble_walk_forward(
         "hedge_n_triggers": _hedge_n_triggers,
         "hedge_forced_rebals": n_hedge_forced,
     }
+
+    # Variant telemetry. Every walk-forward — research sweep or production —
+    # returns through here exactly once, so this is the only hook needed to
+    # capture per-variant return SERIES (what PBO/CSCV requires and what the
+    # 2026-08-14 validation could not compute because only summary Sharpes had
+    # ever been kept). The engine supplies VARIANT_SINK; failure is swallowed
+    # because telemetry must never break a trading run.
+    if VARIANT_SINK is not None:
+        try:
+            VARIANT_SINK(blended_returns)
+        except Exception as _e:
+            print(f"[variants] sink failed ({type(_e).__name__}: {_e})")
+
+    return _out

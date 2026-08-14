@@ -203,3 +203,64 @@ def apply_universe_vintage(panel: pd.DataFrame, vintage, keep=()) -> tuple:
     if not drop:
         return panel, []
     return panel.drop(columns=drop), sorted(drop)
+
+
+# ---------------------------------------------------------------------------
+# Probability of Backtest Overfitting (CSCV)
+# ---------------------------------------------------------------------------
+
+def probability_of_backtest_overfitting(trial_matrix: pd.DataFrame,
+                                        n_splits: int = 16) -> dict:
+    """PBO via Combinatorially Symmetric Cross-Validation.
+
+    Bailey, Borwein, Lopez de Prado & Zhu. Answers the question the Deflated
+    Sharpe cannot: when you pick the best config in-sample, how often does it
+    land BELOW the median out-of-sample? That is overfitting measured directly,
+    rather than inferred from a trial count.
+
+    `trial_matrix`: rows = time, columns = one config's return series, all on
+    the same evaluation window (variant_store.load_trial_matrix guarantees
+    this — comparing configs across different windows is meaningless here).
+
+    Returns pbo plus the logit distribution. PBO near 0 => the in-sample
+    winner generally stays a winner. PBO >= 0.5 => selection is noise.
+    """
+    from itertools import combinations
+
+    M = trial_matrix.dropna(how="any")
+    n_obs, n_trials = M.shape
+    if n_trials < 2 or n_obs < n_splits * 2:
+        return {"pbo": np.nan, "n_trials": n_trials, "n_obs": n_obs,
+                "reason": "need >=2 trials and >=2 rows per split"}
+    if n_splits % 2:
+        n_splits += 1
+
+    blocks = np.array_split(np.arange(n_obs), n_splits)
+    half = n_splits // 2
+    logits = []
+    for combo in combinations(range(n_splits), half):
+        is_rows = np.concatenate([blocks[i] for i in combo])
+        oos_rows = np.concatenate([blocks[i] for i in range(n_splits)
+                                   if i not in combo])
+        is_m, oos_m = M.values[is_rows], M.values[oos_rows]
+
+        def _sr(a):
+            sd = a.std(axis=0, ddof=1)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                return np.where(sd > 0, a.mean(axis=0) / sd, -np.inf)
+
+        best = int(np.argmax(_sr(is_m)))
+        oos_sr = _sr(oos_m)
+        # Relative rank of the IS winner in the OOS ordering.
+        rank = float((oos_sr < oos_sr[best]).sum() + 1) / (n_trials + 1)
+        rank = min(max(rank, 1e-6), 1 - 1e-6)
+        logits.append(np.log(rank / (1.0 - rank)))
+
+    logits = np.asarray(logits, dtype=float)
+    return {
+        "pbo": float((logits <= 0).mean()),
+        "n_trials": int(n_trials),
+        "n_obs": int(n_obs),
+        "n_combinations": int(len(logits)),
+        "logit_median": float(np.median(logits)),
+    }

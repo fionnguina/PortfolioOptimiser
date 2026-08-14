@@ -296,6 +296,56 @@ _OOS_ENGINE_INJECT = (
 )
 
 
+_VARIANT_CONFIG_KNOBS = (
+    "COV_SHRINKAGE", "COV_METHOD", "CRASH_HEDGE_BASKET", "CRASH_HEDGE_DD_RELEASE",
+    "CRASH_HEDGE_DD_TRIGGER", "CRASH_HEDGE_LOOKBACK_DAYS", "CRISIS_HEDGE_BAND_SD",
+    "CRISIS_HEDGE_MA_DAYS", "CRISIS_HEDGE_WEIGHT", "EARLY_TRIGGER_DD_DEEPEN",
+    "EARLY_TRIGGER_MIN_DAYS", "ENSEMBLE_HALFLIFE_DAYS", "ENSEMBLE_LAMBDA_TEMP",
+    "EXTRA_TICKERS", "LEGACY_BACKFILL", "LOT_MATCH_METHOD",
+    "LT_DEFER_DD_CONDITIONAL", "LT_DEFER_RELEASE_DD", "LT_DEFER_WINDOW_DAYS",
+    "MU_PRIOR_METHOD", "MU_SHRINKAGE_LAMBDA", "PER_ASSET_WEIGHT_CAPS",
+    "REBALANCE_FREQ", "RETURN_OUTLIER_THRESHOLD", "SECTOR_GROUP_CAPS",
+    "SKIP_REBAL_DELTA", "SKIP_REBAL_DELTA_CALM", "STRETCH_FLOOR_CALM",
+    "STRETCH_FLOOR_PREDICTIVE", "TLH_ENABLED", "TREND_SLEEVE_WEIGHT",
+    "UNIVERSE_VINTAGE", "VOL_TARGET_ANNUAL",
+)
+
+
+def _variant_config_snapshot() -> dict:
+    """The strategy knobs that DEFINE a variant. Deliberately excludes the
+    data window — variant_store keys config and data separately so PBO can
+    hold data fixed and vary config (see variant_store docstring)."""
+    out = {}
+    for k in _VARIANT_CONFIG_KNOBS:
+        v = globals().get(k)
+        out[k] = (str(v) if isinstance(v, (pd.Timestamp,)) else v)
+    return out
+
+
+def _variant_sink(blended_returns):
+    """Record one walk-forward's return series for later PBO/CSCV.
+
+    Wired into oos_engine.VARIANT_SINK, which fires once per walk-forward —
+    research sweeps and production runs alike. Opt out with
+    PORTOPT_VARIANT_STORE=0.
+    """
+    if os.environ.get("PORTOPT_VARIANT_STORE", "").strip() in ("0", "false", "False"):
+        return
+    meta = {
+        "git_sha": globals().get("_BUILD_GIT_SHA", "dev"),
+        "mode": ("research" if globals().get("_DATA_LOCKBOX_RESEARCH_MODE") else "live"),
+        "lockbox": (None if globals().get("DATA_LOCKBOX_DATE") is None
+                    else str(pd.Timestamp(DATA_LOCKBOX_DATE).date())),
+        "nav_aud": globals().get("_oos_starting_nav_aud"),
+    }
+    key = _variant_store.persist_variant(
+        blended_returns, _variant_config_snapshot(), meta,
+        app_dir=globals().get("APP_DIR"))
+    if key:
+        print(f"[variants] recorded {key} "
+              f"({len(blended_returns)} obs) -> .cache/variants/")
+
+
 def _sync_oos_engine():
     """Push the ~25 engine config values the OOS engine reads into oos_engine.
     Config is static after load, so one call (after config is defined) suffices;
@@ -303,6 +353,7 @@ def _sync_oos_engine():
     _g = globals()
     for _n in _OOS_ENGINE_INJECT:
         setattr(_oos_engine, _n, _g.get(_n))
+    _oos_engine.VARIANT_SINK = _variant_sink
 
 
 # Research/diagnostic CLI drivers (module split #18, 2026-07-10). The 12 --flag
@@ -311,6 +362,7 @@ def _sync_oos_engine():
 # helper fns + 9 config/runtime values via _sync_research_modes() before dispatch
 # (all defined before the first `if flag:` block). Re-exported for the dispatch.
 import validation as _validation
+import variant_store as _variant_store
 import research_modes as _research_modes
 from research_modes import (
     _run_gfc_stress_test,

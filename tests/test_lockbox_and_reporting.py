@@ -315,3 +315,120 @@ def test_universe_vintage_drops_only_late_listers_and_keeps_protected():
 
 def test_vintage_state_is_in_the_cache_fingerprint():
     assert 'h.update(f"vintage:' in _SRC
+
+
+# --------------------------------------------------------- variant persistence
+
+def _fake_returns(n=300, seed=0, start="2020-01-01"):
+    rng = np.random.default_rng(seed)
+    return pd.Series(rng.normal(0.0005, 0.009, n),
+                     index=pd.bdate_range(start, periods=n))
+
+
+def test_variant_store_roundtrip(tmp_path):
+    import variant_store as vs
+    r = _fake_returns()
+    key = vs.persist_variant(r, {"VOL_TARGET_ANNUAL": 0.16}, {"mode": "research"},
+                             app_dir=tmp_path)
+    assert key
+    back = vs.load_series(key, app_dir=tmp_path)
+    pd.testing.assert_series_equal(back, r)
+    idx = vs.load_index(app_dir=tmp_path)
+    assert len(idx) == 1 and idx.iloc[0]["config_key"] and idx.iloc[0]["sharpe_ann"]
+
+
+def test_variant_store_dedups_identical_config_and_window(tmp_path):
+    import variant_store as vs
+    r = _fake_returns()
+    cfg = {"VOL_TARGET_ANNUAL": 0.16}
+    k1 = vs.persist_variant(r, cfg, app_dir=tmp_path)
+    k2 = vs.persist_variant(r, cfg, app_dir=tmp_path)
+    assert k1 == k2
+    assert len(vs.load_index(app_dir=tmp_path)) == 1, "re-run is the same trial"
+
+
+def test_variant_store_separates_config_from_data(tmp_path):
+    """PBO compares configs on the SAME data — the keys must not collapse."""
+    import variant_store as vs
+    r = _fake_returns()
+    r_later = _fake_returns(start="2021-01-01")
+    a = vs.persist_variant(r, {"VOL_TARGET_ANNUAL": 0.16}, app_dir=tmp_path)
+    b = vs.persist_variant(r, {"VOL_TARGET_ANNUAL": 0.20}, app_dir=tmp_path)
+    c = vs.persist_variant(r_later, {"VOL_TARGET_ANNUAL": 0.16}, app_dir=tmp_path)
+    assert a != b, "different config must be a different variant"
+    assert a != c, "different window must be a different evaluation"
+    idx = vs.load_index(app_dir=tmp_path)
+    assert idx["config_key"].nunique() == 2 and idx["data_key"].nunique() == 2
+
+
+def test_trial_matrix_holds_data_fixed(tmp_path):
+    import variant_store as vs
+    r = _fake_returns()
+    for vt in (0.12, 0.16, 0.20):
+        vs.persist_variant(r * (1 + vt), {"VOL_TARGET_ANNUAL": vt}, app_dir=tmp_path)
+    vs.persist_variant(_fake_returns(start="2022-01-01"), {"VOL_TARGET_ANNUAL": 0.16},
+                       app_dir=tmp_path)
+    m = vs.load_trial_matrix(app_dir=tmp_path)
+    # Picks the window with the most configs — 3, not the lone later one.
+    assert m.shape[1] == 3, m.shape
+
+
+def test_variant_store_never_raises_on_bad_input(tmp_path):
+    import variant_store as vs
+    assert vs.persist_variant(None, {}, app_dir=tmp_path) is None
+    assert vs.persist_variant(pd.Series(dtype=float), {}, app_dir=tmp_path) is None
+    assert vs.load_series("nope", app_dir=tmp_path) is None
+
+
+def test_engine_wires_the_sink_into_oos_engine():
+    assert "_oos_engine.VARIANT_SINK = _variant_sink" in _SRC
+    assert "def _variant_sink(" in _SRC
+    assert "PORTOPT_VARIANT_STORE" in _SRC
+    oos = (Path(__file__).resolve().parent.parent / "oos_engine.py").read_text(encoding="utf-8")
+    assert "VARIANT_SINK(blended_returns)" in oos
+
+
+# ------------------------------------------------------------------- PBO/CSCV
+
+def _pbo_matrix(seed=0, T=1200, N=20):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame(rng.normal(0, 0.01, (T, N)),
+                        index=pd.bdate_range("2020-01-01", periods=T))
+
+
+def test_pbo_detects_a_genuine_persistent_edge():
+    import validation as _v
+    m = _pbo_matrix()
+    m[0] = m[0] + 0.0012          # one column really is better
+    assert _v.probability_of_backtest_overfitting(m)["pbo"] < 0.10
+
+
+def test_pbo_flags_selection_that_cannot_persist():
+    """Column-demeaning forces an in-sample winner to be an out-of-sample
+    loser by construction — the pathological case PBO exists to catch."""
+    import validation as _v
+    m = _pbo_matrix()
+    assert _v.probability_of_backtest_overfitting(m - m.mean())["pbo"] > 0.90
+
+
+def test_pbo_orders_correctly_across_the_three_regimes():
+    """The robust assertion: real edge < raw noise < anti-persistent.
+
+    Pinning absolute values would be wrong — raw iid columns retain genuine
+    finite-sample persistence, so a proper null sits below 0.5, not at it.
+    """
+    import validation as _v
+    raw = _pbo_matrix()
+    edge = raw.copy(); edge[0] = edge[0] + 0.0012
+    p_edge = _v.probability_of_backtest_overfitting(edge)["pbo"]
+    p_raw = _v.probability_of_backtest_overfitting(raw)["pbo"]
+    p_anti = _v.probability_of_backtest_overfitting(raw - raw.mean())["pbo"]
+    assert p_edge < p_raw < p_anti
+
+
+def test_pbo_refuses_underpowered_input():
+    import validation as _v
+    one = _pbo_matrix(N=1)
+    assert np.isnan(_v.probability_of_backtest_overfitting(one)["pbo"])
+    tiny = _pbo_matrix(T=10, N=5)
+    assert np.isnan(_v.probability_of_backtest_overfitting(tiny)["pbo"])

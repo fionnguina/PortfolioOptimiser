@@ -107,6 +107,10 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
 - `PORTOPT_LT_DEFER_DAYS=126` — LT-discount sell deferral (prod 0; FAILED dev/val 2026-07-02)
 - `PORTOPT_REPORT_LOCKBOX=YYYY-MM-DD` — truncate the PUBLISHED backtest (deck +
   Excel). Default = the lockbox boundary. `=""` publishes a to-today backtest.
+- `PORTOPT_UNIVERSE_VINTAGE=2016-08-16` — restrict the panel to instruments
+  already trading then ("could this have been run in 2016?"). Research only;
+  measured -2.98%/yr and -0.21 Sharpe, all of it post-2021 (VALIDATION_2026_08_14.md).
+- `PORTOPT_VARIANT_STORE=0` — disable per-variant return-series capture.
 - `PORTOPT_LEGACY_BACKFILL=1` — restore the pre-inception price back-fill.
   **A/B ONLY — it is a known look-ahead** (see PREREG_backfill_lookahead_fix.md).
 
@@ -123,6 +127,21 @@ blinding them forced the 2026-07-06 revert) vs `oos_prices_report` (truncated
 `LOCKBOX_BOUNDARY` is the single constant; no other hardcoded date.
 **A lockbox scoped to research modes does NOT govern what you publish** — for
 six weeks the deck's backtest ran to today, outside the boundary. See LOCKBOX.md.
+
+## Overfitting instrumentation (`validation.py`, `variant_store.py`)
+- **Deflated Sharpe / PSR / MinTRL** — prices the search that found the config.
+  DSR 0.99 at the observed 47-variant spread (sd 0.040); the spread would have
+  to be ~5x larger before the edge fails. **MinTRL: 4.05 yrs of LIVE data to
+  establish Sharpe>0 at 95%** — the number that should govern what you tell
+  investors. Do NOT feed `metrics_history.jsonl` to DSR: those are production
+  re-runs of ONE config (sd 0.077 = yfinance jitter) and set the null near zero.
+  The honest trial spread comes from distinct variants in `logs/*.log`.
+- **PBO / CSCV** — `probability_of_backtest_overfitting()`. Needs each variant's
+  full return SERIES, which is why `variant_store` exists.
+- **`variant_store`** — one hook (`oos_engine.VARIANT_SINK`, fired once per
+  walk-forward) captures every variant to `.cache/variants/`. Keys config and
+  data SEPARATELY: PBO holds `data_key` fixed and varies `config_key`. Use
+  `load_trial_matrix()`, never compare configs across different windows.
 
 ## Validation protocol (hard-won; do not shortcut)
 1. Gate on the PRODUCTION frame (exe slide metrics at user NAV), not the CV harness alone.
