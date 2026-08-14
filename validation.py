@@ -257,10 +257,20 @@ def probability_of_backtest_overfitting(trial_matrix: pd.DataFrame,
         logits.append(np.log(rank / (1.0 - rank)))
 
     logits = np.asarray(logits, dtype=float)
-    return {
+    # With few trials the OOS rank can only take a handful of values, so the
+    # statistic is an artifact of the arithmetic rather than a measurement —
+    # 2 trials can only ever yield a rank of 1/3 or 2/3. Flag it loudly rather
+    # than let a number that looks like a result get quoted as one.
+    underpowered = n_trials < 10
+    out = {
         "pbo": float((logits <= 0).mean()),
         "n_trials": int(n_trials),
         "n_obs": int(n_obs),
         "n_combinations": int(len(logits)),
         "logit_median": float(np.median(logits)),
+        "underpowered": bool(underpowered),
     }
+    if underpowered:
+        out["reason"] = (f"only {n_trials} trials — PBO needs >=10 distinct "
+                         f"configs on one window to mean anything; treat as N/A")
+    return out

@@ -432,3 +432,12 @@ def test_pbo_refuses_underpowered_input():
     assert np.isnan(_v.probability_of_backtest_overfitting(one)["pbo"])
     tiny = _pbo_matrix(T=10, N=5)
     assert np.isnan(_v.probability_of_backtest_overfitting(tiny)["pbo"])
+
+
+def test_pbo_flags_underpowered_trial_counts():
+    """2 trials can only rank 1/3 or 2/3 — the number must not read as a result."""
+    import validation as _v
+    few = _v.probability_of_backtest_overfitting(_pbo_matrix(N=3))
+    assert few["underpowered"] is True and "reason" in few
+    many = _v.probability_of_backtest_overfitting(_pbo_matrix(N=20))
+    assert many["underpowered"] is False and "reason" not in many
