@@ -826,3 +826,74 @@ def test_health_error_count_excludes_handled_warnings():
     i = _SRC.index("n_err = sum(1 for l in _lines")
     block = _SRC[i:i + 420]
     assert "not _is_tagged(l)" in block, "handled warnings must not count as errors"
+
+
+# ------------------------------------------------- lot-book FX cost-base check
+
+def _recon_fixture():
+    """One US lot bought at 10.00 USD when USD=1.60 AUD, checked when USD=1.40.
+    Cost base is correct; only the spot rate has moved."""
+    fx = pd.Series(1.60, index=pd.bdate_range("2026-01-01", periods=40))
+    fx.iloc[20:] = 1.40
+    lots_df = pd.DataFrame([{"Security": "XUS", "AcqDate": fx.index[0],
+                             "Units": 100.0, "CostBaseAUD": 10.00 * 1.60}])
+    broker = {"XUS": {"units": 100.0, "avg_cost_local": 10.00}, "_ts": "x"}
+    return lots_df, broker, fx
+
+
+def test_spot_fx_comparison_fires_a_false_cost_base_warning():
+    """The old behaviour, pinned so the regression is visible: converting the
+    broker's local cost at TODAY's rate drifts with FX even when the cost base
+    is exactly right."""
+    import lots as _lots
+    lots_df, broker, fx = _recon_fixture()
+    warns = _lots.reconcile_lots_vs_broker(lots_df, broker, fx_map={"XUS": 1.40})
+    assert warns and "cost base may be wrong" in warns[0]
+    assert "spot-FX comparison" in warns[0], "must disclose which comparison ran"
+
+
+def test_currency_free_comparison_clears_it():
+    """With fx_hist the lot is re-expressed at its ACQUISITION rate — which is
+    what AU CGT requires — and the false warning disappears."""
+    import lots as _lots
+    lots_df, broker, fx = _recon_fixture()
+    warns = _lots.reconcile_lots_vs_broker(lots_df, broker,
+                                           fx_map={"XUS": 1.40}, fx_hist=fx)
+    assert warns == [], warns
+
+
+def test_currency_free_still_catches_a_real_cost_base_error():
+    """It must not simply silence the check: a genuinely wrong cost base
+    still fires once FX drift is removed."""
+    import lots as _lots
+    lots_df, broker, fx = _recon_fixture()
+    lots_df.loc[0, "CostBaseAUD"] = 11.00 * 1.60      # 10% too high, real error
+    warns = _lots.reconcile_lots_vs_broker(lots_df, broker,
+                                           fx_map={"XUS": 1.40}, fx_hist=fx)
+    assert warns and "local ccy" in warns[0] and "+1000bps" in warns[0].replace(",", "")
+
+
+def test_subsecond_acquisition_timestamps_do_not_sink_the_check():
+    """Series.asof against a date-resolution index raises 'Cannot losslessly
+    convert units' on '2026-08-03T09:33:30.149710', and the except-clause
+    silently fell back to the spot comparison."""
+    import lots as _lots
+    lots_df, broker, fx = _recon_fixture()
+    lots_df.loc[0, "AcqDate"] = pd.Timestamp("2026-01-01T09:33:30.149710")
+    warns = _lots.reconcile_lots_vs_broker(lots_df, broker,
+                                           fx_map={"XUS": 1.40}, fx_hist=fx)
+    assert warns == [], f"sub-second timestamp must not force the spot path: {warns}"
+
+
+def test_au_tickers_are_unaffected_by_the_local_path():
+    import lots as _lots
+    lots_df = pd.DataFrame([{"Security": "AAA.AX", "AcqDate": pd.Timestamp("2026-01-05"),
+                             "Units": 10.0, "CostBaseAUD": 5.00}])
+    broker = {"AAA.AX": {"units": 10.0, "avg_cost_local": 5.00}, "_ts": "x"}
+    fx = pd.Series(1.5, index=pd.bdate_range("2026-01-01", periods=20))
+    assert _lots.reconcile_lots_vs_broker(lots_df, broker, fx_map={"AAA.AX": 1.0},
+                                          fx_hist=fx) == []
+
+
+def test_engine_passes_the_historical_fx_series():
+    assert 'fx_hist=globals().get("fx_usdaud")' in _SRC

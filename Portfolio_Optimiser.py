@@ -8902,8 +8902,13 @@ if USE_XLWINGS:
                 try:
                     _broker_pos = _nav_mod.load_broker_positions()
                     if _broker_pos:
+                        # fx_hist lets the cost check run in LOCAL currency:
+                        # CostBaseAUD was fixed at acquisition (AU CGT rule), so
+                        # converting the broker's local cost at TODAY's rate
+                        # compared two different things and drifted with FX.
                         _lot_warns = reconcile_lots_vs_broker(
-                            UPDATED_LOTS, _broker_pos, fx_map=fx_map_all)
+                            UPDATED_LOTS, _broker_pos, fx_map=fx_map_all,
+                            fx_hist=globals().get("fx_usdaud"))
                         for _w in _lot_warns:
                             print(f"[lots][WARN] {_w}")
                         _n_pos = sum(1 for _k in _broker_pos if not _k.startswith("_"))

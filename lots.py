@@ -67,7 +67,52 @@ def _normalise_fx_map(fx_map) -> dict:
     return {}
 
 
+def _implied_local_avg(g, fx_hist):
+    """Lot-book average cost expressed in the asset's LOCAL currency.
+
+    Each lot's CostBaseAUD was fixed at ACQUISITION — that is what AU CGT
+    requires, translation at the rate prevailing on the acquisition date — so
+    dividing by the SAME date's rate recovers the local cost the broker
+    reports. Returns None when any lot's date or rate is unusable, so the
+    caller can fall back rather than compare a half-converted number.
+    """
+    if fx_hist is None or len(fx_hist) == 0:
+        return None
+    try:
+        fxs = pd.Series(fx_hist).copy()
+        fxs.index = pd.to_datetime(fxs.index).tz_localize(None).normalize()
+        fxs = fxs[~fxs.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        return None
+    tot_u = 0.0
+    tot_v = 0.0
+    for _, row in g.iterrows():
+        try:
+            u = float(row["Units"])
+            aud = float(row["CostBaseAUD"])
+            # NORMALISE. Lot timestamps carry sub-second precision
+            # ('2026-08-03T09:33:30.149710') and Series.asof against a
+            # date-resolution index raises "Cannot losslessly convert units",
+            # which silently sank this whole comparison. A CGT translation
+            # uses the acquisition DATE anyway.
+            d = pd.Timestamp(row["AcqDate"]).tz_localize(None).normalize()
+        except Exception:
+            return None
+        if u <= 0 or not np.isfinite(aud):
+            continue
+        try:
+            f = float(fxs.asof(d))
+        except Exception:
+            return None
+        if not np.isfinite(f) or f <= 0:
+            return None
+        tot_u += u
+        tot_v += u * (aud / f)
+    return (tot_v / tot_u) if tot_u > 0 else None
+
+
 def reconcile_lots_vs_broker(lots_df, broker_positions, fx_map=None, *,
+                             fx_hist=None,
                              unit_tol: float = LOT_RECON_UNIT_TOL,
                              cost_bps_tol: float = LOT_RECON_COST_BPS_TOL) -> list:
     """Compare the rebuilt lot book against broker-truth positions.
@@ -87,10 +132,21 @@ def reconcile_lots_vs_broker(lots_df, broker_positions, fx_map=None, *,
     fact cost anchor available — hence checking against it every run.
 
     Units are compared first and directly: that is currency-free and catches a
-    missed fill outright. Average cost is compared in AUD, converting the
-    broker's LOCAL-currency avg_cost_local with the SAME fx_map used to build
-    the lot book — so an FX error cancels on both sides instead of firing false
-    warnings on every US ticker.
+    missed fill outright.
+
+    Average cost is compared in LOCAL currency when `fx_hist` is supplied.
+    The earlier design converted the broker's local cost at the CURRENT rate
+    and claimed "an FX error cancels on both sides" — it does not. The lot
+    book's CostBaseAUD was fixed at ACQUISITION (which is what AU CGT
+    requires), so only one side moves with the spot rate and the check drifts
+    apart as FX does. On 2026-08-17 that reported PDBC +115bps, VEA +115bps
+    and SMH +180bps as "CGT cost base may be wrong" when the cost bases were
+    fine — the AUD had simply moved ~1.1% since acquisition. Re-expressing
+    each lot at its own acquisition-date rate brings all three inside ±70bps.
+
+    Without `fx_hist` the old AUD comparison is used for foreign tickers, but
+    the warning says the number is FX-drift-contaminated rather than implying
+    a cost-base error.
     """
     warnings: list = []
     if not broker_positions:
@@ -104,6 +160,7 @@ def reconcile_lots_vs_broker(lots_df, broker_positions, fx_map=None, *,
 
     lot_units: dict = {}
     lot_avg: dict = {}
+    lot_local: dict = {}
     if lots_df is not None and len(lots_df) > 0:
         df = lots_df.copy()
         df["Security"] = df["Security"].astype(str).str.strip().str.upper()
@@ -118,6 +175,10 @@ def reconcile_lots_vs_broker(lots_df, broker_positions, fx_map=None, *,
             if tot > 0:
                 lot_avg[sec] = float(
                     (valid["Units"] * valid["CostBaseAUD"]).sum() / tot)
+                if "AcqDate" in valid.columns:
+                    _il = _implied_local_avg(valid, fx_hist)
+                    if _il is not None and _il > 0:
+                        lot_local[sec] = _il
 
     for tkr in sorted(set(lot_units) | set(broker)):
         b = broker.get(tkr)
@@ -138,7 +199,20 @@ def reconcile_lots_vs_broker(lots_df, broker_positions, fx_map=None, *,
         # avg_cost_local is absent on rows written before 2026-07-17.
         if b_avg_local is None or l_avg_aud is None or b_units <= 0:
             continue
-        fx = fx_lookup.get(tkr, 1.0 if tkr.endswith(".AX") else None)
+
+        is_local_aud = tkr.endswith(".AX")
+        l_local = lot_local.get(tkr)
+        if l_local is not None and not is_local_aud:
+            # Currency-free: both sides in the asset's own currency.
+            bps = (l_local - float(b_avg_local)) / float(b_avg_local) * 1e4
+            if abs(bps) > cost_bps_tol:
+                warnings.append(
+                    f"{tkr}: lot-book avg cost {l_local:,.4f} vs broker "
+                    f"{float(b_avg_local):,.4f} (local ccy, {bps:+.0f}bps) "
+                    f"— CGT cost base may be wrong")
+            continue
+
+        fx = fx_lookup.get(tkr, 1.0 if is_local_aud else None)
         if not fx or fx <= 0:
             continue
         b_avg_aud = float(b_avg_local) * float(fx)
@@ -146,9 +220,18 @@ def reconcile_lots_vs_broker(lots_df, broker_positions, fx_map=None, *,
             continue
         bps = (l_avg_aud - b_avg_aud) / b_avg_aud * 1e4
         if abs(bps) > cost_bps_tol:
+            # Say WHICH comparison produced the number, and don't advise
+            # passing fx_hist when it was passed and turned out unusable.
+            _caveat = ("" if is_local_aud else
+                       (" [spot-FX comparison — includes FX drift since "
+                        "acquisition; fx_hist unusable for this ticker]"
+                        if fx_hist is not None else
+                        " [spot-FX comparison — includes FX drift since "
+                        "acquisition; pass fx_hist for a currency-free check]"))
             warnings.append(
                 f"{tkr}: lot-book avg cost A${l_avg_aud:,.4f} vs broker "
-                f"A${b_avg_aud:,.4f} ({bps:+.0f}bps) — CGT cost base may be wrong")
+                f"A${b_avg_aud:,.4f} ({bps:+.0f}bps) — CGT cost base may be "
+                f"wrong{_caveat}")
 
     return warnings
 
