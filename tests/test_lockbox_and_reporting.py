@@ -669,3 +669,98 @@ def test_drift_still_works_without_a_tax_series():
 
 def test_engine_passes_the_tax_series_to_drift():
     assert 'oos_taxes=globals().get("oos_rebalance_taxes")' in _SRC
+
+
+# ------------------------------------------------- fills-log NAV reconstruction
+
+def _seed_and_fills(tmp_path, units_au=100, units_us=10):
+    import json as _j
+    seed = tmp_path / "seed.json"
+    seed.write_text(_j.dumps([
+        {"Security": "AAA.AX", "Units": units_au, "AcqDate": "2026-07-01T00:00:00"},
+        {"Security": "BBB", "Units": units_us, "AcqDate": "2026-07-01T00:00:00"},
+    ]), encoding="utf-8")
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text("", encoding="utf-8")
+    return seed, fills
+
+
+def test_reconstruction_converts_usd_holdings_to_aud():
+    """`prices` is the engine's MIXED panel; summing it raw added USD values to
+    AUD ones and put the series ~15% below broker NetLiq."""
+    import nav as _nav, tempfile, pathlib
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        seed, fills = _seed_and_fills(tmp)
+        idx = pd.bdate_range("2026-07-01", periods=10)
+        px = pd.DataFrame({"AAA.AX": 10.0, "BBB": 20.0}, index=idx)
+        fx = pd.Series(1.5, index=idx)          # 1 USD = 1.5 AUD
+        raw = _nav.compute_actual_nav_series(px, fills, seed)
+        conv = _nav.compute_actual_nav_series(px, fills, seed, fx_usdaud=fx)
+        assert float(raw.iloc[0]) == pytest.approx(100 * 10 + 10 * 20)
+        assert float(conv.iloc[0]) == pytest.approx(100 * 10 + 10 * 20 * 1.5)
+        # The .AX leg must NOT be converted.
+        assert float(conv.iloc[0]) - float(raw.iloc[0]) == pytest.approx(10 * 20 * 0.5)
+
+
+def test_reconstruction_includes_cash_because_netliq_does():
+    import nav as _nav, tempfile, pathlib
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        seed, fills = _seed_and_fills(tmp)
+        idx = pd.bdate_range("2026-07-01", periods=5)
+        px = pd.DataFrame({"AAA.AX": 10.0, "BBB": 20.0}, index=idx)
+        base = _nav.compute_actual_nav_series(px, fills, seed)
+        withc = _nav.compute_actual_nav_series(px, fills, seed, cash_aud=5000.0)
+        assert float(withc.iloc[0] - base.iloc[0]) == pytest.approx(5000.0)
+
+
+def test_reconstruction_that_fails_validation_is_not_extrapolated(tmp_path, monkeypatch):
+    """It derives a PATH from a position SNAPSHOT. If it cannot match broker
+    where both exist, it has not earned the right to speak where only it does."""
+    import nav as _nav
+    monkeypatch.setattr(_nav, "APP_DIR", tmp_path)
+    seed, fills = _seed_and_fills(tmp_path)
+    idx = pd.bdate_range("2026-07-01", periods=12)
+    # Prices wander; the broker log says something quite different.
+    rng = np.random.default_rng(3)
+    px = pd.DataFrame({"AAA.AX": 10 * (1 + pd.Series(rng.normal(0, 0.03, len(idx)), index=idx)).cumprod(),
+                       "BBB": 20.0}, index=idx)
+    log = tmp_path / "ibkr_nav_log.jsonl"
+    import json as _j
+    with open(log, "w", encoding="utf-8") as fp:
+        for i, d in enumerate(idx[4:]):
+            fp.write(_j.dumps({"ts": d.isoformat(), "net_liquidation_aud": 200_000 + i * 900,
+                               "cash_aud": 1000.0}) + "\n")
+    out = _nav.compute_actual_nav_series_spliced(px, fills, seed, broker_nav_path=log)
+    broker = _nav._load_broker_nav_series(log)
+    pd.testing.assert_series_equal(out, broker), "must fall back to broker-only"
+
+
+def test_first_broker_cash_reads_the_earliest_balance(tmp_path):
+    import nav as _nav, json as _j
+    log = tmp_path / "n.jsonl"
+    with open(log, "w", encoding="utf-8") as fp:
+        fp.write(_j.dumps({"ts": "2026-08-01T10:00:00", "cash_aud": 111.0}) + "\n")
+        fp.write(_j.dumps({"ts": "2026-07-01T10:00:00", "cash_aud": 222.0}) + "\n")
+    assert _nav._first_broker_cash(log) == pytest.approx(222.0)
+
+
+def test_engine_passes_fx_to_the_reconstruction():
+    assert 'fx_usdaud=globals().get("fx_usdaud")' in _SRC
+
+
+def test_nav_source_label_is_read_after_the_call_that_sets_it():
+    """First attempt read LAST_NAV_SOURCE before the spliced call ran, so the
+    log said 'unknown' — the same ordering slip as the variant-sink NAV."""
+    call = _SRC.index("_live_nav = compute_actual_nav_series_spliced(")
+    label = _SRC.index('_nav_src = "actual-NAV: "')
+    assert label > call, "label must be read after the call populates it"
+
+
+def test_nav_module_records_which_source_it_returned():
+    import nav as _nav
+    assert hasattr(_nav, "LAST_NAV_SOURCE")
+    src = (Path(__file__).resolve().parent.parent / "nav.py").read_text(encoding="utf-8")
+    assert 'LAST_NAV_SOURCE"] = "broker NetLiq only (recon failed validation)"' in src
+    assert 'LAST_NAV_SOURCE"] = "fills recon (validated) + broker NetLiq"' in src

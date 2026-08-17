@@ -20,7 +20,8 @@ import pandas as pd
 APP_DIR = Path(".")
 
 
-def compute_actual_nav_series(prices, fills_path, seed_path):
+def compute_actual_nav_series(prices, fills_path, seed_path,
+                              fx_usdaud=None, cash_aud: float = 0.0):
     """Reconstruct daily NAV series from seed lots + executed fills.
 
     Returns a pd.Series of portfolio market value indexed by date,
@@ -102,6 +103,18 @@ def compute_actual_nav_series(prices, fills_path, seed_path):
     for d, tk, du in events:
         by_ticker.setdefault(tk, []).append((d, du))
 
+    # FX: `prices` is the engine's MIXED USD/AUD panel, so summing it raw adds
+    # USD position values to AUD ones. At AUDUSD~0.65 that understated the US
+    # sleeve badly enough to put the whole series ~15% below broker NetLiq.
+    fxs = None
+    if fx_usdaud is not None:
+        try:
+            fxs = pd.to_numeric(pd.Series(fx_usdaud), errors="coerce")
+            fxs.index = pd.to_datetime(fxs.index).tz_localize(None)
+            fxs = fxs.reindex(dates).ffill().bfill()
+        except Exception:
+            fxs = None
+
     nav = pd.Series(0.0, index=dates)
     for tk, evs in by_ticker.items():
         if tk not in prices.columns:
@@ -117,8 +130,15 @@ def compute_actual_nav_series(prices, fills_path, seed_path):
             units_series.loc[d] = cum
         px = pd.to_numeric(prices[tk].reindex(dates),
                             errors="coerce").ffill().fillna(0.0)
+        if fxs is not None and not str(tk).endswith(".AX") and not str(tk).startswith("^"):
+            px = px * fxs                      # USD -> AUD
         nav = nav.add(units_series * px, fill_value=0.0)
 
+    # NetLiquidation = positions + cash. Omitting cash left the reconstruction
+    # short by the full cash balance (~4.6% of NAV here) and biased every
+    # return, since a cash buffer damps them.
+    if cash_aud:
+        nav = nav + float(cash_aud)
     return nav
 
 
@@ -270,8 +290,41 @@ def last_position_change_date(path=None):
     return last
 
 
+RECON_MAX_MEDIAN_DAILY_ERR = 0.0025   # 25bps median; above this, don't extrapolate
+# What the last call actually returned, so callers can label it honestly
+# rather than always claiming "fills recon + broker".
+LAST_NAV_SOURCE = "unknown"
+
+
+def _first_broker_cash(path=None) -> float:
+    """Earliest recorded cash balance, for the pre-broker head."""
+    try:
+        p = Path(path) if path is not None else (APP_DIR / "ibkr_nav_log.jsonl")
+        if not p.exists():
+            return 0.0
+        best = None
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            ts, c = r.get("ts"), r.get("cash_aud")
+            if ts is None or c is None:
+                continue
+            t = pd.Timestamp(str(ts)).tz_localize(None) if pd.Timestamp(str(ts)).tzinfo else pd.Timestamp(str(ts))
+            if best is None or t < best[0]:
+                best = (t, float(c))
+        return float(best[1]) if best else 0.0
+    except Exception:
+        return 0.0
+
+
 def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
-                                      broker_nav_path=None) -> pd.Series:
+                                      broker_nav_path=None,
+                                      fx_usdaud=None) -> pd.Series:
     """Actual-NAV path: fills-log reconstruction, upgraded to BROKER truth
     where ibkr_nav_log.jsonl has data (user directive 2026-07-08 — the
     fund's performance record is the broker's number).
@@ -282,9 +335,12 @@ def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
     snapshot, broker RETURNS applied cumulatively from there. On overlap
     days a return divergence > 50bps prints a [drift][WARN] — that gap is
     reconstruction error (missed fees/marks), worth knowing about."""
-    recon = compute_actual_nav_series(prices, fills_path, seed_path)
+    recon = compute_actual_nav_series(prices, fills_path, seed_path,
+                                      fx_usdaud=fx_usdaud,
+                                      cash_aud=_first_broker_cash(broker_nav_path))
     broker = _load_broker_nav_series(broker_nav_path)
     if len(broker) < 2 or recon.empty:
+        globals()["LAST_NAV_SOURCE"] = "fills recon only (no broker log)"
         return recon
     seam = broker.index[0]
     recon_at_seam = recon.reindex(recon.index.union(broker.index)).ffill().asof(seam)
@@ -292,17 +348,41 @@ def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
         return recon
     spliced_tail = recon_at_seam * (broker / float(broker.iloc[0]))
     out = pd.concat([recon[recon.index < seam], spliced_tail]).sort_index()
-    # Return-divergence check on overlapping days (unit-free).
+    # Validate on the OVERLAP, and refuse to extrapolate if it fails.
+    #
+    # The reconstruction derives a NAV PATH from lots_seed.json, which is a
+    # broker POSITION SNAPSHOT with nominal AcqDates — not a transaction
+    # history. IBKR serves no fill history and every order in the fills log
+    # shows qty_filled=0 / qty_remaining=qty_requested / is_done=false, i.e.
+    # genuinely unfilled. You cannot recover a path from a snapshot, so where
+    # the seed's nominal dates disagree with what was actually held the
+    # reconstruction is simply wrong — measured 11-15% below broker before
+    # 2026-08-04, converging only once the seed caught up.
+    #
+    # So: if it cannot match broker on the days where BOTH exist, it has not
+    # earned the right to speak for the days where only it exists. Fall back
+    # to broker-only rather than emit a plausible-looking fiction.
     try:
         rr = recon.pct_change().reindex(broker.index).dropna()
         br = broker.pct_change().dropna()
         both = rr.index.intersection(br.index)
-        bad = (rr.reindex(both) - br.reindex(both)).abs() > 0.005
-        if bool(bad.any()):
-            days = [str(d.date()) for d in both[bad][:5]]
-            print(f"[drift][WARN] fills-log NAV reconstruction diverges from broker "
-                  f"NetLiq by >50bps/day on {int(bad.sum())} day(s) (e.g. {days}) — "
-                  f"reconstruction is missing fees/marks; broker series is authoritative")
+        err = (rr.reindex(both) - br.reindex(both)).abs().dropna()
+        if len(err) >= 3:
+            med = float(err.median())
+            n_bad = int((err > 0.005).sum())
+            if med > RECON_MAX_MEDIAN_DAILY_ERR:
+                print(f"[nav][WARN] fills-log reconstruction FAILED validation "
+                      f"(median daily error {med*100:.2f}% over {len(err)} overlap "
+                      f"day(s), {n_bad} above 50bps). lots_seed.json is a position "
+                      f"SNAPSHOT, not a transaction history, so the pre-broker path "
+                      f"cannot be derived — using BROKER-ONLY NAV rather than "
+                      f"splicing an unvalidated head.")
+                globals()["LAST_NAV_SOURCE"] = "broker NetLiq only (recon failed validation)"
+                return broker
+            if n_bad:
+                print(f"[nav] reconstruction passed validation (median daily error "
+                      f"{med*100:.2f}%) with {n_bad} day(s) above 50bps")
     except Exception:
         pass
+    globals()["LAST_NAV_SOURCE"] = "fills recon (validated) + broker NetLiq"
     return out

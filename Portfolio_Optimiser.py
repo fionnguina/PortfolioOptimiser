@@ -109,6 +109,7 @@ from cgt import (
     tax_provision_from_ledger,
     TAX_SETTLEMENTS_FILENAME,
 )
+import nav as _nav_mod
 from drift import (
     DRIFT_MONTHLY_THRESH,
     DRIFT_CUMULATIVE_THRESH,
@@ -7951,17 +7952,24 @@ if USE_XLWINGS:
                 # values, so compute_live_max_drawdown returned ~0% forever and the
                 # DD alert could NEVER fire — while real NetLiq fell 249.4k -> 244.4k.
                 # Audit 2026-07-17. Broker series is authoritative.
-                _nav_src = "actual-NAV (fills recon + broker NetLiq)"
                 try:
+                    # `prices` is the MIXED USD/AUD panel — pass the FX series
+                    # so US positions are valued in AUD like NetLiq is.
                     _live_nav = compute_actual_nav_series_spliced(
                         prices,
                         APP_DIR / "ibkr_fills_log.jsonl",
                         APP_DIR / "lots_seed.json",
+                        fx_usdaud=globals().get("fx_usdaud"),
                     )
                 except Exception as _e_nav_src:
                     print(f"[drift] actual-NAV series failed ({_e_nav_src}); "
                           f"falling back to live_nav_history")
                     _live_nav = pd.Series(dtype=float)
+                # Read the label AFTER the call that sets it — the
+                # reconstruction is dropped entirely when it fails validation,
+                # and the old hardcoded "fills recon + broker NetLiq" then lied.
+                _nav_src = "actual-NAV: " + str(
+                    getattr(_nav_mod, "LAST_NAV_SOURCE", "unknown"))
                 # Keep the history file as a truthful record — _portfolio_val_for_log
                 # now resolves to broker NetLiq via _resolve_live_nav_aud().
                 append_live_nav_history(_nav_path, _portfolio_val_for_log)
