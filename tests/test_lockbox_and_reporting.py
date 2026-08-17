@@ -609,3 +609,63 @@ def test_pbo_readiness_reports_the_shortfall(tmp_path):
 
     ready = vs.pbo_readiness(app_dir=tmp_path, min_configs=3)
     assert ready["ready"] is True and ready["shortfall"] == 0
+
+
+# ------------------------------------------------- FY tax vs live NAV convention
+
+def _july_case():
+    """July 2026 in miniature: a 5.53% FY settlement the day after the
+    2026-07-13 rebalance, which live NetLiq never books."""
+    idx = pd.bdate_range("2026-06-30", "2026-08-17")
+    oos = pd.Series(0.0005, index=idx)
+    oos.loc[pd.Timestamp("2026-07-14")] -= 0.0553
+    nav = pd.Series(np.linspace(240_000, 255_000, len(idx)), index=idx)
+    taxes = pd.Series({pd.Timestamp("2026-07-13"): 0.0553})
+    return nav, oos, taxes
+
+
+def test_fy_tax_is_netted_out_of_drift_and_shown_separately():
+    import drift
+    nav, oos, taxes = _july_case()
+    df = drift.compute_monthly_nav_drift(nav, oos, "2026-06-22", oos_taxes=taxes)
+    jul = df.iloc[0]
+    assert jul["OOS Tax"] == pytest.approx(0.0553, abs=1e-6)
+    # ex-Tax must be the raw return with the charge added back.
+    assert jul["OOS ex-Tax"] > jul["OOS Return"]
+    # Drift is measured against ex-Tax, so it shrinks by ~the tax amount.
+    raw = drift.compute_monthly_nav_drift(nav, oos, "2026-06-22")
+    assert jul["Drift"] < raw.iloc[0]["Drift"] - 0.05
+
+
+def test_netting_is_exact_because_the_charge_is_additive():
+    """oos_engine does seg_b.iloc[0] -= cost + tax, so adding the fraction
+    back on that same day recovers the pre-tax return exactly."""
+    import drift
+    idx = pd.bdate_range("2026-07-01", periods=20)
+    oos = pd.Series(0.001, index=idx)
+    clean = oos.copy()
+    oos.loc[idx[8]] -= 0.04
+    ex, per_day = drift._net_out_fy_tax(oos, pd.Series({idx[7]: 0.04}))
+    pd.testing.assert_series_equal(ex, clean, check_exact=False, rtol=1e-12)
+    assert per_day.sum() == pytest.approx(0.04)
+
+
+def test_months_without_a_tax_charge_are_unchanged():
+    import drift
+    nav, oos, taxes = _july_case()
+    df = drift.compute_monthly_nav_drift(nav, oos, "2026-06-22", oos_taxes=taxes)
+    aug = df[df["Month"] == "2026-08"].iloc[0]
+    assert aug["OOS Tax"] == 0.0
+    assert aug["OOS ex-Tax"] == pytest.approx(aug["OOS Return"])
+
+
+def test_drift_still_works_without_a_tax_series():
+    """Back-compat: the argument is optional and absence must not crash."""
+    import drift
+    nav, oos, _ = _july_case()
+    df = drift.compute_monthly_nav_drift(nav, oos, "2026-06-22")
+    assert not df.empty and (df["OOS Tax"] == 0.0).all()
+
+
+def test_engine_passes_the_tax_series_to_drift():
+    assert 'oos_taxes=globals().get("oos_rebalance_taxes")' in _SRC

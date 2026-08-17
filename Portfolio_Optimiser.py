@@ -7973,8 +7973,17 @@ if USE_XLWINGS:
                 _fills_df = _read_actual_fills(wb)
                 _fills_drift = compute_fill_drift(_fills_df, _drift_log_path)
                 _oos_ret = globals().get("oos_returns_daily", pd.Series(dtype=float))
+                # Net out the simulated FY tax so drift measures PERFORMANCE.
+                # The backtest settles Australian FY CGT inside NAV; live
+                # NetLiq does not (accrued CGT is reserved as un-investable
+                # cash), so without this the tracker breaches every July on a
+                # convention difference — 2026-07 read +5.24pp, of which
+                # ~5.5pp was the 2026-07-13 settlement and only ~-0.5pp was
+                # the real holdings difference. oos_rebalance_taxes is already
+                # published by the OOS block above.
                 _nav_drift = compute_monthly_nav_drift(
                     _live_nav, _oos_ret, LIVE_TRADING_START_DATE,
+                    oos_taxes=globals().get("oos_rebalance_taxes"),
                 )
                 _write_drift_sheets(wb, _fills_drift, _nav_drift, _live_nav, _live_dd)
                 _n_warn = _print_drift_warnings(_fills_drift, _nav_drift, _live_dd)

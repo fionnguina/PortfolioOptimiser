@@ -139,14 +139,63 @@ def compute_live_max_drawdown(nav_series: pd.Series) -> float:
     return float(dd.iloc[-1])  # current drawdown (last observation)
 
 
+def _net_out_fy_tax(oos: pd.Series, oos_taxes: pd.Series | None):
+    """Add back the simulated FY tax charge, and report it per day.
+
+    The backtest settles the Australian financial year's CGT at the first
+    rebalance after 30 June, subtracting it ADDITIVELY from that segment's
+    first realised day (oos_engine: `seg_b.iloc[0] -= cost_frac + tax_frac`),
+    so adding the fraction back on that same day is exact rather than an
+    approximation.
+
+    Why bother: live NetLiq does NOT book that charge — the live book reserves
+    accrued CGT as un-investable cash instead — so comparing the two makes the
+    tracker fire every July for a modelling convention rather than a tracking
+    error. July 2026 was +5.24pp of "drift", of which ~5.5pp was a 5.53% tax
+    settlement on 2026-07-13 and only ~-0.5pp was the real holdings
+    difference. Every one of the 10 charges in the backtest lands in July or
+    early August, so this recurs annually — and since cumulative drift is a
+    cumsum, one false July latches the breach permanently.
+    """
+    if oos is None or oos.empty or oos_taxes is None or len(oos_taxes) == 0:
+        return oos, pd.Series(0.0, index=(oos.index if oos is not None else []))
+    taxes = pd.Series(oos_taxes).copy()
+    try:
+        taxes.index = pd.to_datetime(taxes.index).tz_localize(None)
+    except Exception:
+        return oos, pd.Series(0.0, index=oos.index)
+    ex = oos.copy()
+    per_day = pd.Series(0.0, index=oos.index)
+    for t, frac in taxes.items():
+        try:
+            f = float(frac)
+        except Exception:
+            continue
+        if f <= 0:
+            continue
+        after = ex.index[ex.index > pd.Timestamp(t)]
+        if len(after) == 0:
+            continue
+        d = after[0]
+        ex.loc[d] = float(ex.loc[d]) + f
+        per_day.loc[d] = per_day.loc[d] + f
+    return ex, per_day
+
+
 def compute_monthly_nav_drift(
     live_nav: pd.Series,
     oos_returns: pd.Series,
     live_start_date: str | None,
+    oos_taxes: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Per-month live vs OOS-expected returns since live_start_date.
 
-    Columns: Month | Live Return | OOS Return | Drift | Cumulative Drift
+    Columns: Month | Live Return | OOS Return | OOS Tax | OOS ex-Tax |
+             Drift | Cumulative Drift
+
+    Drift is measured against OOS ex-Tax, so it reflects PERFORMANCE
+    divergence. The FY tax settlement is shown in its own column rather than
+    masquerading as tracking error — see _net_out_fy_tax.
     """
     if live_start_date is None or live_nav is None or live_nav.empty:
         return pd.DataFrame()
@@ -158,6 +207,7 @@ def compute_monthly_nav_drift(
     oos = oos.copy()
     if not oos.empty:
         oos.index = pd.to_datetime(oos.index).tz_localize(None)
+    oos_ex, tax_daily = _net_out_fy_tax(oos, oos_taxes)
     months: list[dict] = []
     # Live NAV resampled to month-end (last observed NAV per month).
     nav_me = nav.resample("ME").last().dropna()
@@ -171,15 +221,22 @@ def compute_monthly_nav_drift(
         live_ret = float(end_nav / prev_nav - 1.0) if prev_nav > 0 else 0.0
         # OOS expected return = product of OOS daily returns over the same window.
         if not oos.empty:
-            window = oos[(oos.index > prev_dt) & (oos.index <= month_end)]
+            mask = (oos.index > prev_dt) & (oos.index <= month_end)
+            window = oos[mask]
             oos_ret = float((1.0 + window).prod() - 1.0) if not window.empty else 0.0
+            win_ex = oos_ex[mask]
+            oos_ret_ex = float((1.0 + win_ex).prod() - 1.0) if not win_ex.empty else 0.0
+            tax_in_month = float(tax_daily[mask].sum()) if not window.empty else 0.0
         else:
-            oos_ret = 0.0
-        drift = live_ret - oos_ret
+            oos_ret = oos_ret_ex = tax_in_month = 0.0
+        # Compare like with like: live NetLiq does not book the FY tax charge.
+        drift = live_ret - oos_ret_ex
         months.append({
             "Month": month_end.strftime("%Y-%m"),
             "Live Return": round(live_ret, 6),
             "OOS Return": round(oos_ret, 6),
+            "OOS Tax": round(tax_in_month, 6),
+            "OOS ex-Tax": round(oos_ret_ex, 6),
             "Drift": round(drift, 6),
         })
         prev_nav = float(end_nav)
@@ -229,10 +286,14 @@ def _print_drift_warnings(
     if nav_drift_df is not None and not nav_drift_df.empty:
         for _, r in nav_drift_df.iterrows():
             if abs(float(r["Drift"])) > DRIFT_MONTHLY_THRESH:
+                _tax = float(r.get("OOS Tax", 0.0) or 0.0)
+                _ex = float(r.get("OOS ex-Tax", r["OOS Return"]))
+                _tx = (f", after netting out a {_tax*100:.2f}% FY tax settlement"
+                       if _tax > 0 else "")
                 print(f"[drift][WARN] {r['Month']}: monthly drift "
                       f"{float(r['Drift'])*100:+.2f}% > ±{DRIFT_MONTHLY_THRESH*100:.0f}% "
-                      f"(live {float(r['Live Return'])*100:+.2f}% vs OOS "
-                      f"{float(r['OOS Return'])*100:+.2f}%)")
+                      f"(live {float(r['Live Return'])*100:+.2f}% vs OOS ex-tax "
+                      f"{_ex*100:+.2f}%{_tx})")
                 n_warn += 1
         cum = float(nav_drift_df["Cumulative Drift"].iloc[-1])
         if abs(cum) > DRIFT_CUMULATIVE_THRESH:
