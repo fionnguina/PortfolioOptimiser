@@ -12,11 +12,21 @@ Design notes that matter:
     call-site churn and no chance of a variant quietly not being recorded.
 
   * TWO keys, not one. `config_key` hashes the strategy knobs ONLY;
-    `data_key` hashes the price panel's shape and date range. PBO compares
+    `data_key` hashes the evaluation setup — window and NAV. PBO compares
     configs evaluated on the SAME data, so it selects one data_key and varies
     config_key. Collapsing these into a single fingerprint — the mistake the
     OOS cache makes deliberately for its own purposes — would make the store
     useless for this.
+
+  * RUN A SWEEP IN ONE SITTING. The panel is downloaded with a rolling
+    `period="12y"`, so its start moves forward every day; two runs on
+    different dates see genuinely different data and correctly get different
+    data_keys. Variants therefore do NOT accumulate across days into one
+    comparable matrix — 10 configs swept on one afternoon are computable, the
+    same 10 spread over two weeks are not. `pbo_readiness()` reports where you
+    stand. (Inner-joining across days would look tempting and be wrong: a
+    later panel start shifts the whole rebalance schedule, so the series are
+    not the same experiment even on shared dates.)
 
   * Failure is silent and non-fatal. A telemetry store must never take down
     a trading pipeline. Every entry point swallows its own exceptions.
@@ -206,3 +216,34 @@ def load_trial_matrix(app_dir=None, data_key_filter: str | None = None) -> pd.Da
         if s is not None and len(s):
             cols[row["config_key"]] = s
     return pd.DataFrame(cols).sort_index() if cols else pd.DataFrame()
+
+
+def pbo_readiness(app_dir=None, min_configs: int = 10) -> dict:
+    """How close the store is to supporting a meaningful PBO.
+
+    PBO needs >= ~10 distinct configs sharing ONE evaluation setup. Because
+    the panel start rolls daily, that means a sweep run in a single sitting —
+    so "how many variants do I have" is the wrong question and "how many share
+    my best data_key" is the right one.
+    """
+    idx = load_index(app_dir)
+    if idx.empty:
+        return {"ready": False, "best_data_key": None, "n_configs": 0,
+                "n_records": 0, "shortfall": min_configs,
+                "reason": "store is empty"}
+    counts = idx.groupby("data_key")["config_key"].nunique().sort_values(ascending=False)
+    best, n = counts.index[0], int(counts.iloc[0])
+    ready = n >= min_configs
+    return {
+        "ready": bool(ready),
+        "best_data_key": best,
+        "n_configs": n,
+        "n_records": int(len(idx)),
+        "n_data_keys": int(idx["data_key"].nunique()),
+        "shortfall": max(0, min_configs - n),
+        "reason": ("ready" if ready else
+                   f"best window has {n} distinct config(s); PBO needs "
+                   f"{min_configs}. Sweep configs in ONE sitting — the panel "
+                   f"start rolls daily, so runs on different days land on "
+                   f"different windows."),
+    }

@@ -322,12 +322,19 @@ def _variant_config_snapshot() -> dict:
     return out
 
 
-def _variant_sink(blended_returns):
+def _variant_sink(blended_returns, nav_aud=None):
     """Record one walk-forward's return series for later PBO/CSCV.
 
     Wired into oos_engine.VARIANT_SINK, which fires once per walk-forward —
     research sweeps and production runs alike. Opt out with
     PORTOPT_VARIANT_STORE=0.
+
+    `nav_aud` comes from the walk-forward's own signature. Reading the global
+    instead was wrong twice: _oos_starting_nav_aud is assigned AFTER the first
+    OOS call, so the primary production record stored no NAV at all; and it
+    never changes across the scale sweep, so 100k/250k/500k/1M all produced
+    one identical key and three of the four series were silently dropped.
+    The global remains only as a fallback for any caller that predates this.
     """
     if os.environ.get("PORTOPT_VARIANT_STORE", "").strip() in ("0", "false", "False"):
         return
@@ -336,7 +343,8 @@ def _variant_sink(blended_returns):
         "mode": ("research" if globals().get("_DATA_LOCKBOX_RESEARCH_MODE") else "live"),
         "lockbox": (None if globals().get("DATA_LOCKBOX_DATE") is None
                     else str(pd.Timestamp(DATA_LOCKBOX_DATE).date())),
-        "nav_aud": globals().get("_oos_starting_nav_aud"),
+        "nav_aud": (float(nav_aud) if nav_aud is not None
+                    else globals().get("_oos_starting_nav_aud")),
     }
     key = _variant_store.persist_variant(
         blended_returns, _variant_config_snapshot(), meta,

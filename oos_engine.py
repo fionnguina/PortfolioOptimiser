@@ -1312,7 +1312,13 @@ def run_oos_ensemble_walk_forward(
     # because telemetry must never break a trading run.
     if VARIANT_SINK is not None:
         try:
-            VARIANT_SINK(blended_returns)
+            # Pass the NAV this walk-forward ACTUALLY ran at. The sink used to
+            # read a module global, which was wrong twice over: the global is
+            # assigned after the first call (so the primary run recorded no
+            # NAV), and it never changes across the scale sweep's
+            # 100k/250k/500k/1M iterations (so all four collided into one
+            # record). The real value is right here in the signature.
+            VARIANT_SINK(blended_returns, starting_nav_aud)
         except Exception as _e:
             print(f"[variants] sink failed ({type(_e).__name__}: {_e})")
 

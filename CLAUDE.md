@@ -142,6 +142,12 @@ six weeks the deck's backtest ran to today, outside the boundary. See LOCKBOX.md
   walk-forward) captures every variant to `.cache/variants/`. Keys config and
   data SEPARATELY: PBO holds `data_key` fixed and varies `config_key`. Use
   `load_trial_matrix()`, never compare configs across different windows.
+  **Sweep in ONE sitting** — the panel start rolls with `period="12y"`, so runs
+  on different days land on different windows and do NOT accumulate into one
+  comparable matrix. `pbo_readiness()` says where you stand (needs ~10 configs
+  on one window). NAV is part of `data_key`, not config: the scale sweep's
+  100k→1M are the same strategy at genuinely different brokerage drag
+  (Sharpe 0.98→1.03).
 
 ## Validation protocol (hard-won; do not shortcut)
 1. Gate on the PRODUCTION frame (exe slide metrics at user NAV), not the CV harness alone.

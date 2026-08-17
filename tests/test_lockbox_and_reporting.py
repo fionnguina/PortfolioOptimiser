@@ -385,7 +385,7 @@ def test_engine_wires_the_sink_into_oos_engine():
     assert "def _variant_sink(" in _SRC
     assert "PORTOPT_VARIANT_STORE" in _SRC
     oos = (Path(__file__).resolve().parent.parent / "oos_engine.py").read_text(encoding="utf-8")
-    assert "VARIANT_SINK(blended_returns)" in oos
+    assert "VARIANT_SINK(blended_returns, starting_nav_aud)" in oos
 
 
 # ------------------------------------------------------------------- PBO/CSCV
@@ -571,3 +571,41 @@ def test_unattended_runs_do_not_auto_open_powerpoint():
     did not reach it — an unattended run still left a PowerPoint resident."""
     assert '"--auto-pipeline" in sys.argv) or globals().get("_SKIP_LIVE_PIPELINE")' in _SRC
     assert "deck saved but not opened" in _SRC
+
+
+def test_sink_takes_nav_as_an_argument_not_from_a_global():
+    """Two bugs, one cause: the global is assigned AFTER the first OOS call
+    (primary record stored no NAV) and never changes across the scale sweep
+    (100k/250k/500k/1M all collided into one key)."""
+    oos = (Path(__file__).resolve().parent.parent / "oos_engine.py").read_text(encoding="utf-8")
+    assert "VARIANT_SINK(blended_returns, starting_nav_aud)" in oos
+    assert "def _variant_sink(blended_returns, nav_aud=None):" in _SRC
+    # Argument wins; the global survives only as a fallback.
+    assert "float(nav_aud) if nav_aud is not None" in _SRC
+
+
+def test_scale_sweep_navs_produce_distinct_records(tmp_path):
+    """End-to-end of the fix: four NAVs, one config, four keys."""
+    import variant_store as vs
+    r = _fake_returns()
+    cfg = {"VOL_TARGET_ANNUAL": 0.16}
+    keys = {vs.persist_variant(r * (1 - i * 0.005), cfg, {"nav_aud": nav}, app_dir=tmp_path)
+            for i, nav in enumerate((100_000, 250_000, 500_000, 1_000_000))}
+    assert len(keys) == 4
+    assert vs.load_index(app_dir=tmp_path)["nav_aud"].notna().all(), "NAV must be recorded"
+
+
+def test_pbo_readiness_reports_the_shortfall(tmp_path):
+    import variant_store as vs
+    r = _fake_returns()
+    empty = vs.pbo_readiness(app_dir=tmp_path)
+    assert empty["ready"] is False and empty["n_configs"] == 0
+
+    for vt in (0.10, 0.12, 0.14):
+        vs.persist_variant(r * (1 + vt), {"VOL_TARGET_ANNUAL": vt},
+                           {"nav_aud": 250_000}, app_dir=tmp_path)
+    few = vs.pbo_readiness(app_dir=tmp_path)
+    assert few["ready"] is False and few["n_configs"] == 3 and few["shortfall"] == 7
+
+    ready = vs.pbo_readiness(app_dir=tmp_path, min_configs=3)
+    assert ready["ready"] is True and ready["shortfall"] == 0
