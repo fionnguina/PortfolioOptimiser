@@ -1305,7 +1305,11 @@ def export_to_ppt(results, trades, charts=None):
 
         # ---- ROADSHOW SLIDE (Phase 3): inserted at position 2 after build. ----
         try:
-            oos_rets = globals().get("oos_returns_daily", pd.Series(dtype=float))
+            # Reporting-truncated series so the chart ends where the metrics
+            # table does. oos_returns_daily stays FULL for the drift tracker.
+            oos_rets = globals().get("oos_returns_report", pd.Series(dtype=float))
+            if not isinstance(oos_rets, pd.Series) or oos_rets.empty:
+                oos_rets = globals().get("oos_returns_daily", pd.Series(dtype=float))
             oos_mtx = globals().get("oos_metrics_table", pd.DataFrame())
             # Reporting-lockboxed frame so the CHART ends on the same date as
             # the metrics table; falls back to the full panel if absent.

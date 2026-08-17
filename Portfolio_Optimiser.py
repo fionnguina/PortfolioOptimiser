@@ -242,7 +242,7 @@ _PPT_EXPORT_INJECT = (
     "compute_actual_nav_series_spliced", "ensemble_mix_live", "ff5_raw",
     "_universe_post_start_count", "_universe_total_count",
     "oos_metrics_table", "oos_metrics_table_roadshow", "oos_prices_aud_long",
-    "oos_prices_report",
+    "oos_prices_report", "oos_returns_report",
     "oos_rebalance_costs", "oos_rebalance_taxes", "oos_returns_daily",
     "oos_returns_daily_roadshow", "oos_scale_metrics", "oos_scale_results",
     "oos_softmax_history", "oos_tlh_events", "portfolio_value_series", "prices",
@@ -5962,6 +5962,7 @@ globals()["returns_wide_df"] = df_cov_wide.copy()
 # a separate long-history (12y) view here so live optimisation behaviour is
 # unchanged. Task #11 will consolidate this into a single data store.
 oos_returns_daily = pd.Series(dtype=float)
+oos_returns_report = pd.Series(dtype=float)
 oos_weights_history = pd.DataFrame()
 oos_prices_aud_long = pd.DataFrame()
 oos_prices_report = pd.DataFrame()
@@ -6065,7 +6066,7 @@ if bool(CFG.get("oos_validation", True)):
                        and portfolio_value_override > 0
                     else 1_000_000.0)
         ensemble_out = run_oos_ensemble_walk_forward_cached(
-            oos_prices_report,
+            oos_prices_aud_long,
             train_window_months=24,
             rebalance=REBALANCE_FREQ,
             benchmark_ticker="SPY",
@@ -6085,6 +6086,22 @@ if bool(CFG.get("oos_validation", True)):
         )
         globals()["_oos_starting_nav_aud"] = float(_oos_nav)
         oos_returns_daily = ensemble_out["blended_returns"]
+        # REPORTING truncation happens on the OUTPUT, not the input. The
+        # walk-forward is causal — returns at t use only px.loc[:t], and the
+        # two consumers of daily_rets_all are forward slices .loc[t:seg_end] —
+        # so cutting the series here yields exactly what running on a
+        # truncated panel would, while leaving oos_returns_daily COMPLETE.
+        # That matters: the drift tracker compares live NAV against
+        # oos_returns_daily, and truncating the input made every post-boundary
+        # day read as pure drift (2026-08 showed "OOS +0.00%" and the
+        # cumulative breach latched permanently, defeating the monitor).
+        oos_returns_report = oos_returns_daily
+        if REPORT_LOCKBOX_DATE is not None and not oos_returns_daily.empty:
+            oos_returns_report = oos_returns_daily[
+                oos_returns_daily.index <= REPORT_LOCKBOX_DATE]
+            print(f"[lockbox] published return series truncated to "
+                  f"{len(oos_returns_report)} of {len(oos_returns_daily)} obs "
+                  f"(drift tracker keeps the full series)")
         oos_weights_history = ensemble_out["blended_weights"]
 
         # Optional second OOS backtest at ROADSHOW_BASE_NAV — for the PDS /
@@ -6099,7 +6116,7 @@ if bool(CFG.get("oos_validation", True)):
                 print(f"[oos-roadshow] running second backtest at "
                       f"${ROADSHOW_BASE_NAV:,.0f} for dual-NAV chart...")
                 ensemble_out_rs = run_oos_ensemble_walk_forward_cached(
-                    oos_prices_report,
+                    oos_prices_aud_long,
                     train_window_months=24,
                     rebalance=REBALANCE_FREQ,
                     benchmark_ticker="SPY",
@@ -6303,7 +6320,7 @@ if bool(CFG.get("oos_validation", True)):
                         try:
                             print(f"[scale] running OOS at ${_nav:,.0f} (sequential)...")
                             _scale_out = run_oos_ensemble_walk_forward_cached(
-                                oos_prices_report,
+                                oos_prices_aud_long,
                                 starting_nav_aud=float(_nav),
                                 **_common_kwargs,
                             )
@@ -6321,7 +6338,7 @@ if bool(CFG.get("oos_validation", True)):
                     try:
                         print(f"[scale] running OOS at ${_nav:,.0f} (sequential)...")
                         _scale_out = run_oos_ensemble_walk_forward_cached(
-                            oos_prices_report,
+                            oos_prices_aud_long,
                             starting_nav_aud=float(_nav),
                             **_common_kwargs,
                         )
@@ -6665,7 +6682,7 @@ if not oos_returns_daily.empty and not oos_prices_aud_long.empty:
         _aord_ret = _au_bench_returns(oos_prices_report)
         _ff5 = globals().get("ff5_raw", None)
         oos_metrics_table = compute_oos_metrics(
-            strat_returns=oos_returns_daily,
+            strat_returns=oos_returns_report,
             spy_returns=_spy_ret,
             aord_returns=_aord_ret,
             ff5_factors=_ff5,
@@ -6683,6 +6700,9 @@ globals()["oos_metrics_table"] = oos_metrics_table
 # discriminate. Quiet no-op when dual mode is off.
 oos_metrics_table_roadshow = pd.DataFrame()
 _oos_rets_rs = globals().get("oos_returns_daily_roadshow", pd.Series(dtype=float))
+if (REPORT_LOCKBOX_DATE is not None and isinstance(_oos_rets_rs, pd.Series)
+        and not _oos_rets_rs.empty):
+    _oos_rets_rs = _oos_rets_rs[_oos_rets_rs.index <= REPORT_LOCKBOX_DATE]
 if isinstance(_oos_rets_rs, pd.Series) and not _oos_rets_rs.empty:
     try:
         _spy_aud_rs = oos_prices_aud_long.get("SPY") if "SPY" in oos_prices_aud_long.columns else None
@@ -6716,6 +6736,11 @@ if _scale_results_local:
         _ff5_sc = globals().get("ff5_raw", None)
         for _nav, _payload in _scale_results_local.items():
             _rets_for_nav = _payload.get("returns", pd.Series(dtype=float))
+            if (REPORT_LOCKBOX_DATE is not None
+                    and isinstance(_rets_for_nav, pd.Series)
+                    and not _rets_for_nav.empty):
+                _rets_for_nav = _rets_for_nav[
+                    _rets_for_nav.index <= REPORT_LOCKBOX_DATE]
             if not isinstance(_rets_for_nav, pd.Series) or _rets_for_nav.empty:
                 continue
             try:

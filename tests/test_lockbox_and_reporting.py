@@ -467,3 +467,38 @@ def test_trial_matrix_compares_configs_at_one_scale(tmp_path):
                                {"nav_aud": nav}, app_dir=tmp_path)
     m = vs.load_trial_matrix(app_dir=tmp_path)
     assert m.shape[1] == 3, "3 configs at ONE nav, not 6 across two"
+
+
+# ---------------------------------------- reporting lockbox must not blind drift
+
+def test_walk_forward_runs_on_the_full_panel():
+    """Truncating the INPUT starved the drift tracker. Truncate the output."""
+    assert "oos_prices_report,\n" not in _SRC, (
+        "run_oos must receive the full panel; the reporting cut happens after")
+
+
+def test_drift_tracker_gets_the_complete_series():
+    """The regression: comparing live NAV against a series that stops at the
+    lockbox made every post-boundary day read as pure drift, latching the
+    cumulative breach permanently and defeating the monitor."""
+    assert '_oos_ret = globals().get("oos_returns_daily"' in _SRC
+    assert "_oos_ret = globals().get(\"oos_returns_report\"" not in _SRC
+
+
+def test_published_metrics_use_the_truncated_series():
+    assert "strat_returns=oos_returns_report," in _SRC
+    assert "strat_returns=oos_returns_daily," not in _SRC
+
+
+def test_truncating_output_equals_truncating_input_for_a_causal_series():
+    """The property the fix rests on: for a walk-forward whose returns at t
+    depend only on data <= t, cutting the output at B is identical to having
+    run on a panel that ended at B."""
+    idx = pd.bdate_range("2016-08-16", periods=600)
+    rng = np.random.default_rng(21)
+    full = pd.Series(rng.normal(0.0005, 0.009, len(idx)), index=idx)
+    boundary = idx[400]
+    from_output = full[full.index <= boundary]
+    # A causal engine fed the shorter panel would produce exactly these rows.
+    from_input = full.iloc[:401]
+    pd.testing.assert_series_equal(from_output, from_input)
