@@ -173,7 +173,10 @@ from lots import (
 
 # Actual (broker-truth) NAV series (module split #18, 2026-07-09). Engine syncs
 # nav.APP_DIR after APP_DIR is defined (default broker-nav-log path).
-import nav as _nav
+# NOTE: do NOT alias this module as `_nav` — module-level `for _nav in ...`
+# loops over the scale-sensitivity NAVs leak and rebind it to a float, which
+# silently broke lot-book broker reconciliation ('float' object has no
+# attribute 'load_broker_positions'). `_nav_mod` is imported once at the top.
 from nav import (
     compute_actual_nav_series,
     _load_broker_nav_series,
@@ -616,7 +619,7 @@ _DEV_BASE = Path.home() / "Portfolio_Optimiser"
 APP_DIR = _DEV_BASE if _DEV_BASE.exists() else _app_dir()
 # Sync the resolved APP_DIR into the nav module (its only engine coupling — the
 # default broker-nav-log path). Same pattern as factors.REGIONS_JSON_PATH.
-_nav.APP_DIR = APP_DIR
+_nav_mod.APP_DIR = APP_DIR
 
 # ---------------------------------------------------------------------
 # Config file and Excel workbook paths
@@ -6133,15 +6136,19 @@ if bool(CFG.get("oos_validation", True)):
         # FX-adjust USD tickers into AUD (same recipe as _rebuild_core_from_prices).
         _fx_raw = yf.download("USDAUD=X", period="12y", interval="1d",
                               auto_adjust=True, threads=False, progress=False)
-        _fx = _fx_raw["Close"] if isinstance(_fx_raw, pd.DataFrame) else _fx_raw
-        if isinstance(_fx, pd.DataFrame):
-            _fx = _fx.iloc[:, 0]
-        _fx = pd.to_numeric(_fx, errors="coerce").reindex(_oos_long_px.index).ffill()
+        # NB: named _fx_ser, not _fx — `_fx` is the fx MODULE alias, and
+        # rebinding it at module scope is the trap that silently broke lot
+        # reconciliation via `_nav`. It works today only because the module
+        # use at :3100 happens to precede this line.
+        _fx_ser = _fx_raw["Close"] if isinstance(_fx_raw, pd.DataFrame) else _fx_raw
+        if isinstance(_fx_ser, pd.DataFrame):
+            _fx_ser = _fx_ser.iloc[:, 0]
+        _fx_ser = pd.to_numeric(_fx_ser, errors="coerce").reindex(_oos_long_px.index).ffill()
         _usd_cols = [c for c in _oos_long_px.columns
                      if not str(c).endswith(".AX") and not str(c).startswith("^")]
         oos_prices_aud_long = _oos_long_px.copy()
         if _usd_cols:
-            oos_prices_aud_long.update(_oos_long_px.loc[:, _usd_cols].mul(_fx, axis=0))
+            oos_prices_aud_long.update(_oos_long_px.loc[:, _usd_cols].mul(_fx_ser, axis=0))
         oos_prices_aud_long = oos_prices_aud_long.ffill()
         if LEGACY_BACKFILL:
             oos_prices_aud_long = oos_prices_aud_long.bfill()
@@ -8893,7 +8900,7 @@ if USE_XLWINGS:
                 # WARN, not HALT: this is a data-quality signal like the drift
                 # tracker's, not a structurally-absurd trade plan.
                 try:
-                    _broker_pos = _nav.load_broker_positions()
+                    _broker_pos = _nav_mod.load_broker_positions()
                     if _broker_pos:
                         _lot_warns = reconcile_lots_vs_broker(
                             UPDATED_LOTS, _broker_pos, fx_map=fx_map_all)
@@ -9635,10 +9642,17 @@ def _print_run_health_summary():
             # teardown that fires ~25x/run) matched NONE of the old patterns —
             # lowercase, and "Exception:" was compared case-sensitively. A whole
             # class of hard faults was being reported as "Errors in log: 0".
+            # A line already tagged [WARN] has been HANDLED — counting it again
+            # as an error demanding investigation is double-counting, and the
+            # bare "FAILED" pattern makes that easy to trip: the nav
+            # reconstruction's "FAILED validation" notice is the gate working
+            # as designed, not a fault. Cry wolf here and the real 2am errors
+            # stop being believed.
             n_err = sum(1 for l in _lines
-                        if ("[ERROR" in l) or ("Traceback" in l)
-                        or ("FAILED" in l)
-                        or re.search(r"(exception:|fatal exception)", l, re.I))
+                        if not _is_tagged(l)
+                        and (("[ERROR" in l) or ("Traceback" in l)
+                             or ("FAILED" in l)
+                             or re.search(r"(exception:|fatal exception)", l, re.I)))
             n_regress = log_text.count("[metrics-warn]")
             _warn_str = f"  Warnings in log:      {n_warn}"
             if n_warn > 0:

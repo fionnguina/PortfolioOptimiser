@@ -764,3 +764,65 @@ def test_nav_module_records_which_source_it_returned():
     src = (Path(__file__).resolve().parent.parent / "nav.py").read_text(encoding="utf-8")
     assert 'LAST_NAV_SOURCE"] = "broker NetLiq only (recon failed validation)"' in src
     assert 'LAST_NAV_SOURCE"] = "fills recon (validated) + broker NetLiq"' in src
+
+
+# ------------------------------------------------------- module-alias shadowing
+
+def test_nav_module_is_not_aliased_to_a_shadowable_name():
+    """`import nav as _nav` collided with eight module-level `for _nav in ...`
+    loops over scale-sensitivity NAVs. Loop variables leak at module scope, so
+    by the time lot reconciliation ran, _nav was a float — broker
+    reconciliation failed silently on every run ('float' object has no
+    attribute 'load_broker_positions')."""
+    import ast
+    src = _SRC
+    assert "import nav as _nav\n" not in src, "the shadowable alias must stay retired"
+    tree = ast.parse(src)
+    # No attribute access on a bare `_nav` may remain.
+    bad = [n.lineno for n in ast.walk(tree)
+           if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+           and n.value.id == "_nav"]
+    assert not bad, f"module-attribute use of shadowable _nav at lines {bad}"
+
+
+def test_no_module_handle_is_rebound_at_module_scope():
+    """Generalises the _nav bug to its whole class.
+
+    The condition that actually breaks: a name used as a MODULE (attribute
+    access) that is also assigned at MODULE scope. Function-local rebinds are
+    harmless (they never reach module scope) and try/except import fallbacks
+    are intended, so both are excluded — the first version of this test flagged
+    `tk` inside fetch_ibkr_live_prices_native and was a false positive.
+    """
+    import ast
+    tree = ast.parse(_SRC)
+    aliases = {a.asname for n in ast.walk(tree)
+               if isinstance(n, (ast.Import, ast.ImportFrom))
+               for a in n.names if a.asname}
+    # Only names actually dereferenced as modules can break this way.
+    used_as_module = {n.value.id for n in ast.walk(tree)
+                      if isinstance(n, ast.Attribute)
+                      and isinstance(n.value, ast.Name) and n.value.id in aliases}
+
+    func_spans = [(f.lineno, f.end_lineno) for f in ast.walk(tree)
+                  if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+    def at_module_scope(lineno):
+        return not any(a <= lineno <= (b or 0) for a, b in func_spans)
+
+    offenders = {}
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                and n.id in used_as_module and at_module_scope(n.lineno)):
+            offenders.setdefault(n.id, []).append(n.lineno)
+    assert not offenders, (
+        f"module handles rebound at module scope (the _nav bug class): {offenders}")
+
+
+def test_health_error_count_excludes_handled_warnings():
+    """A [WARN]-tagged line is handled by definition. The bare "FAILED"
+    pattern was counting the nav gate's own notice as an error demanding
+    investigation — cry wolf and the real 2am errors stop being believed."""
+    i = _SRC.index("n_err = sum(1 for l in _lines")
+    block = _SRC[i:i + 420]
+    assert "not _is_tagged(l)" in block, "handled warnings must not count as errors"
