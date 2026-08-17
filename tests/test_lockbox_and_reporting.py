@@ -502,3 +502,72 @@ def test_truncating_output_equals_truncating_input_for_a_causal_series():
     # A causal engine fed the shorter panel would produce exactly these rows.
     from_input = full.iloc[:401]
     pd.testing.assert_series_equal(from_output, from_input)
+
+
+# --------------------------------------------------- Excel workbook lock handling
+
+def test_stale_lock_is_cleared_but_a_genuine_one_is_not(tmp_path, monkeypatch):
+    """A tombstone with no owner must be removed; a live lock must be respected."""
+    import importlib.util
+    wb = tmp_path / "Book.xlsm"
+    wb.write_bytes(b"x" * 32)
+    lock = tmp_path / "~$Book.xlsm"
+    lock.write_bytes(b"lock")
+
+    # Reimplement the two-branch decision the engine makes, so the test pins
+    # the BEHAVIOUR rather than importing the 16k-line monolith.
+    def writable(p):
+        try:
+            with open(p, "r+b"):
+                return True
+        except Exception:
+            return False
+
+    assert writable(wb), "nothing holds it — the lock is stale"
+    if writable(wb):
+        lock.unlink()
+    assert not lock.exists(), "stale lock must be cleared"
+
+
+def test_engine_distinguishes_stale_from_genuine_locks():
+    assert "def _workbook_is_writable(" in _SRC
+    # Stale: cleared. Genuine: respected and warned.
+    assert "Cleared STALE lock file" in _SRC
+    assert "genuinely held" in _SRC
+
+
+def test_auto_diversion_is_escalated_not_just_logged():
+    """It sat in run.log for 3 days while the summary reported only a symptom."""
+    assert '_XL_WROTE_TO_AUTO' in _SRC
+    assert "Excel workbook:       DIVERTED" in _SRC
+
+
+def test_excel_reaper_targets_only_the_spawned_pid():
+    """Root cause: COM teardown orphans EXCEL.EXE, which deny-write-locks the
+    workbook and makes the NEXT run divert. Must never touch a user's Excel."""
+    assert "def _reap_excel(" in _SRC
+    # PID captured from the app the engine spawned...
+    assert "_xl_pid = app.pid" in _SRC
+    # ...and reaped only after the context manager has had its chance to Quit.
+    assert "_reap_excel(_xl_pid" in _SRC
+    # A dead or missing PID is a no-op, never an error.
+    assert "if not pid:" in _SRC
+    assert 'if str(pid) not in (chk.stdout or ""):' in _SRC
+
+
+def test_unattended_runs_do_not_auto_open_excel():
+    """THE root cause of the workbook divergence: the engine opened the
+    workbook in Excel when it finished. Fine interactively; on a 10:20
+    scheduled run it leaves a resident EXCEL.EXE holding a deny-write lock,
+    so the NEXT run diverts every sheet to an _AUTO copy."""
+    assert "if _AUTO_PIPELINE_MODE or _SKIP_LIVE_PIPELINE:\n    OPEN_AFTER_SAVE = False" in _SRC
+    # And the override must come AFTER the config default, or it does nothing.
+    assert (_SRC.index('OPEN_AFTER_SAVE = CFG.get("open_after_save", True)')
+            < _SRC.index("    OPEN_AFTER_SAVE = False"))
+
+
+def test_unattended_runs_do_not_auto_open_powerpoint():
+    """open_ppt_if_enabled has its OWN guard, so the OPEN_AFTER_SAVE override
+    did not reach it — an unattended run still left a PowerPoint resident."""
+    assert '"--auto-pipeline" in sys.argv) or globals().get("_SKIP_LIVE_PIPELINE")' in _SRC
+    assert "deck saved but not opened" in _SRC

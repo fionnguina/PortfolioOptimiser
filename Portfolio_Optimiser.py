@@ -671,8 +671,18 @@ def load_config() -> dict:
 CFG = load_config()
 
 def open_ppt_if_enabled(pptx_path: str) -> None:
-    """Open PPTX file if enabled in config."""
+    """Open PPTX file if enabled in config AND a human is actually present.
+
+    This path has its own guard and so was NOT covered by the OPEN_AFTER_SAVE
+    override — an unattended run still left a PowerPoint resident. Less
+    damaging than the Excel case (nothing reads the deck back), but it is the
+    same defect: a scheduled job with no viewer leaving a GUI app running,
+    accumulating one per run.
+    """
     if not CFG.get("open_ppt_after_save", True):
+        return
+    if ("--auto-pipeline" in sys.argv) or globals().get("_SKIP_LIVE_PIPELINE"):
+        print("[pptx] unattended run — deck saved but not opened")
         return
 
     pptx_path = os.path.abspath(pptx_path)
@@ -1709,6 +1719,35 @@ if _SHOW_METRICS_HISTORY_MODE:
     sys.exit(_exit_code)
 
 
+def _reap_excel(pid, where=""):
+    """Terminate an Excel instance the ENGINE spawned, if COM teardown left it.
+
+    Root cause of the 2026-08-17 workbook divergence. xw.App's context manager
+    calls Quit, but teardown emits 26 x 0x800706ba (RPC_S_SERVER_UNAVAILABLE)
+    faults and the process can survive. A resident EXCEL.EXE keeps a deny-write
+    handle on the workbook, so the NEXT run finds it genuinely locked and
+    diverts every sheet to Stock Analysis_AUTO.xlsm — which is how the real
+    workbook went three days stale while each run reported success.
+
+    Targets the captured PID only. It must never touch a user's own Excel
+    session, so a missing or already-dead PID is a no-op, not an error.
+    """
+    if not pid:
+        return
+    try:
+        import subprocess as _sp
+        chk = _sp.run(["tasklist", "/FI", f"PID eq {int(pid)}"],
+                      capture_output=True, text=True, timeout=15)
+        if str(pid) not in (chk.stdout or ""):
+            return  # exited cleanly, nothing to reap
+        _sp.run(["taskkill", "/PID", str(int(pid)), "/F"],
+                capture_output=True, text=True, timeout=15)
+        print(f"[xl] Reaped orphaned Excel PID {pid} after COM teardown{where} "
+              f"— prevents the next run diverting to an _AUTO copy.")
+    except Exception as _e:
+        print(f"[xl][WARN] Could not reap Excel PID {pid}: {_e}")
+
+
 def _run_preflight() -> int:
     """Fast system-check before the heavy live pipeline.
 
@@ -1822,7 +1861,12 @@ def _run_preflight() -> int:
             import xlwings as _xw
             # Don't actually open a workbook here; just test that the COM object is reachable.
             _app = _xw.App(visible=False, add_book=False)
+            try:
+                _probe_pid = _app.pid
+            except Exception:
+                _probe_pid = None
             _app.quit()
+            _reap_excel(_probe_pid, " (COM probe)")
             _check("Excel COM (xlwings)", "PASS", "COM accessible")
         except Exception as _e:
             _check("Excel COM (xlwings)", "FAIL", f"{type(_e).__name__}: {_e}")
@@ -2574,6 +2618,19 @@ try:
 except Exception:
     SCALE_SENSITIVITY_NAVS = [100_000.0, 250_000.0, 500_000.0, 1_000_000.0]
 OPEN_AFTER_SAVE = CFG.get("open_after_save", True)
+# THE root cause of the 2026-08-17 workbook divergence. The engine opens the
+# workbook (and deck) in Excel/PowerPoint when it finishes — correct for an
+# interactive run, actively harmful for a scheduled one. Nobody is watching a
+# 10:20 unattended run, but the EXCEL.EXE it launches stays resident holding a
+# deny-write lock, so the NEXT run finds the workbook genuinely locked and
+# diverts every sheet to Stock Analysis_AUTO.xlsm. That is how the real
+# workbook went three days stale while each run reported success.
+# (The 26 x 0x800706ba COM teardown faults are real but were a red herring —
+# the Apps the engine manages do quit cleanly; this one is opened ON PURPOSE.)
+if _AUTO_PIPELINE_MODE or _SKIP_LIVE_PIPELINE:
+    OPEN_AFTER_SAVE = False
+    print("[auto-pipeline] unattended run — will NOT auto-open Excel/PowerPoint "
+          "(a resident Excel locks the workbook and diverts the next run)")
 USE_XLWINGS = CFG.get("use_xlwings", True)
 # OOS kernel mode (Phase 3b, 2026-06-29) — when subprocess workers want
 # to import the engine PURELY to grab run_oos_ensemble_walk_forward and
@@ -4774,18 +4831,61 @@ def ensure_workbook(path):
         wb.sheets["Lots"].range("A1").value = [["Security","AcqDate","Units","CostBaseAUD"]]
         wb.save(path); wb.close()
 
+def _workbook_is_writable(path) -> bool:
+    """True when nothing else holds the workbook open.
+
+    Excel opens .xlsm with a deny-write share mode, so an exclusive-ish open
+    raises PermissionError while a real Excel session has it. This asks the
+    filesystem who actually holds the file rather than enumerating EXCEL.EXE
+    processes, which cannot tell you WHICH workbook a given process has open.
+    """
+    try:
+        with open(path, "r+b"):
+            return True
+    except Exception:
+        return False
+
+
 def warn_if_workbook_locked(path):
-    """Print a clear warning if the workbook has an Office lock file (~$Name.xlsm) sibling.
-    A lock means Excel (or another process) has the file open — writes via xlwings will either
-    fall back to a read-only copy or trigger a 'File in Use' dialog. Non-fatal: we just surface it."""
+    """Resolve an Office lock file (~$Name.xlsm), clearing it when it is stale.
+
+    Two very different situations produce the same tombstone:
+
+      GENUINE — you have the workbook open. Falling back to an _AUTO copy is
+        correct; clobbering a live session would be worse.
+      STALE  — a crashed or orphaned EXCEL.EXE left the lock behind with no
+        owner. Falling back is wrong: the workbook is perfectly writable and
+        the engine silently diverts anyway.
+
+    The 2026-08-17 run hit the stale case. Excel had been orphaned (COM
+    teardown emits 26 x 0x800706ba RPC_S_SERVER_UNAVAILABLE faults after the
+    health summary, and a failed teardown can leave EXCEL.EXE resident), so
+    every sheet went to Stock Analysis_AUTO.xlsm and the real workbook sat
+    three days stale — with the Holdings sheet being the ticker universe, that
+    is a divergence that matters.
+
+    Distinguish them by asking whether the file is actually writable, and only
+    remove a tombstone with no owner.
+    """
     try:
         d, f = os.path.split(path)
         lock = os.path.join(d, "~$" + f)
-        if os.path.exists(lock):
-            print(f"[warn] Workbook lock file detected: {lock}")
-            print("[warn] Close any open Excel windows for 'Stock Analysis.xlsm' (including stray "
-                  "EXCEL.EXE processes in Task Manager) before continuing — otherwise the script will "
-                  "either save to an _AUTO copy or you'll see a 'File in Use' dialog.")
+        if not os.path.exists(lock):
+            return
+        if _workbook_is_writable(path):
+            try:
+                os.remove(lock)
+                print(f"[xl] Cleared STALE lock file (no process holds the workbook): {lock}")
+                print("[xl] Likely an orphaned EXCEL.EXE from a failed COM teardown. "
+                      "Writes will go to the real workbook, not an _AUTO copy.")
+                return
+            except Exception as _e:
+                print(f"[warn] Stale lock file present but could not be removed ({_e}): {lock}")
+                return
+        print(f"[warn] Workbook lock file detected AND the file is genuinely held: {lock}")
+        print("[warn] Close any open Excel windows for 'Stock Analysis.xlsm' (including stray "
+              "EXCEL.EXE processes in Task Manager) — this run will save to an _AUTO copy, "
+              "and the real workbook will go stale.")
     except Exception:
         pass
 
@@ -6800,7 +6900,12 @@ fx_map_all = fx_to_aud_for_tickers(prices.columns, usd_aud)
 # ---- 10D) Reopen Excel and WRITE everything, then close ----
 if USE_XLWINGS:
     try:
+        _xl_pid = None
         with xw.App(visible=False, add_book=False) as app:
+            try:
+                _xl_pid = app.pid
+            except Exception:
+                _xl_pid = None
             filename = os.path.abspath(filename)
             wb = app.books.open(filename, update_links=False, read_only=False)      
             
@@ -6809,7 +6914,11 @@ if USE_XLWINGS:
                 base, ext = os.path.splitext(filename)
                 alt = base + "_AUTO" + ext
                 shutil.copy2(filename, alt)
+                globals()["_XL_WROTE_TO_AUTO"] = alt
                 print(f"[warn] Workbook opened read-only. Will write to: {alt}")
+                print("[warn] THE REAL WORKBOOK WILL NOT BE UPDATED BY THIS RUN. "
+                      "Holdings is the ticker universe, so a persistent diversion "
+                      "means the engine and the sheet you look at diverge.")
                 wb.close()
                 wb = app.books.open(alt, update_links=False, read_only=False)
             
@@ -8970,6 +9079,9 @@ if USE_XLWINGS:
 
             wb.save()
             wb.close()
+        # Outside the context manager: Quit has run (or failed). Reap only if
+        # the PID we spawned is still resident.
+        _reap_excel(_xl_pid, " (workbook write)")
 
     except SanityViolation:
         # NEVER swallow a sanity violation here. The whole point of the
@@ -9145,7 +9257,12 @@ try:
         # (Bare xw.Book(path) attaches to the default app, which then stays alive as a blank
         # window after _book.close() — caused the spurious second Excel window.)
         try:
+            _post_pid = None
             with xw.App(visible=False, add_book=False) as _app:
+                try:
+                    _post_pid = _app.pid
+                except Exception:
+                    _post_pid = None
                 _book = _app.books.open(_xl, update_links=False, read_only=False)
                 _ws = _book.sheets["OPT"] if "OPT" in [s.name for s in _book.sheets] else _book.sheets.add("OPT")
 
@@ -9155,6 +9272,7 @@ try:
 
                 _book.save()
                 _book.close()
+            _reap_excel(_post_pid, " (OPT post-write)")
             _written = True
             print(f"[post] Wrote OPT validation + layout fixes to: {_xl}")
         except Exception as _e_xlw:
@@ -9408,10 +9526,19 @@ def _print_run_health_summary():
         if _xlpath and os.path.exists(_xlpath):
             mtime = os.path.getmtime(_xlpath)
             age_s = _time_for_health.time() - mtime
-            if age_s < 120:
+            _auto = globals().get("_XL_WROTE_TO_AUTO")
+            if _auto:
+                # The 2026-08-17 failure mode: the summary said "WARNING (last
+                # modified 3858m ago)" — a symptom — while the cause sat 200
+                # lines earlier in the log and went unnoticed for three days.
+                print(f"  Excel workbook:       DIVERTED — this run wrote to "
+                      f"{os.path.basename(_auto)}, NOT the real workbook "
+                      f"(locked; last modified {int(age_s/60)}m ago)")
+            elif age_s < 120:
                 print(f"  Excel workbook:       OK (updated {int(age_s)}s ago)")
             else:
-                print(f"  Excel workbook:       WARNING (last modified {int(age_s/60)}m ago)")
+                print(f"  Excel workbook:       WARNING (last modified {int(age_s/60)}m ago) "
+                      f"— engine did not write it this run")
     except Exception:
         pass
 
