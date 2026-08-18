@@ -1,79 +1,186 @@
 [
-    {
-        "Security": "BEAR.AX",
-        "AcqDate": "2026-07-08T00:00:00",
-        "Units": 1567,
-        "CostBaseAUD": 7.4089979,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "BEAR.AX",
-        "AcqDate": "2026-08-03T09:33:30.149710",
-        "Units": 77.0,
-        "CostBaseAUD": 7.295136,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "GOLD.AX",
-        "AcqDate": "2026-07-08T00:00:00",
-        "Units": 362,
-        "CostBaseAUD": 54.6856467,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "GOLD.AX",
-        "AcqDate": "2026-08-03T09:33:30.149710",
-        "Units": 7.0,
-        "CostBaseAUD": 51.3433844,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "HBRD.AX",
-        "AcqDate": "2026-07-08T00:00:00",
-        "Units": 1508.0,
-        "CostBaseAUD": 10.1041406,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "PDBC",
-        "AcqDate": "2026-07-21T00:00:00",
-        "Units": 304,
-        "CostBaseAUD": 24.7382959,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "PDBC",
-        "AcqDate": "2026-08-03T09:33:30.149710",
-        "Units": 116.0,
-        "CostBaseAUD": 24.4944363,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "SMH",
-        "AcqDate": "2026-07-08T00:00:00",
-        "Units": 50,
-        "CostBaseAUD": 867.4125297,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "VEA",
-        "AcqDate": "2026-07-13T00:00:00",
-        "Units": 13,
-        "CostBaseAUD": 100.0200601,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "VEA",
-        "AcqDate": "2026-08-03T09:33:30.149710",
-        "Units": 19.0,
-        "CostBaseAUD": 100.3135173,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    },
-    {
-        "Security": "VLUE.AX",
-        "AcqDate": "2026-07-08T00:00:00",
-        "Units": 2974.0,
-        "CostBaseAUD": 37.0537019,
-        "SeedAsOf": "2026-08-03T09:33:30.149710"
-    }
+  {
+    "Security": "BEAR.AX",
+    "Units": 1034.0,
+    "AcqDate": "2026-06-24T09:59:53",
+    "CostBaseAUD": 7.3864944,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "BEAR.AX",
+    "Units": 96.0,
+    "AcqDate": "2026-07-08T09:59:52",
+    "CostBaseAUD": 7.51875,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "BEAR.AX",
+    "Units": 367.0,
+    "AcqDate": "2026-07-24T09:59:57",
+    "CostBaseAUD": 7.447983651226157,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "BEAR.AX",
+    "Units": 106.0,
+    "AcqDate": "2026-07-30T09:59:50",
+    "CostBaseAUD": 7.322264150943396,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "BEAR.AX",
+    "Units": 41.0,
+    "AcqDate": "2026-07-31T09:59:59",
+    "CostBaseAUD": 7.3809756097560975,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "GOLD.AX",
+    "Units": 189.0,
+    "AcqDate": "2026-07-06T13:15:17",
+    "CostBaseAUD": 55.078426400000005,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "GOLD.AX",
+    "Units": 150.0,
+    "AcqDate": "2026-07-08T09:59:52",
+    "CostBaseAUD": 54.1776344,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "GOLD.AX",
+    "Units": 8.0,
+    "AcqDate": "2026-07-24T09:59:57",
+    "CostBaseAUD": 54.195,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "GOLD.AX",
+    "Units": 22.0,
+    "AcqDate": "2026-07-31T10:00:29",
+    "CostBaseAUD": 53.88999999999999,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "HBRD.AX",
+    "Units": 299.0,
+    "AcqDate": "2026-07-20T09:59:53",
+    "CostBaseAUD": 10.09327967806841,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "HBRD.AX",
+    "Units": 857.0,
+    "AcqDate": "2026-07-24T09:59:57",
+    "CostBaseAUD": 10.108888,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "HBRD.AX",
+    "Units": 352.0,
+    "AcqDate": "2026-07-30T09:59:50",
+    "CostBaseAUD": 10.11875,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "PDBC",
+    "Units": 304.0,
+    "AcqDate": "2026-07-20T23:30:01",
+    "CostBaseAUD": 24.766816604596496,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "PDBC",
+    "Units": 116.0,
+    "AcqDate": "2026-07-31T23:30:45",
+    "CostBaseAUD": 25.101330231735535,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "SMH",
+    "Units": 50.0,
+    "AcqDate": "2026-07-06T23:30:00",
+    "CostBaseAUD": 874.6281881809655,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "SMH",
+    "Units": 31.0,
+    "AcqDate": "2026-08-03T23:30:19",
+    "CostBaseAUD": 757.7007666278386,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "VEA",
+    "Units": 13.0,
+    "AcqDate": "2026-07-08T23:30:02",
+    "CostBaseAUD": 100.95261542910369,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "VEA",
+    "Units": 19.0,
+    "AcqDate": "2026-07-31T23:31:03",
+    "CostBaseAUD": 101.21475221391559,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "VLUE.AX",
+    "Units": 2227.0,
+    "AcqDate": "2026-07-06T13:17:45",
+    "CostBaseAUD": 37.182691999999996,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "VLUE.AX",
+    "Units": 253.0,
+    "AcqDate": "2026-07-20T09:59:53",
+    "CostBaseAUD": 36.4720672,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "VLUE.AX",
+    "Units": 464.0,
+    "AcqDate": "2026-07-24T09:59:57",
+    "CostBaseAUD": 36.632208,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "VLUE.AX",
+    "Units": 9.0,
+    "AcqDate": "2026-07-30T09:59:50",
+    "CostBaseAUD": 38.00333333333333,
+    "CostBase": null,
+    "Price": null
+  },
+  {
+    "Security": "VLUE.AX",
+    "Units": 21.0,
+    "AcqDate": "2026-07-31T09:59:59",
+    "CostBaseAUD": 37.434285714285714,
+    "CostBase": null,
+    "Price": null
+  }
 ]

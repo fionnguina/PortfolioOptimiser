@@ -126,26 +126,137 @@ def parse_trades(path) -> pd.DataFrame:
     return df.sort_values("DateTime").reset_index(drop=True) if not df.empty else df
 
 
-def build_lots(trades: pd.DataFrame, fx: dict | None = None) -> pd.DataFrame:
-    """Lot book in the engine schema: Security | AcqDate | Units | CostBaseAUD.
+def fx_from_statement(path) -> pd.Series:
+    """USDAUD implied by IBKR's OWN AUD.USD conversions in the statement.
 
-    Only BUYs open lots. Sells are left to the existing FIFO machinery in
-    cgt.LotBook rather than being netted here, so the disposal order stays the
-    engine's single source of truth.
+    The executor converts AUD to USD to fund a USD purchase, so a conversion
+    usually sits on the same day as the trade it funds — meaning the exact
+    rate IBKR applied is recoverable rather than approximated. It matters:
+    against yfinance daily closes these differ by a mean 17bps and up to 76bps
+    on 2026-08-03, which is a date lots were actually acquired. Rows are
+    AUD.USD (USD per AUD), so USDAUD is the reciprocal.
     """
-    if trades is None or trades.empty:
-        return pd.DataFrame(columns=["Security", "AcqDate", "Units", "CostBaseAUD"])
-    fx = fx or {}
-    out = []
-    for _, r in trades[trades["Units"] > 0].iterrows():
-        rate = 1.0 if r["Currency"] == "AUD" else float(fx.get(r["Currency"], 0) or 0)
-        basis = r["BasisLocal"]
-        if not rate or basis is None or not r["Units"]:
+    rows = {}
+    for sec, kind, d in _sections(path):
+        if sec != "Trades" or kind != "Data":
             continue
-        out.append({
-            "Security": r["Security"],
-            "AcqDate": r["DateTime"].isoformat(),
-            "Units": float(r["Units"]),
-            "CostBaseAUD": float(basis) * rate / float(r["Units"]),
-        })
-    return pd.DataFrame(out)
+        if str(d.get("Asset Category", "")).strip() != "Forex":
+            continue
+        px = _num(d.get("T. Price"))
+        dt = str(d.get("Date/Time", "")).strip()
+        if not px or px <= 0 or not dt:
+            continue
+        day = pd.to_datetime(dt.replace(",", " "), errors="coerce")
+        if pd.isna(day):
+            continue
+        rows[day.normalize()] = 1.0 / px
+    return pd.Series(rows).sort_index() if rows else pd.Series(dtype=float)
+
+
+def open_lots(trades: pd.DataFrame) -> pd.DataFrame:
+    """Surviving lots after signed FIFO, in LOCAL currency.
+
+    Buys-only is not an option: over this statement BEAR nets 1,644 units from
+    22,200 bought and 20,556 sold, so ignoring sells overstates it 13x. Sells
+    consume the OLDEST lot first (the engine's LOT_MATCH_METHOD default), and
+    each surviving lot keeps its own acquisition date and per-unit cost —
+    which is the point, since AcqDate drives the 12-month CGT discount.
+
+    SHORTS ARE SIGNED, not dropped. SOXX was sold 53 short on 2026-07-20 and
+    covered on 2026-07-27 (the Borrow Fee Details section bills the borrow for
+    exactly those days). A long-only FIFO silently discards a sale made against
+    an empty book and then books the covering purchase as a NEW LONG — which
+    invented a phantom 53-unit SOXX position that the broker does not hold.
+    This project has been bitten by phantom lots before (the 3.4M SMH
+    corruption, 2026-06-26), and a phantom lot is not cosmetic: it carries a
+    fabricated cost base straight into the CGT calculation.
+
+    The 2026-06-23 rows priced at 0 with 0 proceeds are the paper-account reset
+    (paired with the -189,334 withdrawal and +250,000 deposit that day). They
+    are ordinary disposals to FIFO and correctly close every pre-reset lot.
+    """
+    cols = ["Security", "AcqDate", "Units", "CostBaseLocal", "Currency"]
+    if trades is None or trades.empty:
+        return pd.DataFrame(columns=cols)
+    eps = 1e-9
+    out = []
+    for sec, g in trades.sort_values("DateTime").groupby("Security", sort=True):
+        book: list[list] = []          # [signed units, per-unit cost, date, ccy]
+        for _, r in g.iterrows():
+            u = float(r["Units"])
+            basis = r["BasisLocal"]
+            if abs(u) <= eps or basis is None:
+                continue
+            unit_cost = float(basis) / u          # sign-safe: both flip together
+            if not book or (book[0][0] > 0) == (u > 0):
+                book.append([u, unit_cost, r["DateTime"], r["Currency"]])
+                continue
+            # Opposite direction: close oldest first, then flip if it overruns.
+            rem = abs(u)
+            while rem > eps and book:
+                avail = abs(book[0][0])
+                take = min(rem, avail)
+                book[0][0] -= (1.0 if book[0][0] > 0 else -1.0) * take
+                rem -= take
+                if abs(book[0][0]) <= eps:
+                    book.pop(0)
+            if rem > eps:
+                book.append([(1.0 if u > 0 else -1.0) * rem, unit_cost,
+                             r["DateTime"], r["Currency"]])
+        for units, cost, dt, ccy in book:
+            if abs(units) > eps:
+                out.append({"Security": sec, "AcqDate": dt, "Units": units,
+                            "CostBaseLocal": cost, "Currency": ccy})
+    return pd.DataFrame(out, columns=cols)
+
+
+def to_aud(lots: pd.DataFrame, fx_usdaud=None, flat_rates: dict | None = None,
+           stmt_fx=None) -> pd.DataFrame:
+    """Add CostBaseAUD, translating at each lot's ACQUISITION-date rate.
+
+    AU CGT translates a foreign cost base at the rate prevailing on the
+    acquisition date, not today's — the very thing that made the lot-book
+    reconciliation drift. `fx_usdaud` is a dated Series (preferred);
+    `flat_rates` is a {CCY: rate} fallback from the statement's own table.
+    """
+    if lots is None or lots.empty:
+        return lots
+    df = lots.copy()
+    ser = None
+    if fx_usdaud is not None and len(fx_usdaud):
+        ser = pd.Series(fx_usdaud).copy()
+        ser.index = pd.to_datetime(ser.index).tz_localize(None).normalize()
+        ser = ser[~ser.index.duplicated(keep="last")].sort_index()
+    # IBKR's own conversions take precedence on the days they exist — they are
+    # the rate actually applied, not a daily close standing in for it.
+    if stmt_fx is not None and len(stmt_fx):
+        sf = pd.Series(stmt_fx).copy()
+        sf.index = pd.to_datetime(sf.index).tz_localize(None).normalize()
+        sf = sf[~sf.index.duplicated(keep="last")].sort_index()
+        ser = sf if ser is None else sf.combine_first(ser).sort_index()
+
+    def rate(row):
+        if str(row["Currency"]).upper() == "AUD":
+            return 1.0
+        if ser is not None:
+            try:
+                v = float(ser.asof(pd.Timestamp(row["AcqDate"]).tz_localize(None).normalize()))
+                if v == v and v > 0:
+                    return v
+            except Exception:
+                pass
+        return float((flat_rates or {}).get(str(row["Currency"]).upper(), 0) or 0)
+
+    df["FxAtAcq"] = df.apply(rate, axis=1)
+    df["CostBaseAUD"] = df["CostBaseLocal"] * df["FxAtAcq"]
+    return df
+
+
+def build_lots(trades: pd.DataFrame, fx: dict | None = None) -> pd.DataFrame:
+    """Engine-schema seed: Security | AcqDate | Units | CostBaseAUD."""
+    lots = to_aud(open_lots(trades), flat_rates=fx)
+    if lots is None or lots.empty:
+        return pd.DataFrame(columns=["Security", "AcqDate", "Units", "CostBaseAUD"])
+    lots = lots[lots["FxAtAcq"] > 0].copy()
+    lots["AcqDate"] = lots["AcqDate"].apply(lambda d: pd.Timestamp(d).isoformat())
+    return lots[["Security", "AcqDate", "Units", "CostBaseAUD"]].reset_index(drop=True)

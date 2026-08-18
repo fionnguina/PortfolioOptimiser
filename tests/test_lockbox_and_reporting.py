@@ -965,3 +965,56 @@ def test_statement_lots_carry_real_timestamps_not_nominal_dates(tmp_path):
     p = _stmt(tmp_path)
     lots = S.build_lots(S.parse_trades(p), S.fx_to_base(p))
     assert all("T" in a and a.startswith("2026-06-22") for a in lots["AcqDate"])
+
+
+def test_signed_fifo_nets_sells_and_never_invents_a_phantom_long():
+    """SOXX was sold 53 short then covered. A long-only FIFO discards a sale
+    against an empty book and books the cover as a NEW LONG — inventing a
+    position the broker does not hold, with a fabricated cost base that would
+    flow into CGT. This project has seen phantom lots before (3.4M SMH)."""
+    import ibkr_statement as S
+    t = pd.DataFrame([
+        {"Security": "X", "DateTime": pd.Timestamp("2026-07-20"), "Units": -53.0,
+         "Currency": "USD", "BasisLocal": -28241.58},
+        {"Security": "X", "DateTime": pd.Timestamp("2026-07-27"), "Units": 53.0,
+         "Currency": "USD", "BasisLocal": 28241.58},
+    ])
+    assert S.open_lots(t).empty, "a covered short must leave NO open lot"
+
+
+def test_fifo_consumes_oldest_lots_first(tmp_path):
+    import ibkr_statement as S
+    t = pd.DataFrame([
+        {"Security": "X", "DateTime": pd.Timestamp("2026-06-01"), "Units": 100.0,
+         "Currency": "AUD", "BasisLocal": 1000.0},      # 10.00/u, oldest
+        {"Security": "X", "DateTime": pd.Timestamp("2026-07-01"), "Units": 100.0,
+         "Currency": "AUD", "BasisLocal": 2000.0},      # 20.00/u
+        {"Security": "X", "DateTime": pd.Timestamp("2026-08-01"), "Units": -100.0,
+         "Currency": "AUD", "BasisLocal": -1000.0},
+    ])
+    lots = S.open_lots(t)
+    assert len(lots) == 1
+    assert lots.iloc[0]["CostBaseLocal"] == pytest.approx(20.0), "oldest lot goes first"
+    assert lots.iloc[0]["AcqDate"] == pd.Timestamp("2026-07-01"), "survivor keeps ITS date"
+
+
+def test_statement_fx_overrides_a_daily_close():
+    """IBKR's own conversion is the rate actually applied; daily closes differ
+    by up to 76bps on days lots were acquired."""
+    import ibkr_statement as S
+    lots = pd.DataFrame([{"Security": "X", "AcqDate": pd.Timestamp("2026-08-03"),
+                          "Units": 10.0, "CostBaseLocal": 100.0, "Currency": "USD"}])
+    daily = pd.Series(1.41927, index=pd.bdate_range("2026-08-01", periods=5))
+    stmt = pd.Series({pd.Timestamp("2026-08-03"): 1.43010})
+    out = S.to_aud(lots, fx_usdaud=daily, stmt_fx=stmt)
+    assert out.iloc[0]["FxAtAcq"] == pytest.approx(1.43010)
+
+
+def test_statement_fx_falls_back_to_daily_series_off_conversion_days():
+    import ibkr_statement as S
+    lots = pd.DataFrame([{"Security": "X", "AcqDate": pd.Timestamp("2026-07-20"),
+                          "Units": 10.0, "CostBaseLocal": 100.0, "Currency": "USD"}])
+    daily = pd.Series(1.43285, index=pd.bdate_range("2026-07-15", periods=10))
+    stmt = pd.Series({pd.Timestamp("2026-08-03"): 1.43010})
+    out = S.to_aud(lots, fx_usdaud=daily, stmt_fx=stmt)
+    assert out.iloc[0]["FxAtAcq"] == pytest.approx(1.43285)
