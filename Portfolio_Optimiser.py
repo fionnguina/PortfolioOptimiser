@@ -7962,11 +7962,15 @@ if USE_XLWINGS:
                 try:
                     # `prices` is the MIXED USD/AUD panel — pass the FX series
                     # so US positions are valued in AUD like NetLiq is.
+                    # statement_path carries the full signed trade history —
+                    # the thing the fills log never had, since every order in
+                    # it shows qty_filled=0.
                     _live_nav = compute_actual_nav_series_spliced(
                         prices,
                         APP_DIR / "ibkr_fills_log.jsonl",
                         APP_DIR / "lots_seed.json",
                         fx_usdaud=globals().get("fx_usdaud"),
+                        statement_path=APP_DIR / "ibkr_activity_statement.csv",
                     )
                 except Exception as _e_nav_src:
                     print(f"[drift] actual-NAV series failed ({_e_nav_src}); "

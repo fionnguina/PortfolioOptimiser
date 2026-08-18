@@ -153,6 +153,119 @@ def fx_from_statement(path) -> pd.Series:
     return pd.Series(rows).sort_index() if rows else pd.Series(dtype=float)
 
 
+def cash_events(path) -> pd.DataFrame:
+    """Every dated cash movement, per currency: date | Currency | Amount.
+
+    Positions alone do not make a NAV — NetLiquidation is positions PLUS cash,
+    and a reconstruction that omits cash is wrong by the whole balance and
+    biases every return. Signs follow the statement: trade Proceeds are already
+    negative for a purchase, commissions are negative, withdrawals negative.
+
+    Forex conversions ARE included. They net to ~zero in base currency but move
+    the balance between AUD and USD, and each currency is translated at its own
+    rate, so dropping them leaves both legs wrong.
+    """
+    rows = []
+
+    def add(day, ccy, amt):
+        if day is None or amt is None or not ccy:
+            return
+        d = pd.to_datetime(str(day).replace(",", " "), errors="coerce")
+        if pd.isna(d):
+            return
+        rows.append({"Date": d.normalize(), "Currency": str(ccy).strip().upper(),
+                     "Amount": float(amt)})
+
+    for sec, kind, d in _sections(path):
+        if kind != "Data":
+            continue
+        if sec == "Trades" and d.get("DataDiscriminator") == "Order":
+            when = d.get("Date/Time")
+            ccy = d.get("Currency")
+            if str(d.get("Asset Category", "")).strip() == "Forex":
+                # A conversion has TWO legs and they are in different
+                # currencies. For symbol AUD.USD, Quantity is the AUD sold and
+                # Proceeds the USD received; the commission column is
+                # explicitly "Comm in AUD" whatever the row currency says.
+                # Booking only the Proceeds leg left AUD overstated by the
+                # entire 183,563 that was converted away.
+                base = str(d.get("Symbol", "")).split(".")[0].strip().upper()
+                add(when, base, _num(d.get("Quantity")))
+                add(when, ccy, _num(d.get("Proceeds")))
+                add(when, "AUD", _num(d.get("Comm in AUD")))
+            else:
+                add(when, ccy, _num(d.get("Proceeds")))
+                add(when, ccy, _num(d.get("Comm/Fee")))
+        elif sec == "Deposits & Withdrawals" and d.get("Settle Date"):
+            add(d.get("Settle Date"), d.get("Currency"), _num(d.get("Amount")))
+        elif sec == "Dividends" and d.get("Date"):
+            add(d.get("Date"), d.get("Currency"), _num(d.get("Amount")))
+        elif sec == "Interest" and d.get("Date"):
+            add(d.get("Date"), d.get("Currency"), _num(d.get("Amount")))
+        # Borrow fees are deliberately NOT added: they are already inside the
+        # Interest rows ("Net Short Stock Interest"). Counting them again
+        # overstated the drain by exactly their total, -38.87 AUD / -3.29 USD.
+
+    df = pd.DataFrame(rows, columns=["Date", "Currency", "Amount"])
+    if df.empty:
+        return df
+    # "Total"/"Total in AUD" rows have no usable currency and are dropped by the
+    # guards above; anything left with a non-currency label is not a movement.
+    df = df[df["Currency"].str.len() == 3]
+    return df.sort_values("Date").reset_index(drop=True)
+
+
+def external_flows(path, min_abs: float = 1000.0) -> pd.DataFrame:
+    """Deposits and withdrawals — capital movements, not performance.
+
+    A NAV series containing these cannot be used to measure returns or
+    drawdown. This account was reset on 2026-06-23 with a -189,334 withdrawal
+    and a +250,000 deposit; read naively that is a -75% "drawdown" which is
+    really just capital leaving. `min_abs` ignores the sub-dollar FX sweeps
+    that also land in this section.
+    """
+    rows = []
+    for sec, kind, d in _sections(path):
+        if sec != "Deposits & Withdrawals" or kind != "Data":
+            continue
+        if not d.get("Settle Date"):
+            continue
+        amt = _num(d.get("Amount"))
+        if amt is None or abs(amt) < min_abs:
+            continue
+        day = pd.to_datetime(str(d["Settle Date"]).strip(), errors="coerce")
+        if pd.isna(day):
+            continue
+        rows.append({"Date": day.normalize(),
+                     "Currency": str(d.get("Currency", "")).strip().upper(),
+                     "Amount": amt})
+    return pd.DataFrame(rows, columns=["Date", "Currency", "Amount"])
+
+
+def performance_start(path, min_abs: float = 1000.0):
+    """First date after the last external capital flow.
+
+    Before it, the NAV path reflects money moving in and out rather than the
+    strategy, so it is not a live track record and must not feed drift or
+    drawdown.
+    """
+    fl = external_flows(path, min_abs=min_abs)
+    if fl.empty:
+        return None
+    return pd.Timestamp(fl["Date"].max()) + pd.Timedelta(days=1)
+
+
+def starting_cash(path) -> dict:
+    """{CCY: opening balance} from the Cash Report."""
+    out = {}
+    for sec, kind, d in _sections(path):
+        if sec == "Cash Report" and kind == "Data"                 and d.get("Currency Summary") == "Starting Cash":
+            c = str(d.get("Currency", "")).strip().upper()
+            if len(c) == 3:
+                out[c] = _num(d.get("Total")) or 0.0
+    return out
+
+
 def open_lots(trades: pd.DataFrame) -> pd.DataFrame:
     """Surviving lots after signed FIFO, in LOCAL currency.
 

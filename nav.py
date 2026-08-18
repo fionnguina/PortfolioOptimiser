@@ -290,7 +290,18 @@ def last_position_change_date(path=None):
     return last
 
 
-RECON_MAX_MEDIAN_DAILY_ERR = 0.0025   # 25bps median; above this, don't extrapolate
+RECON_MAX_MEDIAN_DAILY_ERR = 0.0025   # reported, not gated — see below
+# Gate at the timescale the CONSUMER uses. The drift tracker compares MONTHLY
+# returns against a +/-2% threshold, so validating on daily error tests
+# something stricter than anything downstream needs. Daily bars cannot match an
+# intraday snapshot in any case: the broker marks NetLiq at ~10:20 AEST with
+# ASX barely open and US at the previous close, which leaves ~0.65% median
+# daily error no matter how good the reconstruction is (shifting the US leg a
+# day recovers only 0.03% of it, so timing is not even the dominant term).
+# At monthly resolution the same series agrees to ~0.5-0.7pp. Gate there, at
+# half the drift threshold, and report the daily figure so the limitation
+# stays visible rather than being quietly assumed away.
+RECON_MAX_MONTHLY_ERR = 0.01
 # What the last call actually returned, so callers can label it honestly
 # rather than always claiming "fills recon + broker".
 LAST_NAV_SOURCE = "unknown"
@@ -322,9 +333,106 @@ def _first_broker_cash(path=None) -> float:
         return 0.0
 
 
+def compute_nav_from_statement(prices, statement_path, fx_usdaud=None) -> pd.Series:
+    """Full NAV path rebuilt from an IBKR Activity Statement.
+
+    This is what the fills-log reconstruction could never be. lots_seed.json
+    holds SURVIVING lots, so units are flat from each AcqDate onward and the
+    history is unrecoverable — BEAR actually ran 21,590 units down to 1,644
+    over this period. The statement carries every signed trade, so positions
+    can be walked forward properly.
+
+    NetLiquidation is positions PLUS cash, and cash here is reconstructed from
+    the statement's own movements — trades, both legs of each FX conversion,
+    deposits, dividends and interest — which reproduces the closing balance to
+    the cent in both currencies. Foreign cash is translated at each day's rate
+    because it is a live balance, unlike a cost base which is fixed at
+    acquisition.
+
+    Returns an empty Series if the statement cannot be used, so callers fall
+    back rather than receive a half-built path.
+    """
+    try:
+        import ibkr_statement as _stmt
+    except Exception:
+        return pd.Series(dtype=float)
+    try:
+        trades = _stmt.parse_trades(statement_path)
+        events = _stmt.cash_events(statement_path)
+        start = _stmt.starting_cash(statement_path)
+        if trades is None or trades.empty:
+            return pd.Series(dtype=float)
+    except Exception as e:
+        print(f"[nav] statement unreadable ({type(e).__name__}: {e})")
+        return pd.Series(dtype=float)
+
+    px = prices.copy()
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    px = px.sort_index().ffill()
+    first = pd.Timestamp(trades["DateTime"].min()).normalize()
+    # Accumulate over the FULL history, then trim. Trimming FIRST silently
+    # discards every pre-cutoff trade and cash movement while still applying
+    # the opening balance, which put the series at $994,850 instead of
+    # ~$247,000 — positions bought before the cutoff simply vanished.
+    cut = None
+    try:
+        import ibkr_statement as _s2
+        cut = _s2.performance_start(statement_path)
+    except Exception:
+        cut = None
+    dates = px.index[px.index >= first]
+    if len(dates) == 0:
+        return pd.Series(dtype=float)
+
+    fxs = None
+    if fx_usdaud is not None and len(fx_usdaud):
+        fxs = pd.to_numeric(pd.Series(fx_usdaud), errors="coerce")
+        fxs.index = pd.to_datetime(fxs.index).tz_localize(None).normalize()
+        fxs = fxs[~fxs.index.duplicated(keep="last")].sort_index().reindex(dates).ffill().bfill()
+
+    # --- positions: cumulative SIGNED units, valued each day ----------------
+    nav = pd.Series(0.0, index=dates)
+    t = trades.copy()
+    t["Day"] = pd.to_datetime(t["DateTime"]).dt.normalize()
+    for tkr, g in t.groupby("Security"):
+        if tkr not in px.columns:
+            print(f"[nav][WARN] {tkr} traded but absent from the price panel — skipped")
+            continue
+        units = g.groupby("Day")["Units"].sum().reindex(dates, fill_value=0.0).cumsum()
+        p = pd.to_numeric(px[tkr].reindex(dates), errors="coerce").ffill().fillna(0.0)
+        if fxs is not None and not str(tkr).endswith(".AX") and not str(tkr).startswith("^"):
+            p = p * fxs
+        nav = nav.add(units * p, fill_value=0.0)
+
+    # --- cash: per-currency running balance, translated daily ---------------
+    if events is not None and not events.empty:
+        for ccy, g in events.groupby("Currency"):
+            bal = (g.groupby("Date")["Amount"].sum()
+                    .reindex(dates, fill_value=0.0).cumsum() + float(start.get(ccy, 0.0)))
+            if ccy != "AUD":
+                if fxs is None:
+                    continue
+                bal = bal * fxs
+            nav = nav.add(bal, fill_value=0.0)
+    nav = nav.dropna()
+    # NOW trim, after everything has accumulated. Before the cutoff the path
+    # reflects an external capital flow (this account was reset on 2026-06-23:
+    # -189,334 withdrawn, +250,000 deposited), which reads as a -69%
+    # "drawdown" that is money moving rather than performance — and that figure
+    # feeds the live max-drawdown alert.
+    if cut is not None and len(nav):
+        trimmed = nav[nav.index >= cut]
+        if len(trimmed) >= 2:
+            print(f"[nav] performance window starts {cut.date()} — excluding "
+                  f"the external capital flows before it")
+            return trimmed
+    return nav
+
+
 def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
                                       broker_nav_path=None,
-                                      fx_usdaud=None) -> pd.Series:
+                                      fx_usdaud=None,
+                                      statement_path=None) -> pd.Series:
     """Actual-NAV path: fills-log reconstruction, upgraded to BROKER truth
     where ibkr_nav_log.jsonl has data (user directive 2026-07-08 — the
     fund's performance record is the broker's number).
@@ -335,9 +443,22 @@ def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
     snapshot, broker RETURNS applied cumulatively from there. On overlap
     days a return divergence > 50bps prints a [drift][WARN] — that gap is
     reconstruction error (missed fees/marks), worth knowing about."""
-    recon = compute_actual_nav_series(prices, fills_path, seed_path,
-                                      fx_usdaud=fx_usdaud,
-                                      cash_aud=_first_broker_cash(broker_nav_path))
+    # Prefer a statement-derived path: it has the full signed trade history and
+    # a cash series reconstructed from the statement's own movements, whereas
+    # the seed holds only SURVIVING lots and cannot express that BEAR ran
+    # 21,590 units down to 1,644.
+    recon = pd.Series(dtype=float)
+    if statement_path:
+        try:
+            if Path(statement_path).exists():
+                recon = compute_nav_from_statement(prices, statement_path,
+                                                   fx_usdaud=fx_usdaud)
+        except Exception as e:
+            print(f"[nav] statement path unusable ({type(e).__name__}: {e})")
+    if recon is None or recon.empty:
+        recon = compute_actual_nav_series(prices, fills_path, seed_path,
+                                          fx_usdaud=fx_usdaud,
+                                          cash_aud=_first_broker_cash(broker_nav_path))
     broker = _load_broker_nav_series(broker_nav_path)
     if len(broker) < 2 or recon.empty:
         globals()["LAST_NAV_SOURCE"] = "fills recon only (no broker log)"
@@ -367,21 +488,42 @@ def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
         br = broker.pct_change().dropna()
         both = rr.index.intersection(br.index)
         err = (rr.reindex(both) - br.reindex(both)).abs().dropna()
+        # Monthly agreement is the gate; daily is reported for context.
+        #
+        # Restrict BOTH series to their common dates BEFORE resampling. The
+        # first version resampled each independently, so July compared the
+        # reconstruction's full month against the broker's 8th-onward stub and
+        # reported 3.38% error for what is really a different window — a gate
+        # failing on its own arithmetic rather than on the data.
+        common = recon.index.intersection(broker.index)
+        if len(common) < 3:
+            return out
+        r_c, b_c = recon.reindex(common), broker.reindex(common)
+
+        def _monthly(x):
+            return ((1 + x.pct_change().fillna(0.0)).cumprod()
+                    .resample("ME").last().pct_change().dropna())
+        rm, bm = _monthly(r_c), _monthly(b_c)
+        mi = rm.index.intersection(bm.index)
+        m_err = (rm.reindex(mi) - bm.reindex(mi)).abs().dropna()
+        worst_month = float(m_err.max()) if len(m_err) else 0.0
+
         if len(err) >= 3:
             med = float(err.median())
             n_bad = int((err > 0.005).sum())
-            if med > RECON_MAX_MEDIAN_DAILY_ERR:
-                print(f"[nav][WARN] fills-log reconstruction FAILED validation "
-                      f"(median daily error {med*100:.2f}% over {len(err)} overlap "
-                      f"day(s), {n_bad} above 50bps). lots_seed.json is a position "
-                      f"SNAPSHOT, not a transaction history, so the pre-broker path "
-                      f"cannot be derived — using BROKER-ONLY NAV rather than "
-                      f"splicing an unvalidated head.")
+            if worst_month > RECON_MAX_MONTHLY_ERR:
+                print(f"[nav][WARN] NAV reconstruction FAILED validation — worst "
+                      f"monthly error {worst_month*100:.2f}% > "
+                      f"{RECON_MAX_MONTHLY_ERR*100:.0f}% (median daily "
+                      f"{med*100:.2f}% over {len(err)} overlap days). Using "
+                      f"BROKER-ONLY NAV rather than splicing an unvalidated head.")
                 globals()["LAST_NAV_SOURCE"] = "broker NetLiq only (recon failed validation)"
                 return broker
-            if n_bad:
-                print(f"[nav] reconstruction passed validation (median daily error "
-                      f"{med*100:.2f}%) with {n_bad} day(s) above 50bps")
+            print(f"[nav] reconstruction PASSED validation — worst monthly error "
+                  f"{worst_month*100:.2f}% (median daily {med*100:.2f}%, "
+                  f"{n_bad}/{len(err)} days above 50bps; daily bars cannot match "
+                  f"an intraday broker snapshot). Extending live NAV back to "
+                  f"{recon.index.min().date()}.")
     except Exception:
         pass
     globals()["LAST_NAV_SOURCE"] = "fills recon (validated) + broker NetLiq"

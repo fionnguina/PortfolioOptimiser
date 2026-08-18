@@ -716,25 +716,44 @@ def test_reconstruction_includes_cash_because_netliq_does():
 
 
 def test_reconstruction_that_fails_validation_is_not_extrapolated(tmp_path, monkeypatch):
-    """It derives a PATH from a position SNAPSHOT. If it cannot match broker
-    where both exist, it has not earned the right to speak where only it does."""
-    import nav as _nav
+    """It derives a PATH from history. If it cannot match broker where both
+    exist, it has not earned the right to speak where only it does.
+
+    Gated on MONTHLY error, because that is what the drift tracker consumes —
+    daily bars cannot match an intraday broker snapshot no matter how good the
+    reconstruction is (~0.65% median daily error is the floor).
+    """
+    import nav as _nav, json as _j
     monkeypatch.setattr(_nav, "APP_DIR", tmp_path)
-    seed, fills = _seed_and_fills(tmp_path)
-    idx = pd.bdate_range("2026-07-01", periods=12)
-    # Prices wander; the broker log says something quite different.
-    rng = np.random.default_rng(3)
-    px = pd.DataFrame({"AAA.AX": 10 * (1 + pd.Series(rng.normal(0, 0.03, len(idx)), index=idx)).cumprod(),
+    idx = pd.bdate_range("2026-05-01", periods=70)
+    # Lots must predate the broker log or the reconstruction never overlaps it
+    # and there is nothing to validate against.
+    seed = tmp_path / "seed.json"
+    seed.write_text(_j.dumps([
+        {"Security": "AAA.AX", "Units": 100, "AcqDate": idx[0].isoformat()},
+        {"Security": "BBB", "Units": 10, "AcqDate": idx[0].isoformat()},
+    ]), encoding="utf-8")
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text("", encoding="utf-8")
+    # Reconstruction drifts ~1%/month away from the broker — well past the gate.
+    px = pd.DataFrame({"AAA.AX": 10 * (1 + pd.Series(0.004, index=idx)).cumprod(),
                        "BBB": 20.0}, index=idx)
     log = tmp_path / "ibkr_nav_log.jsonl"
-    import json as _j
     with open(log, "w", encoding="utf-8") as fp:
-        for i, d in enumerate(idx[4:]):
-            fp.write(_j.dumps({"ts": d.isoformat(), "net_liquidation_aud": 200_000 + i * 900,
-                               "cash_aud": 1000.0}) + "\n")
+        for i, d in enumerate(idx):
+            fp.write(_j.dumps({"ts": d.isoformat(),
+                               "net_liquidation_aud": 200_000 * (1.0005 ** i),
+                               "cash_aud": 0.0}) + chr(10))
     out = _nav.compute_actual_nav_series_spliced(px, fills, seed, broker_nav_path=log)
     broker = _nav._load_broker_nav_series(log)
     pd.testing.assert_series_equal(out, broker), "must fall back to broker-only"
+
+
+def test_gate_is_monthly_not_daily():
+    """Pinning the decision: daily error is reported, monthly error decides."""
+    src = (Path(__file__).resolve().parent.parent / "nav.py").read_text(encoding="utf-8")
+    assert "RECON_MAX_MONTHLY_ERR" in src
+    assert "if worst_month > RECON_MAX_MONTHLY_ERR:" in src
 
 
 def test_first_broker_cash_reads_the_earliest_balance(tmp_path):
@@ -1018,3 +1037,35 @@ def test_statement_fx_falls_back_to_daily_series_off_conversion_days():
     stmt = pd.Series({pd.Timestamp("2026-08-03"): 1.43010})
     out = S.to_aud(lots, fx_usdaud=daily, stmt_fx=stmt)
     assert out.iloc[0]["FxAtAcq"] == pytest.approx(1.43285)
+
+
+def test_external_capital_flows_are_excluded_from_performance(tmp_path):
+    """A -189,334 withdrawal plus a +250,000 deposit is not a -69% drawdown."""
+    import ibkr_statement as S
+    csv = tmp_path / "s.csv"
+    csv.write_text(
+        "Deposits & Withdrawals,Header,Currency,Account,Settle Date,Description,Amount\n"
+        "Deposits & Withdrawals,Data,AUD,D1,2026-06-23,Adjustment,-189334.35\n"
+        "Deposits & Withdrawals,Data,AUD,D1,2026-06-23,Adjustment,250000\n"
+        "Deposits & Withdrawals,Data,AUD,D1,2026-06-23,FX sweep,-2.06\n", encoding="utf-8")
+    fl = S.external_flows(csv)
+    assert len(fl) == 2, "sub-dollar FX sweeps are not capital flows"
+    assert S.performance_start(csv) == pd.Timestamp("2026-06-24")
+
+
+def test_performance_start_is_none_without_flows(tmp_path):
+    import ibkr_statement as S
+    csv = tmp_path / "s.csv"
+    csv.write_text("Statement,Header,Field Name,Field Value\n"
+                   "Statement,Data,Period,x\n", encoding="utf-8")
+    assert S.performance_start(csv) is None
+
+
+def test_monthly_gate_compares_the_common_window_only():
+    """Resampling two series with different start dates compares a full month
+    against a stub — the gate then fails on its own arithmetic."""
+    src = (Path(__file__).resolve().parent.parent / "nav.py").read_text(encoding="utf-8")
+    i = src.index("Monthly agreement is the gate")
+    block = src[i:i + 900]
+    assert "common = recon.index.intersection(broker.index)" in block
+    assert "r_c, b_c = recon.reindex(common), broker.reindex(common)" in block

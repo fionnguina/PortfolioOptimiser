@@ -1,0 +1,353 @@
+﻿Statement,Header,Field Name,Field Value
+Statement,Data,BrokerName,"Interactive Brokers Australia Pty Ltd., AFSL 453554, ABN 98 166 929 568"
+Statement,Data,BrokerAddress,"Level 11, 175 Pitt Street, Sydney, New South Wales 2000, Australia"
+Statement,Data,Title,Activity Statement
+Statement,Data,Period,"June 22, 2026 - August 17, 2026"
+Statement,Data,WhenGenerated,"2026-08-18, 18:31:16 AEST"
+Disclaimer,Header,Field Name,Field Value
+Disclaimer,Data,Disclaimer,"This Activity Summary is provided as a convenience to clients, including those who may have migrated their account(s) to Interactive Brokers Australia Pty Limited ("IBAU") from other Interactive Brokers companies outside of Australia. Transactions (including trades and any deposit or withdrawal) shown on this Activity Summary may include transactions in your accounts held at another Interactive Brokers company prior to the opening of your account with IBAU. Client statements for each of your account(s) are available under Account Management when you log in to the IB website."
+Account Information,Header,Field Name,Field Value
+Account Information,Data,Name,Fionn Guina
+Account Information,Data,Account,DUQ532705 (Custom Consolidated)
+Account Information,Data,Accounts Included,"DUQ532705, DUQ532705-P (Paxos)"
+Account Information,Data,Address of Account Holder(s),"Unit 2 332 Shannon Avenue,Geelong, AU-VIC 3220,Australia"
+Account Information,Data,Account Type,Individual
+Account Information,Data,Customer Type,Individual
+Account Information,Data,Account Capabilities,Margin
+Account Information,Data,Base Currency,AUD
+Net Asset Value,Header,Asset Class,Prior Total,Current Long,Current Short,Current Total,Change
+Net Asset Value,Data,Cash ,1000000,11672.933736882,-0.005223145,11672.928513737,-988327.071486263
+Net Asset Value,Data,Stock,0,244074.35722,0,244074.35722,244074.35722
+Net Asset Value,Data,Interest Accruals,1865.24,11.59,-4.64508,6.94492,-1858.29508
+Net Asset Value,Data,Total,1001865.24,255758.880956882,-4.650303145,255754.230653737,-746111.009346263
+Net Asset Value,Header,Time Weighted Rate of Return
+Net Asset Value,Data,-75.927334837%
+Change in Combined NAV,Header,Field Name,Field Value
+Change in NAV,Data,Starting Value,1001865.24
+Change in NAV,Data,Mark-to-Market,-806054.102502
+Change in NAV,Data,Deposits & Withdrawals,60662.671652
+Change in NAV,Data,Dividends,174.39
+Change in NAV,Data,Interest,2614.06265
+Change in NAV,Data,Change in Interest Accruals,-1858.711228
+Change in NAV,Data,Commissions,-1233.671541821
+Change in NAV,Data,GST,-120.8292408
+Change in NAV,Data,Net FX Trading,-143.578963295
+Change in NAV,Data,Other FX Translations,-151.240172347
+Change in NAV,Data,Ending Value,255754.230653737
+Mark-to-Market Performance Summary,Header,Asset Category,Symbol,Prior Quantity,Current Quantity,Prior Price,Current Price,Mark-to-Market P/L Position,Mark-to-Market P/L Transaction,Mark-to-Market P/L Commissions,Mark-to-Market P/L Other,Mark-to-Market P/L Total,Code
+Mark-to-Market Performance Summary,Data,Stocks,BBUS,0,0,--,--,-403.56,-10.62,-22.2986016,0,-436.4786016,
+Mark-to-Market Performance Summary,Data,Stocks,BEAR,0,1644,--,7.2100,-275.18,-622.19,-308.346192,0,-1205.716192,
+Mark-to-Market Performance Summary,Data,Stocks,GOLD,0,369,--,56.4700,-1946.03,-175759.55,-207.925256,0,-177913.505256,
+Mark-to-Market Performance Summary,Data,Stocks,HBRD,0,1508,--,10.0700,-93.595,-16.645,-67.6230192,174.39,-3.4730192,
+Mark-to-Market Performance Summary,Data,Stocks,PDBC,0,420,--,18.2100,463.386164,35.1769,-3.597474583,0,494.965589417,
+Mark-to-Market Performance Summary,Data,Stocks,REIT,0,0,--,--,47.32,-3095.82,-6.6,0,-3055.1,
+Mark-to-Market Performance Summary,Data,Stocks,SEMI,0,0,--,--,-3214.64,-101609.6,-92.2453312,0,-104916.4853312,
+Mark-to-Market Performance Summary,Data,Stocks,SMH,0,81,--,594.0700,-2065.313261,-44508.0136,-4.294962741,0,-46577.621823741,
+Mark-to-Market Performance Summary,Data,Stocks,SOXL,0,0,--,--,-343.469664,-245.70336,-2.94202258,0,-592.11504658,
+Mark-to-Market Performance Summary,Data,Stocks,SOXX,0,0,--,--,-3125.770192,-43994.127836,-5.134624696,0,-47125.032652696,
+Mark-to-Market Performance Summary,Data,Stocks,VAE,0,0,--,--,-312.3,-10363.5,-9.394704,0,-10685.194704,
+Mark-to-Market Performance Summary,Data,Stocks,VEA,0,32,--,73.6900,-107.85812,-7499.269533,-5.745434901,0,-7612.873087901,
+Mark-to-Market Performance Summary,Data,Stocks,VLUE,0,2974,--,38.4600,5220.51,-409055.57,-608.0885448,0,-404443.1485448,
+Mark-to-Market Performance Summary,Data,Stocks,VMIN,0,0,--,--,-2.45,-3149.72,-6.6,0,-3158.77,
+Mark-to-Market Performance Summary,Data,P/L on FX Translation (Stocks),,,,,,,,,,-191.49,
+Mark-to-Market Performance Summary,Data,Total,,,,,,-6158.950073,-799895.152429,-1350.836168301,174.39,-807422.036876301,
+Mark-to-Market Performance Summary,Data,Total (All Assets),,,,,,-6158.950073,-799895.152429,-1350.836168301,174.39,-807422.036876301,
+Mark-to-Market Performance Summary,Data,Broker Interest Paid and Received,,,,,,,,,,2614.06265,
+Total P/L for Statement Period,,,,,,,,,,,,-804807.974226301,
+Realized & Unrealized Performance Summary,Header,Asset Category,Symbol,Cost Adj.,Realized S/T Profit,Realized S/T Loss,Realized L/T Profit,Realized L/T Loss,Realized Total,Unrealized S/T Profit,Unrealized S/T Loss,Unrealized L/T Profit,Unrealized L/T Loss,Unrealized Total,Total,Code
+Realized & Unrealized Performance Summary,Data,Stocks,BBUS,0,0,-436.4786016,0,0,-436.4786016,0,0,0,0,0,-436.4786016,
+Realized & Unrealized Performance Summary,Data,Stocks,BEAR,0,0,-887.33098229,0,0,-887.33098229,0,-318.385209,0,0,-318.385209,-1205.71619129,
+Realized & Unrealized Performance Summary,Data,Stocks,GOLD,0,0,-178595.32750608,0,0,-178595.32750608,681.82225,0,0,0,681.82225,-177913.50525608,
+Realized & Unrealized Performance Summary,Data,Stocks,HBRD,0,0,-120.41537962,0,0,-120.41537962,0,-57.44764,0,0,-57.44764,-177.86301962,
+Realized & Unrealized Performance Summary,Data,Stocks,PDBC,0,0,0,0,0,0,492.376706424,0,0,0,492.376706424,492.376706424,
+Realized & Unrealized Performance Summary,Data,Stocks,REIT,0,0,-3055.1,0,0,-3055.1,0,0,0,0,0,-3055.1,
+Realized & Unrealized Performance Summary,Data,Stocks,SEMI,0,0,-104916.485331,0,0,-104916.485331,0,0,0,0,0,-104916.485331,
+Realized & Unrealized Performance Summary,Data,Stocks,SMH,0,0,-48466.10781687,0,0,-48466.10781687,2803.488637093,-844.81357914,0,0,1958.675057953,-46507.432758917,
+Realized & Unrealized Performance Summary,Data,Stocks,SOXL,0,0,-592.129030767,0,0,-592.129030767,0,0,0,0,0,-592.129030767,
+Realized & Unrealized Performance Summary,Data,Stocks,SOXX,0,125.197034617,-47254.23825687,0,0,-47129.041222253,0,0,0,0,0,-47129.041222253,
+Realized & Unrealized Performance Summary,Data,Stocks,VAE,0,0,-10685.194704,0,0,-10685.194704,0,0,0,0,0,-10685.194704,
+Realized & Unrealized Performance Summary,Data,Stocks,VEA,0,0,-7754.035342046,0,0,-7754.035342046,140.420761362,0,0,0,140.420761362,-7613.614580684,
+Realized & Unrealized Performance Summary,Data,Stocks,VLUE,0,57.8092,-408722.2151474,0,0,-408664.4059474,4221.257402,0,0,0,4221.257402,-404443.1485454,
+Realized & Unrealized Performance Summary,Data,Stocks,VMIN,0,0,-3158.77,0,0,-3158.77,0,0,0,0,0,-3158.77,
+Realized & Unrealized Performance Summary,Data,Total,,0,183.006234617,-814643.828098543,0,0,-814460.821863927,8339.365756879,-1220.64642814,0,0,7118.719328739,-807342.102535188,
+Realized & Unrealized Performance Summary,Data,Total (All Assets),,0,183.006234617,-814643.828098543,0,0,-814460.821863927,8339.365756879,-1220.64642814,0,0,7118.719328739,-807342.102535188,
+Month & Year to Date Performance Summary,Header,Asset Category,Symbol,Description,Mark-to-Market MTD,Mark-to-Market YTD,Realized S/T MTD,Realized S/T YTD,Realized L/T MTD,Realized L/T YTD
+Month & Year to Date Performance Summary,Data,Stocks,BBUS,BE US EQ STR BE CU HE CO ETF,0,-434.451456,0,-436.4786016,0,0
+Month & Year to Date Performance Summary,Data,Stocks,BEAR,BETASHARES AUS EQ BEAR CMPLX,-65.76,-1177.68472,0,-887.33098229,0,0
+Month & Year to Date Performance Summary,Data,Stocks,GOLD,GLOBAL X PHYSICAL GOLD STRU,1247.22,-177894.60296,0,-178595.32750607,0,0
+Month & Year to Date Performance Summary,Data,Stocks,HBRD,BETASHARES AU CREDIT INCOME,26.51,2.674528,0,-120.41537961,0,0
+Month & Year to Date Performance Summary,Data,Stocks,PDBC,INVESCO OPTIMUM YIELD DIVERS,384.17106,494.96558942,0,0,0,0
+Month & Year to Date Performance Summary,Data,Stocks,REIT,VAN FISE IN PR (AUD HE) ETF,0,-3054.5,0,-3055.1,0,0
+Month & Year to Date Performance Summary,Data,Stocks,SEMI,GLOBAL X SEMICONDUCTOR ETF,0,-104908.099392,0,-104916.485331,0,0
+Month & Year to Date Performance Summary,Data,Stocks,SMH,VANECK SEMICONDUCTOR ETF,6621.66072416,-46577.62182374,0,-48466.10781687,0,0
+Month & Year to Date Performance Summary,Data,Stocks,SOXL,DIREX DAIL SEMI BU 3X ET-USD,0,-592.11504659,0,-592.12903077,0,0
+Month & Year to Date Performance Summary,Data,Stocks,SOXX,ISHARES SEMICONDUCTOR ETF,0,-47125.0326527,0,-47129.04122225,0,0
+Month & Year to Date Performance Summary,Data,Stocks,VAE,VANGUARD FTSE ASIA EX-JAP SH,0,-10684.34064,0,-10685.194704,0,0
+Month & Year to Date Performance Summary,Data,Stocks,VEA,VANGUARD FTSE DEVELOPED ETF,139.272736,-7612.8730879,0,-7754.03534204,0,0
+Month & Year to Date Performance Summary,Data,Stocks,VLUE,VANECK MSCI INTERNATIONAL VA,3360.62,-404387.867768,0,-408664.4059474,0,0
+Month & Year to Date Performance Summary,Data,Stocks,VMIN,VANGUARD GLB MIN VOL ACT ETF,0,-3158.17,0,-3158.77,0,0
+Month & Year to Date Performance Summary,Data,Total,,,11713.69452016,-807109.71942951,0,-814460.8218639,0,0
+Month & Year to Date Performance Summary,Data,Total (All Assets),,,11713.69452016,-807109.71942951,0,-814460.8218639,0,0
+Cash Report,Header,Currency Summary,Currency,Total,Paxos,Month to Date,Year to Date,
+Cash Report,Data,Starting Cash,Base Currency Summary,1000000,0,,,
+Cash Report,Data,Commissions,Base Currency Summary,-1233.671541821,0,-1.89615609,-1233.67154183,
+Cash Report,Data,Deposits,Base Currency Summary,250000,0,0,250000,
+Cash Report,Data,Withdrawals,Base Currency Summary,-189337.328348,0,0,-189337.328348,
+Cash Report,Data,Broker Interest Paid and Received,Base Currency Summary,2614.06265,0,113.70617,2614.06265,
+Cash Report,Data,Trades (Sales),Base Currency Summary,494812.434748705,0,23480.57413322,494812.4347487,
+Cash Report,Data,Trades (Purchase),Base Currency Summary,-1545275.96164,0,-46967.873116,-1545275.96164,
+Cash Report,Data,Payment In Lieu of Dividends,Base Currency Summary,174.39,0,71.75,174.39,
+Cash Report,Data,GST,AUD,-120.8292408,0,0,-120.8292408,
+Cash Report,Data,Cash FX Translation Gain/Loss,Base Currency Summary,39.831885654,,,
+Cash Report,Data,Ending Cash,Base Currency Summary,11672.928513737,0,,,
+Cash Report,Data,Ending Settled Cash,Base Currency Summary,11672.928513737,0,,,
+Cash Report,Data,Starting Cash,AUD,1000000,0,,,
+Cash Report,Data,Commissions,AUD,-1211.95702232,0,-0.46762325,-1211.95702232,
+Cash Report,Data,Deposits,AUD,250000,0,0,1250000,
+Cash Report,Data,Withdrawals,AUD,-189334.35,0,0,-189334.35,
+Cash Report,Data,Broker Interest Paid and Received,AUD,2648.55,0,133.53,2648.55,
+Cash Report,Data,Trades (Sales),AUD,267318.42,0,0,267318.42,
+Cash Report,Data,Trades (Purchase),AUD,-1317801.29,0,-23508.56,-1317801.29,
+Cash Report,Data,Payment In Lieu of Dividends,AUD,174.39,0,71.75,174.39,
+Cash Report,Data,GST,AUD,-120.8292408,0,0,-120.8292408,
+Cash Report,Data,Ending Cash,AUD,11672.933736882,0,,,
+Cash Report,Data,Ending Settled Cash,AUD,11672.933736882,0,,,
+Cash Report,Data,Starting Cash,USD,0,0,,,
+Cash Report,Data,Commissions,USD,-15.17204747,0,-1.000093,-15.17204747,
+Cash Report,Data,Withdrawals,USD,-2.06,0,0,-2.06,
+Cash Report,Data,Broker Interest Paid and Received,USD,-24.19,0,-13.99,-24.19,
+Cash Report,Data,Trades (Sales),USD,159030.7883368,0,16438.4743565,159030.7883368,
+Cash Report,Data,Trades (Purchase),USD,-158989.37,0,-16423.49,-158989.37,
+Cash Report,Data,Ending Cash,USD,-0.003710674,0,,,
+Cash Report,Data,Ending Settled Cash,USD,-0.003710674,0,,,
+Open Positions,Header,DataDiscriminator,Asset Category,Currency,Symbol,Quantity,Mult,Cost Price,Cost Basis,Close Price,Value,Unrealized P/L,Code
+Open Positions,Data,Summary,Stocks,AUD,BEAR,1644,1,7.403664969,12171.625209,7.21,11853.24,-318.385209,
+Open Positions,Data,Summary,Stocks,AUD,GOLD,369,1,54.622243225,20155.60775,56.47,20837.43,681.82225,
+Open Positions,Data,Summary,Stocks,AUD,HBRD,1508,1,10.108095252,15243.00764,10.07,15185.56,-57.44764,
+Open Positions,Data,Summary,Stocks,AUD,VLUE,2974,1,37.040612844,110158.782598,38.46,114380.04,4221.257402,
+Open Positions,Total,,Stocks,AUD,,,,,157729.023197,,162256.27,4527.246803,
+Open Positions,Data,Summary,Stocks,USD,PDBC,420,1,17.377145857,7298.40126,18.21,7648.2,349.79874,
+Open Positions,Data,Summary,Stocks,USD,SMH,81,1,576.890990654,46728.170243,594.07,48119.67,1391.499757,
+Open Positions,Data,Summary,Stocks,USD,VEA,32,1,70.572531406,2258.321005,73.69,2358.08,99.758995,
+Open Positions,Total,,Stocks,USD,,,,,56284.892508,,58125.95,1841.057492,
+Open Positions,Total,,Stocks,AUD,,,,,79226.614694261,,81818.08722,2591.472525739,
+Open Positions,Total,,Stocks,AUD,,,,,236955.637891261,,244074.35722,7118.719328739,
+Net Stock Position Summary,Header,Asset Category,Currency,Symbol,Description,Shares at IB,Shares Borrowed,Shares Lent,Net Shares
+Net Stock Position Summary,Data,Stocks,AUD,BEAR,BETASHARES AUS EQ BEAR CMPLX,1644,0,0,1644
+Net Stock Position Summary,Data,Stocks,AUD,GOLD,GLOBAL X PHYSICAL GOLD STRU,369,0,0,369
+Net Stock Position Summary,Data,Stocks,AUD,HBRD,BETASHARES AU CREDIT INCOME,1508,0,0,1508
+Net Stock Position Summary,Data,Stocks,AUD,VLUE,VANECK MSCI INTERNATIONAL VA,2974,0,0,2974
+Net Stock Position Summary,Data,Stocks,USD,PDBC,INVESCO OPTIMUM YIELD DIVERS,420,0,0,420
+Net Stock Position Summary,Data,Stocks,USD,SMH,VANECK SEMICONDUCTOR ETF,81,0,0,81
+Net Stock Position Summary,Data,Stocks,USD,VEA,VANGUARD FTSE DEVELOPED ETF,32,0,0,32
+Trades,Header,DataDiscriminator,Asset Category,Currency,Account,Symbol,Date/Time,Quantity,T. Price,C. Price,Proceeds,Comm/Fee,Basis,Realized P/L,MTM P/L,Code
+Trades,Data,Order,Stocks,AUD,DUQ532705,BBUS,"2026-06-24, 09:59:53",531,24.25,24.19,-12876.75,-11.33154,12888.08154,0,-31.86,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,BBUS,"2026-07-06, 13:18:47",-531,23.47,23.43,12462.57,-10.9670616,-12888.08154,-436.478602,21.24,C
+Trades,SubTotal,,Stocks,AUD,BBUS,,,0,,,-414.18,-22.2986016,0,-436.478602,-10.62,
+Trades,Data,Order,Stocks,AUD,DUQ532705,BEAR,"2026-06-24, 09:59:53","21,590",7.38,7.37,-159334.2,-140.214096,159474.414096,0,-215.9,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,BEAR,"2026-07-06, 13:17:25","-19,872",7.35,7.37,146059.2,-128.532096,-146784.416717,-853.748813,-397.44,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,BEAR,"2026-07-08, 09:59:52",96,7.45,7.42,-715.2,-6.6,721.8,0,-2.88,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,BEAR,"2026-07-20, 09:59:53",-614,7.37,7.4,4525.18,-6.6,-4535.307562,-16.727562,-18.42,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,BEAR,"2026-07-24, 09:59:57",367,7.43,7.45,-2726.81,-6.6,2733.41,0,7.34,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,BEAR,"2026-07-29, 09:59:54",-70,7.24,7.23,506.8,-6.6,-517.054608,-16.854608,0.7,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,BEAR,"2026-07-30, 09:59:50",106,7.26,7.29,-769.56,-6.6,776.16,0,3.18,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,BEAR,"2026-07-31, 09:59:59",41,7.22,7.25,-296.02,-6.6,302.62,0,1.23,O
+Trades,SubTotal,,Stocks,AUD,BEAR,,,1644,,,-12750.61,-308.346192,12171.625209,-887.330983,-622.19,
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-06-22, 11:53:26","3,259",54.72,54.8,-178332.48,-156.9325824,178489.4125824,0,260.72,O;P
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-06-23, 14:00:00","-3,259",0,54.02,0,0,-178489.412582,-178489.412582,-176051.18,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-07-06, 13:15:17",224,55.03,55.1,-12326.72,-10.8475136,12337.5675136,0,15.68,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-07-08, 09:59:52",150,54.13,54.36,-8119.5,-7.14516,8126.64516,0,34.5,O;P
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-07-20, 09:59:53",-20,52.29,52.48,1045.8,-6.6,-1101.568528,-62.368528,-3.8,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-07-24, 09:59:57",8,53.37,52.78,-426.96,-6.6,433.56,0,-4.72,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-07-29, 09:59:54",-8,52.78,53.02,422.24,-6.6,-440.627411,-24.987411,-1.92,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-07-30, 09:59:50",-7,53.37,53.06,373.59,-6.6,-385.548985,-18.558985,2.17,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,GOLD,"2026-07-31, 10:00:29",22,53.59,53.09,-1178.98,-6.6,1185.58,0,-11,O
+Trades,SubTotal,,Stocks,AUD,GOLD,,,369,,,-198543.01,-207.925256,20155.60775,-178595.327506,-175759.55,
+Trades,Data,Order,Stocks,AUD,DUQ532705,HBRD,"2026-06-24, 09:59:53","2,034",10.1,10.1,-20543.4,-18.078192,20561.478192,0,0,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,HBRD,"2026-07-06, 13:22:16","-1,754",10.06,10.07,17645.24,-15.5278112,-17730.989552,-101.277363,-17.54,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,HBRD,"2026-07-20, 09:59:53",497,10.08,10.085,-5009.76,-6.6,5016.36,0,2.485,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,HBRD,"2026-07-24, 09:59:57",857,10.1,10.1,-8655.7,-7.617016,8663.317016,0,0,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,HBRD,"2026-07-29, 09:59:54",-319,10.09,10.09,3218.71,-6.6,-3224.126547,-12.016547,0,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,HBRD,"2026-07-30, 09:59:50",352,10.1,10.1,-3555.2,-6.6,3561.8,0,0,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,HBRD,"2026-07-31, 09:59:59",-159,10.09,10.1,1604.31,-6.6,-1604.831469,-7.121469,-1.59,C
+Trades,SubTotal,,Stocks,AUD,HBRD,,,1508,,,-15295.8,-67.6230192,15243.00764,-120.415379,-16.645,
+Trades,Data,Order,Stocks,AUD,DUQ532705,REIT,"2026-06-22, 11:53:26",182,16.75,16.7,-3048.5,-6.6,3055.1,0,-9.1,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,REIT,"2026-06-23, 14:00:00",-182,0,16.96,0,0,-3055.1,-3055.1,-3086.72,C
+Trades,SubTotal,,Stocks,AUD,REIT,,,0,,,-3048.5,-6.6,0,-3055.1,-3095.82,
+Trades,Data,Order,Stocks,AUD,DUQ532705,SEMI,"2026-06-22, 11:53:26","2,248",46.63,46.88,-104824.24,-92.2453312,104916.4853312,0,562,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,SEMI,"2026-06-23, 14:00:00","-2,248",0,45.45,0,0,-104916.485331,-104916.485331,-102171.6,C
+Trades,SubTotal,,Stocks,AUD,SEMI,,,0,,,-104824.24,-92.2453312,0.0000002,-104916.485331,-101609.6,
+Trades,Data,Order,Stocks,AUD,DUQ532705,VAE,"2026-06-22, 11:53:45",90,118.62,118.66,-10675.8,-9.394704,10685.194704,0,3.6,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,VAE,"2026-06-23, 14:00:00",-90,0,115.19,0,0,-10685.194704,-10685.194704,-10367.1,C
+Trades,SubTotal,,Stocks,AUD,VAE,,,0,,,-10675.8,-9.394704,0,-10685.194704,-10363.5,
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-06-22, 11:53:51","9,412",43.33,43.44,-407821.96,-358.8833248,408180.8433248,0,1035.32,O;P
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-06-23, 14:00:00","-9,412",0,43.56,0,0,-408180.843325,-408180.843325,-409986.72,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-07-06, 13:17:45","4,375",37.15,37.11,-162531.25,-143.0275,162674.2775,0,-175,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-07-08, 09:59:52","-1,718",36.900046566,36.77,63394.28,-55.7869664,-63879.864856,-541.371822,223.42,C;P
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-07-20, 09:59:53",253,36.44,36.27,-9219.32,-8.1130016,9227.4330016,0,-43.01,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-07-24, 09:59:57",464,36.6,36.37,-16982.4,-14.944512,16997.344512,0,-106.72,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-07-29, 09:59:54",-430,37.35,37.36,16060.5,-14.13324,-15988.55756,57.8092,-4.3,C
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-07-30, 09:59:50",9,37.27,36.94,-335.43,-6.6,342.03,0,-2.97,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,VLUE,"2026-07-31, 09:59:59",21,37.12,37.33,-779.52,-6.6,786.12,0,4.41,O
+Trades,SubTotal,,Stocks,AUD,VLUE,,,2974,,,-518215.1,-608.0885448,110158.7825974,-408664.405947,-409055.57,
+Trades,Data,Order,Stocks,AUD,DUQ532705,VMIN,"2026-06-22, 11:53:46",49,64.33,64.28,-3152.17,-6.6,3158.77,0,-2.45,O
+Trades,Data,Order,Stocks,AUD,DUQ532705,VMIN,"2026-06-23, 14:00:00",-49,0,64.23,0,0,-3158.77,-3158.77,-3147.27,C
+Trades,SubTotal,,Stocks,AUD,VMIN,,,0,,,-3152.17,-6.6,0,-3158.77,-3149.72,
+Trades,Total,,Stocks,AUD,,,,,,,-866919.41,-1329.1216488,157729.0231966,-710519.508452,-703683.215, 
+Trades,Data,Order,Stocks,USD,DUQ532705,PDBC,"2026-07-20, 23:30:01",304,17.28,17.38,-5253.12,-1.520912,5254.640912,0,30.4,O;P
+Trades,Data,Order,Stocks,USD,DUQ532705,PDBC,"2026-07-31, 23:30:45",116,17.61,17.56,-2042.76,-1.000348,2043.760348,0,-5.8,O
+Trades,SubTotal,,Stocks,USD,PDBC,,,420,,,-7295.88,-2.52126,7298.40126,0,24.6,
+Trades,Data,Order,Stocks,USD,DUQ532705,SMH,"2026-06-22, 23:30:09",50,670.42,668.91,-33521,-1.00015,33522.00015,0,-75.5,O;P
+Trades,Data,Order,Stocks,USD,DUQ532705,SMH,"2026-06-23, 14:00:00",-50,0,622.05,0,0,-33522.00015,-33522.00015,-31102.5,C
+Trades,Data,Order,Stocks,USD,DUQ532705,SMH,"2026-07-06, 23:30:00",50,606.0536,604.3,-30302.68,-1.00015,30303.68015,0,-87.68,O;P
+Trades,Data,Order,Stocks,USD,DUQ532705,SMH,"2026-08-03, 23:30:19",31,529.79,545.46,-16423.49,-1.000093,16424.490093,0,485.77,O
+Trades,SubTotal,,Stocks,USD,SMH,,,81,,,-80247.17,-3.000393,46728.170243,-33522.00015,-30779.91,
+Trades,Data,Order,Stocks,USD,DUQ532705,SOXL,"2026-07-06, 23:30:02",12,197.05,194.65,-2364.6,-1.000036,2365.600036,0,-28.8,O
+Trades,Data,Order,Stocks,USD,DUQ532705,SOXL,"2026-07-08, 23:30:15",-12,163.02,174.82,1956.24,-1.042674544,-2365.600036,-410.402711,-141.6,C
+Trades,SubTotal,,Stocks,USD,SOXL,,,0,,,-408.36,-2.042710544,0,-410.402711,-170.4,
+Trades,Data,Order,Stocks,USD,DUQ532705,SOXX,"2026-06-22, 23:30:16",50,653.656,655.01,-32682.8,-1.00015,32683.80015,0,67.7,O;P
+Trades,Data,Order,Stocks,USD,DUQ532705,SOXX,"2026-06-23, 14:00:00",-50,0,603.39,0,0,-32683.80015,-32683.80015,-30169.5,C
+Trades,Data,Order,Stocks,USD,DUQ532705,SOXX,"2026-07-20, 23:30:13",-53,532.89,524.14,28243.17,-1.592303302,-28241.577696698,0,463.75,O
+Trades,Data,Order,Stocks,USD,DUQ532705,SOXX,"2026-07-27, 23:30:36",53,531.19,516.23,-28153.07,-1.000159,28241.577697,87.507538,-792.88,C;P
+Trades,SubTotal,,Stocks,USD,SOXX,,,0,,,-32592.7,-3.592612302,0.000000302,-32596.292612,-30430.93,
+Trades,Data,Order,Stocks,USD,DUQ532705,VEA,"2026-06-22, 23:30:33",74,72.44,72.39,-5360.56,-1.000222,5361.560222,0,-3.7,O
+Trades,Data,Order,Stocks,USD,DUQ532705,VEA,"2026-06-23, 14:00:00",-74,0,70.17,0,0,-5361.560222,-5361.560222,-5192.58,C
+Trades,Data,Order,Stocks,USD,DUQ532705,VEA,"2026-07-08, 23:30:02",22,69.84,70.34,-1536.48,-1.000066,1537.480066,0,11,O
+Trades,Data,Order,Stocks,USD,DUQ532705,VEA,"2026-07-20, 23:30:03",-9,69.82,69.23,628.38,-1.014726628,-628.969118,-1.603845,5.31,C
+Trades,Data,Order,Stocks,USD,DUQ532705,VEA,"2026-07-31, 23:31:03",19,70.99,70.62,-1348.81,-1.000057,1349.810057,0,-7.03,O
+Trades,SubTotal,,Stocks,USD,VEA,,,32,,,-7617.47,-4.015071628,2258.321005,-5363.164067,-5187,
+Trades,Total,,Stocks,USD,,,,,,,-128161.58,-15.172047474,56284.892508302,-71891.85954,-66543.64, 
+Trades,Total,,Stocks,AUD,,,,,,,-183400.537928,-21.714519507,79480.939035438,-103941.313413258,-96211.937429, 
+Trades,Header,DataDiscriminator,Asset Category,Currency,Account,Symbol,Date/Time,Quantity,T. Price,,Proceeds,Comm in AUD,,,,Code
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-06-22, 23:31:09","-102,177.8",0.70044,,71569.418232,-2.041016669,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-07-06, 23:31:02","-47,135.96",0.69308,,32668.9911568,-0.941389649,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-07-06, 23:31:02",-0.42,0.69295,,0.291039,0,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-07-07, 00:39:57",-14.71,0.69325,,10.1977075,0,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-07-27, 23:31:36","-5,890.14",0.6997,,4121.330958,-0.118043161,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-07-27, 23:31:37",-1.03,0.6997,,0.720691,0,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-07-31, 23:31:47","-4,834.22",0.7019,,3393.139018,-0.096541591,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-07-31, 23:31:48",-0.62,0.7019,,0.435178,0,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-08-03, 23:31:19","-23,483.03",0.69925,,16420.5087275,-0.467623248,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-08-03, 23:31:20",-5.7,0.69925,,3.985725,0,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-08-05, 23:46:55",-15.18,0.7048,,10.698864,0,,,,L
+Trades,Data,Order,Forex,USD,DUQ532705,AUD.USD,"2026-08-06, 12:54:53",-4.65,0.7056,,3.28104,0,,,,L
+Trades,SubTotal,,Forex,USD,AUD.USD,,,-183563.46,,,128202.9983368,-3.664614318,,,,
+Trades,Total,,Forex,USD,,,,,,,128202.9983368,-3.664614318,,,, 
+Trades,Total,,Forex,AUD,,,,,,,183419.881036705,-3.664614318,,,, 
+Transaction Fees,Header,Asset Category,Currency,Account,Date/Time,Symbol,Description,Quantity,Trade Price,Amount,Code
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-22, 11:53:26",GOLD,GLOBAL X PHYSICAL GOLD STRU,259,54.72,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-22, 11:53:26",GOLD,GLOBAL X PHYSICAL GOLD STRU,"3,000",54.72,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-22, 11:53:26",REIT,VAN FISE IN PR (AUD HE) ETF,182,16.75,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-22, 11:53:26",SEMI,GLOBAL X SEMICONDUCTOR ETF,"2,248",46.63,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-22, 11:53:45",VAE,VANGUARD FTSE ASIA EX-JAP SH,90,118.62,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-22, 11:53:46",VMIN,VANGUARD GLB MIN VOL ACT ETF,49,64.33,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-22, 11:53:51",VLUE,VANECK MSCI INTERNATIONAL VA,"4,412",43.33,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-22, 11:53:51",VLUE,VANECK MSCI INTERNATIONAL VA,"5,000",43.33,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-24, 09:59:53",BBUS,BE US EQ STR BE CU HE CO ETF,531,24.25,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-24, 09:59:53",BEAR,BETASHARES AUS EQ BEAR CMPLX,"21,590",7.38,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-06-24, 09:59:53",HBRD,BETASHARES AU CREDIT INCOME,"2,034",10.1,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-06, 13:15:17",GOLD,GLOBAL X PHYSICAL GOLD STRU,224,55.03,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-06, 13:17:25",BEAR,BETASHARES AUS EQ BEAR CMPLX,"-19,872",7.35,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-06, 13:17:45",VLUE,VANECK MSCI INTERNATIONAL VA,"4,375",37.15,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-06, 13:18:47",BBUS,BE US EQ STR BE CU HE CO ETF,-531,23.47,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-06, 13:22:16",HBRD,BETASHARES AU CREDIT INCOME,"-1,754",10.06,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 09:59:52",BEAR,BETASHARES AUS EQ BEAR CMPLX,96,7.45,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 09:59:52",GOLD,GLOBAL X PHYSICAL GOLD STRU,25,54.13,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 09:59:52",VLUE,VANECK MSCI INTERNATIONAL VA,-1,36.98,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 09:59:53",GOLD,GLOBAL X PHYSICAL GOLD STRU,125,54.13,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 10:02:19",VLUE,VANECK MSCI INTERNATIONAL VA,-353,36.9,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 10:03:54",VLUE,VANECK MSCI INTERNATIONAL VA,-445,36.9,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 10:03:54",VLUE,VANECK MSCI INTERNATIONAL VA,-353,36.9,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 10:04:19",VLUE,VANECK MSCI INTERNATIONAL VA,-80,36.9,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-08, 10:04:19",VLUE,VANECK MSCI INTERNATIONAL VA,-445,36.9,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-20, 09:59:53",BEAR,BETASHARES AUS EQ BEAR CMPLX,-614,7.37,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-20, 09:59:53",GOLD,GLOBAL X PHYSICAL GOLD STRU,-20,52.29,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-20, 09:59:53",HBRD,BETASHARES AU CREDIT INCOME,497,10.08,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-20, 09:59:53",VLUE,VANECK MSCI INTERNATIONAL VA,253,36.44,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-24, 09:59:57",BEAR,BETASHARES AUS EQ BEAR CMPLX,367,7.43,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-24, 09:59:57",GOLD,GLOBAL X PHYSICAL GOLD STRU,8,53.37,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-24, 09:59:57",HBRD,BETASHARES AU CREDIT INCOME,857,10.1,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-24, 09:59:57",VLUE,VANECK MSCI INTERNATIONAL VA,464,36.6,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-29, 09:59:54",BEAR,BETASHARES AUS EQ BEAR CMPLX,-70,7.24,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-29, 09:59:54",GOLD,GLOBAL X PHYSICAL GOLD STRU,-8,52.78,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-29, 09:59:54",HBRD,BETASHARES AU CREDIT INCOME,-319,10.09,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-29, 09:59:54",VLUE,VANECK MSCI INTERNATIONAL VA,-430,37.35,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-30, 09:59:50",BEAR,BETASHARES AUS EQ BEAR CMPLX,106,7.26,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-30, 09:59:50",GOLD,GLOBAL X PHYSICAL GOLD STRU,-7,53.37,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-30, 09:59:50",HBRD,BETASHARES AU CREDIT INCOME,352,10.1,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-30, 09:59:50",VLUE,VANECK MSCI INTERNATIONAL VA,9,37.27,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-31, 09:59:59",BEAR,BETASHARES AUS EQ BEAR CMPLX,41,7.22,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-31, 09:59:59",HBRD,BETASHARES AU CREDIT INCOME,-159,10.09,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-31, 09:59:59",VLUE,VANECK MSCI INTERNATIONAL VA,21,37.12,0,
+Transaction Fees,Data,Stocks,AUD,DUQ532705,"2026-07-31, 10:00:29",GOLD,GLOBAL X PHYSICAL GOLD STRU,22,53.59,0,
+Transaction Fees,Data,Total,,,,,,,,0,
+Deposits & Withdrawals,Header,Currency,Account,Settle Date,Description,Amount
+Deposits & Withdrawals,Data,AUD,DUQ532705,2026-06-23,Adjustment: Cash Receipt/Disbursement/Transfer,-189334.35
+Deposits & Withdrawals,Data,AUD,DUQ532705,2026-06-23,Adjustment: Cash Receipt/Disbursement/Transfer,250000
+Deposits & Withdrawals,Data,Total,,,,60665.65
+Deposits & Withdrawals,Data,USD,DUQ532705,2026-06-23,Adjustment: Cash Receipt/Disbursement/Transfer,-2.06
+Deposits & Withdrawals,Data,Total,,,,-2.06
+Deposits & Withdrawals,Data,Total in AUD,,,,-2.978348
+Deposits & Withdrawals,Data,Total Deposits & Withdrawals in AUD,,,,60662.671652
+Dividends,Header,Currency,Account,Date,Description,Amount
+Dividends,Data,AUD,DUQ532705,2026-07-01,HBRD (AU00000HBRD9) Cash Dividend AUD 0.050461 PAYMENT IN LIEU OF DIVIDEND (Mixed Income),102.64
+Dividends,Data,AUD,DUQ532705,2026-08-03,HBRD (AU00000HBRD9) Cash Dividend AUD 0.047582 PAYMENT IN LIEU OF DIVIDEND (Ordinary Dividend),71.75
+Dividends,Data,Total,,,,174.39
+Interest,Header,Currency,Account,Date,Description,Amount
+Interest,Data,AUD,DUQ532705,2026-07-06,AUD Credit Interest for Jun-2026,2519.64
+Interest,Data,AUD,DUQ532705,2026-07-06,AUD Net Short Stock Interest for Jun-2026,-4.62
+Interest,Data,AUD,DUQ532705,2026-08-05,AUD Credit Interest for Jul-2026,133.53
+Interest,Data,Total,,,,2648.55
+Interest,Data,USD,DUQ532705,2026-07-06,USD Debit Interest for Jun-2026,-10.2
+Interest,Data,USD,DUQ532705,2026-08-05,USD Debit Interest for Jul-2026,-10.7
+Interest,Data,USD,DUQ532705,2026-08-05,USD Net Short Stock Interest for Jul-2026,-3.29
+Interest,Data,Total,,,,-24.19
+Interest,Data,Total in AUD,,,,-34.48735
+Interest,Data,Total Interest in AUD,,,,2614.06265
+Interest Accruals,Header,Currency,Field Name,Field Value
+Interest Accruals,Data,Base Currency Summary,Starting Accrual Balance,1865.24
+Interest Accruals,Data,Base Currency Summary,Interest Accrued,755.351422
+Interest Accruals,Data,Base Currency Summary,Accrual Reversal,-2614.06265
+Interest Accruals,Data,Base Currency Summary,FX Translation,0.416148
+Interest Accruals,Data,Base Currency Summary,Ending Accrual Balance,6.94492
+Interest Accruals,Data,AUD,Starting Accrual Balance,1865.24
+Interest Accruals,Data,AUD,Interest Accrued,794.9
+Interest Accruals,Data,AUD,Accrual Reversal,-2648.55
+Interest Accruals,Data,AUD,Ending Accrual Balance,11.59
+Interest Accruals,Data,USD,Starting Accrual Balance,0
+Interest Accruals,Data,USD,Interest Accrued,-27.49
+Interest Accruals,Data,USD,Accrual Reversal,24.19
+Interest Accruals,Data,USD,Ending Accrual Balance,-3.3
+Interest Accruals,Data,USD,Ending Accrual Balance in AUD,-4.64508
+Borrow Fee Details,Header,Currency,Account,Value Date,Symbol,Quantity,Price,Value,Fee Rate (%),Borrow Fee,Code
+Borrow Fee Details,Data,AUD,DUQ532705,2026-06-23,GOLD,3259,57.54,187522.86,5.645176,-29,Po
+Borrow Fee Details,Data,AUD,DUQ532705,2026-06-23,REIT,182,17.54,3192.28,0.645176,-0.06,Po
+Borrow Fee Details,Data,AUD,DUQ532705,2026-06-23,SEMI,2248,49.23,110669.04,0.645176,-1.96,Po
+Borrow Fee Details,Data,AUD,DUQ532705,2026-06-23,VAE,90,124.6,11214,0.645176,-0.2,Po
+Borrow Fee Details,Data,AUD,DUQ532705,2026-06-23,VLUE,9412,45.62,429375.44,0.645176,-7.59,Po
+Borrow Fee Details,Data,AUD,DUQ532705,2026-06-23,VMIN,49,67.5,3307.5,0.645176,-0.06,Po
+Borrow Fee Details,Data,Total,,,,,,,,-38.87,
+Borrow Fee Details,Data,USD,DUQ532705,2026-07-21,SOXX,53,535,28355,0.7724,-0.61,Po
+Borrow Fee Details,Data,USD,DUQ532705,2026-07-22,SOXX,53,564,29892,0.57,-0.47,Po
+Borrow Fee Details,Data,USD,DUQ532705,2026-07-23,SOXX,53,567,30051,0.5339,-0.45,Po
+Borrow Fee Details,Data,USD,DUQ532705,2026-07-24,SOXX,53,563,29839,0.5064,-0.42,Po
+Borrow Fee Details,Data,USD,DUQ532705,2026-07-25,SOXX,53,563,29839,0.5064,-0.42,Po
+Borrow Fee Details,Data,USD,DUQ532705,2026-07-26,SOXX,53,563,29839,0.5064,-0.42,Po
+Borrow Fee Details,Data,USD,DUQ532705,2026-07-27,SOXX,53,538,28514,0.6367,-0.5,Po
+Borrow Fee Details,Data,Total,,,,,,,,-3.29,
+Borrow Fee Details,Data,Total in AUD,,,,,,,,-4.710605,
+Financial Instrument Information,Header,Asset Category,Symbol,Description,Conid,Security ID,Underlying,Listing Exch,Multiplier,Type,Code
+Financial Instrument Information,Data,Stocks,BBUS,BE US EQ STR BE CU HE CO ETF,837866648,AU00000BBUS4,BBUS,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,BEAR,BETASHARES AUS EQ BEAR CMPLX,110321640,AU00000BEAR2,BEAR,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,GOLD,GLOBAL X PHYSICAL GOLD STRU,45127612,AU00000GOLD7,GOLD,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,HBRD,BETASHARES AU CREDIT INCOME,296448048,AU00000HBRD9,HBRD,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,PDBC,INVESCO OPTIMUM YIELD DIVERS,320227565,US46090F1003,PDBC,NASDAQ,1,ETF,
+Financial Instrument Information,Data,Stocks,REIT,VAN FISE IN PR (AUD HE) ETF,359495664,AU0000041212,REIT,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,SEMI,GLOBAL X SEMICONDUCTOR ETF,511763290,AU0000169120,SEMI,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,SMH,VANECK SEMICONDUCTOR ETF,229725622,US92189F6768,SMH,NASDAQ,1,ETF,
+Financial Instrument Information,Data,Stocks,SOXL,DIREX DAIL SEMI BU 3X ET-USD,73340487,US25459W4583,SOXL,ARCA,1,ETF,
+Financial Instrument Information,Data,Stocks,SOXX,ISHARES SEMICONDUCTOR ETF,12658194,US4642875235,SOXX,NASDAQ,1,ETF,
+Financial Instrument Information,Data,Stocks,VAE,VANGUARD FTSE ASIA EX-JAP SH,215014256,AU000000VAE1,VAE,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,VEA,VANGUARD FTSE DEVELOPED ETF,45444192,US9219438580,VEA,ARCA,1,ETF,
+Financial Instrument Information,Data,Stocks,VLUE,VANECK MSCI INTERNATIONAL VA,475830076,AU0000137796,VLUE,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,VMIN,VANGUARD GLB MIN VOL ACT ETF,314359331,AU0000005894,VMIN,ASX,1,ETF,
