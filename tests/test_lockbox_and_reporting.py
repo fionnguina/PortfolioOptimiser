@@ -897,3 +897,71 @@ def test_au_tickers_are_unaffected_by_the_local_path():
 
 def test_engine_passes_the_historical_fx_series():
     assert 'fx_hist=globals().get("fx_usdaud")' in _SRC
+
+
+# ------------------------------------------------- IBKR activity statement
+
+_STMT = '''Statement,Header,Field Name,Field Value
+Statement,Data,Period,"June 22, 2026"
+Trades,Header,DataDiscriminator,Asset Category,Currency,Account,Symbol,Date/Time,Quantity,T. Price,C. Price,Proceeds,Comm/Fee,Basis,Realized P/L,MTM P/L,Code
+Trades,Data,Order,Stocks,AUD,DUQ1,GOLD,"2026-06-22, 11:53:26","3,259",54.72,54.8,-178332.48,-156.9325824,178489.4125824,0,260.72,O
+Trades,SubTotal,,Stocks,AUD,GOLD,,,3259,,,-178332.48,-156.9325824,178489.4125824,0,260.72,
+Trades,Data,Order,Stocks,USD,DUQ1,SMH,"2026-06-22, 23:30:09",50,670.42,668.91,-33521,-1.00015,33522.00015,0,-75.5,O
+Trades,Header,DataDiscriminator,Asset Category,Currency,Account,Symbol,Date/Time,Quantity,T. Price,,Proceeds,Comm in AUD,,,,Code
+Trades,Data,Order,Forex,USD,DUQ1,AUD.USD,"2026-06-22, 23:31:09","-102,177.8",0.70044,,71569.418232,-2.041016669,,,,L
+Financial Instrument Information,Header,Asset Category,Symbol,Description,Conid,Security ID,Underlying,Listing Exch,Multiplier,Type,Code
+Financial Instrument Information,Data,Stocks,GOLD,GLOBAL X,45127612,AU00000GOLD7,GOLD,ASX,1,ETF,
+Financial Instrument Information,Data,Stocks,SMH,VANECK,229725622,US92189F6768,SMH,NASDAQ,1,ETF,
+Base Currency Exchange Rate,Header,Currency,Rate
+Base Currency Exchange Rate,Data,USD,1.428400
+'''
+
+
+def _stmt(tmp_path):
+    p = tmp_path / "stmt.csv"
+    p.write_text(_STMT, encoding="utf-8")
+    return p
+
+
+def test_statement_parses_trades_and_maps_asx_symbols(tmp_path):
+    import ibkr_statement as S
+    t = S.parse_trades(_stmt(tmp_path))
+    assert list(t["Security"]) == ["GOLD.AX", "SMH"], "ASX listings need the .AX suffix"
+    assert t.iloc[0]["Units"] == 3259, "thousands separators inside quotes must survive"
+    assert str(t.iloc[0]["DateTime"]) == "2026-06-22 11:53:26"
+
+
+def test_statement_excludes_forex_and_subtotal_rows(tmp_path):
+    """SubTotal repeats the same columns (double-counting) and a forex
+    conversion is not the acquisition of a CGT asset."""
+    import ibkr_statement as S
+    t = S.parse_trades(_stmt(tmp_path))
+    assert len(t) == 2, f"expected 2 stock orders, got {len(t)}"
+    assert "AUD.USD" not in set(t["RawSymbol"])
+
+
+def test_statement_cost_base_includes_commission(tmp_path):
+    """Basis already carries the commission, which is what AU CGT requires."""
+    import ibkr_statement as S
+    t = S.parse_trades(_stmt(tmp_path))
+    gold = t[t["Security"] == "GOLD.AX"].iloc[0]
+    assert gold["BasisLocal"] == pytest.approx(178332.48 + 156.9325824)
+
+
+def test_statement_lots_convert_usd_at_the_statement_rate(tmp_path):
+    import ibkr_statement as S
+    p = _stmt(tmp_path)
+    lots = S.build_lots(S.parse_trades(p), S.fx_to_base(p))
+    smh = lots[lots["Security"] == "SMH"].iloc[0]
+    assert smh["CostBaseAUD"] == pytest.approx(33522.00015 / 50 * 1.4284)
+    gold = lots[lots["Security"] == "GOLD.AX"].iloc[0]
+    assert gold["CostBaseAUD"] == pytest.approx(178489.4125824 / 3259)
+
+
+def test_statement_lots_carry_real_timestamps_not_nominal_dates(tmp_path):
+    """The whole point: lots_seed.json's placeholder 2026-07-08 dates are what
+    broke the LT-discount clock and the NAV reconstruction."""
+    import ibkr_statement as S
+    p = _stmt(tmp_path)
+    lots = S.build_lots(S.parse_trades(p), S.fx_to_base(p))
+    assert all("T" in a and a.startswith("2026-06-22") for a in lots["AcqDate"])
