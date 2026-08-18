@@ -1069,3 +1069,27 @@ def test_monthly_gate_compares_the_common_window_only():
     block = src[i:i + 900]
     assert "common = recon.index.intersection(broker.index)" in block
     assert "r_c, b_c = recon.reindex(common), broker.reindex(common)" in block
+
+
+def test_deck_reuses_the_engines_validated_nav_series():
+    """The deck recomputed the NAV reconstruction with neither fx_usdaud nor
+    statement_path, so it got the mixed-currency seed-based path, failed
+    validation at 4.97% and drew broker-only — while the engine's own call
+    passed at 0.67%. One question must not have two answers."""
+    src = (Path(__file__).resolve().parent.parent / "ppt_export.py").read_text(encoding="utf-8")
+    assert 'globals().get("LIVE_NAV_SERIES")' in src, "deck must reuse, not recompute"
+    # If it ever does fall back, it must at least pass the same inputs.
+    i = src.index('_actual_nav_series_local = globals().get("LIVE_NAV_SERIES")')
+    block = src[i:i + 1200]
+    assert "fx_usdaud=globals().get(" in block
+    assert "statement_path=APP_DIR" in block
+    assert 'globals()["LIVE_NAV_SERIES"] = _live_nav' in _SRC, "engine must publish it"
+
+
+def test_missing_price_warning_is_scoped_to_the_performance_window():
+    """SEMI.AX was bought and sold pre-reset, so it is trimmed away and cannot
+    affect NAV — warning about it is noise. A ticker held INSIDE the window and
+    missing from the panel genuinely understates NAV and must still warn."""
+    src = (Path(__file__).resolve().parent.parent / "nav.py").read_text(encoding="utf-8")
+    assert "held_after_cut" in src
+    assert "held in the performance window but" in src

@@ -396,7 +396,17 @@ def compute_nav_from_statement(prices, statement_path, fx_usdaud=None) -> pd.Ser
     t["Day"] = pd.to_datetime(t["DateTime"]).dt.normalize()
     for tkr, g in t.groupby("Security"):
         if tkr not in px.columns:
-            print(f"[nav][WARN] {tkr} traded but absent from the price panel — skipped")
+            # Only worth flagging if the position actually exists inside the
+            # performance window. SEMI.AX was bought and sold pre-reset
+            # (2026-06-22/23), so it is trimmed away regardless and warning
+            # about it is noise — while a ticker held INSIDE the window and
+            # missing from the panel would genuinely understate NAV.
+            held_after_cut = (cut is None
+                              or float(g[g["Day"] >= cut]["Units"].abs().sum()) > 0
+                              or float(g[g["Day"] < cut]["Units"].sum()) != 0.0)
+            if held_after_cut:
+                print(f"[nav][WARN] {tkr} held in the performance window but "
+                      f"absent from the price panel — NAV understated")
             continue
         units = g.groupby("Day")["Units"].sum().reindex(dates, fill_value=0.0).cumsum()
         p = pd.to_numeric(px[tkr].reindex(dates), errors="coerce").ffill().fillna(0.0)

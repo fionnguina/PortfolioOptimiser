@@ -232,6 +232,7 @@ from ppt_utils import (
 import ppt_export as _ppt_export
 _PPT_EXPORT_INJECT = (
     "AU_BENCH_TICKER", "AU_BENCH_LABEL", "AU_BENCH_FALLBACK", "rf_annual", "rf_series",
+    "LIVE_NAV_SERIES", "fx_usdaud",
     "ACTIVE_CGT_PROFILE", "ANNUAL_TRADING_DAYS", "APP_DIR", "BROKER_CONFIG",
     "CGT_CONFIG", "ENSEMBLE_SLOT_NAMES", "EXPORT_DIR", "FUND_FEES_ACTIVE",
     "FY_TAX_LEDGER_DF", "LIVE_TLH_EVENTS", "MANAGEMENT_FEE_PCT_ANN",
@@ -7976,6 +7977,12 @@ if USE_XLWINGS:
                     print(f"[drift] actual-NAV series failed ({_e_nav_src}); "
                           f"falling back to live_nav_history")
                     _live_nav = pd.Series(dtype=float)
+                # Publish for the deck. It used to recompute this itself with
+                # neither fx_usdaud nor statement_path, so it got the
+                # mixed-currency seed-based path and failed validation at 4.97%
+                # while the engine's own call passed at 0.67% — two answers to
+                # one question, and the chart was showing the worse one.
+                globals()["LIVE_NAV_SERIES"] = _live_nav
                 # Read the label AFTER the call that sets it — the
                 # reconstruction is dropped entirely when it fails validation,
                 # and the old hardcoded "fills recon + broker NetLiq" then lied.

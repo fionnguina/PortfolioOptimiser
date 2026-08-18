@@ -533,15 +533,25 @@ def export_to_ppt(results, trades, charts=None):
         # purpose and hid the fact that the held lots (BEAR / BBUS / HBRD)
         # were actually defensive while the chart pretended they tracked
         # NASDAQ. Now reconstructs real NAV; line stubs in at LIVE_START.
-        _actual_nav_series_local = pd.Series(dtype=float)
-        try:
-            _actual_nav_series_local = compute_actual_nav_series_spliced(
-                prices,
-                APP_DIR / "ibkr_fills_log.jsonl",
-                APP_DIR / "lots_seed.json",
-            )
-        except Exception as _e_nav:
-            print(f"[chart] Actual NAV computation failed: {_e_nav}")
+        # Reuse the series the engine already built and validated. Computing
+        # it again here is not just wasteful — this call passed neither
+        # fx_usdaud nor statement_path, so it silently got the mixed-currency
+        # seed-based path, failed validation at 4.97% and fell back to
+        # broker-only while the engine's own call passed at 0.67%. The chart
+        # was drawing the worse of two answers to the same question.
+        _actual_nav_series_local = globals().get("LIVE_NAV_SERIES")
+        if not isinstance(_actual_nav_series_local, pd.Series) or _actual_nav_series_local.empty:
+            _actual_nav_series_local = pd.Series(dtype=float)
+            try:
+                _actual_nav_series_local = compute_actual_nav_series_spliced(
+                    prices,
+                    APP_DIR / "ibkr_fills_log.jsonl",
+                    APP_DIR / "lots_seed.json",
+                    fx_usdaud=globals().get("fx_usdaud"),
+                    statement_path=APP_DIR / "ibkr_activity_statement.csv",
+                )
+            except Exception as _e_nav:
+                print(f"[chart] Actual NAV computation failed: {_e_nav}")
         # Stash for the table section below so we don't compute twice.
         actual_nav_for_table = _actual_nav_series_local
         _nav_in_window = _actual_nav_series_local.reindex(pval.index)
