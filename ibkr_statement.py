@@ -1,4 +1,11 @@
-"""Parse an IBKR Activity Statement CSV into trades, lots and FX.
+"""Parse an IBKR account statement into trades, lots and FX.
+
+TWO WIRE FORMATS, ONE SET OF RULES: the Client Portal's Activity Statement CSV
+(documented below) and the Flex Web Service's XML (documented at the bottom of
+this file). `_sections` dispatches on format and the XML is translated into the
+CSV's column vocabulary, so every consumer — and every trap those consumers
+encode — is written exactly once. The Flex feed exists because it refreshes
+without a human; the CSV remains the archival record and the fallback.
 
 WHY THIS EXISTS: the TWS API serves no execution history — verified 2026-08-17,
 reqExecutions returns 0 at 7/30/90-day filters and reqCompletedOrders returns 0,
@@ -36,6 +43,22 @@ import pandas as pd
 
 
 def _sections(path):
+    """Yield (section, rowtype, {column: value}) for EITHER statement format.
+
+    The Flex Web Service delivers XML, the Client Portal download delivers the
+    multi-section CSV above. Rather than fork every consumer, the XML is
+    translated INTO this CSV row vocabulary (see `_flex_sections`) — so
+    parse_trades, cash_events, starting_cash and external_flows are written
+    once and the hard-won traps they encode (the forex two-leg split, the
+    SubTotal double-count, the borrow-fee exclusion) hold for both sources.
+    """
+    if is_flex_xml(path):
+        yield from _flex_sections(path)
+    else:
+        yield from _csv_sections(path)
+
+
+def _csv_sections(path):
     """Yield (section, rowtype, {column: value}) resolving per-section headers."""
     headers: dict[str, list] = {}
     with open(path, encoding="utf-8-sig", newline="") as fp:
@@ -373,3 +396,278 @@ def build_lots(trades: pd.DataFrame, fx: dict | None = None) -> pd.DataFrame:
     lots = lots[lots["FxAtAcq"] > 0].copy()
     lots["AcqDate"] = lots["AcqDate"].apply(lambda d: pd.Timestamp(d).isoformat())
     return lots[["Security", "AcqDate", "Units", "CostBaseAUD"]].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# IBKR Flex Web Service (XML) support
+#
+# Same account, same trades, different wire format — and the Flex feed is the
+# only one that can refresh unattended (the Client Portal CSV needs a human to
+# click through Statements -> Activity -> date range -> export, which is why
+# `ibkr_activity_statement.csv` silently aged out the moment nobody clicked).
+#
+# Everything below is a TRANSLATION LAYER, not a second parser: it re-labels
+# Flex attributes into the Activity-Statement column vocabulary and hands them
+# to the same consumers unchanged. Field differences that bite:
+#   * assetCategory is "STK"/"CASH", not "Stocks"/"Forex".
+#   * `cost` is the Activity Statement's `Basis` — commission included, signed
+#     with quantity, which is what open_lots' `basis / units` relies on.
+#   * dates default to yyyyMMdd and dateTime to "yyyyMMdd;HHmmss", but the
+#     format is settable per query, so parse defensively and emit ISO.
+#   * FX commission carries its own `ibCommissionCurrency` — strictly better
+#     than the CSV, whose column is hardcoded "Comm in AUD".
+# ---------------------------------------------------------------------------
+
+FLEX_XML_NAME = "ibkr_flex_statement.xml"
+
+
+def is_flex_xml(path) -> bool:
+    """True if `path` is a Flex Web Service XML response rather than the CSV."""
+    try:
+        p = Path(path)
+        if p.suffix.lower() != ".xml":
+            return False
+        with open(p, "rb") as fp:
+            return b"FlexQueryResponse" in fp.read(4096)
+    except Exception:
+        return False
+
+
+def _flex_dt(v, date_only: bool = False):
+    """Normalise a Flex date/dateTime to ISO, or None.
+
+    Flex writes "20260703;103012" by default but the query can be configured
+    for "yyyy-MM-dd" and a space or comma separator, so this must not assume.
+    Downstream does `.replace(",", " ")` before pd.to_datetime, and ISO
+    survives that untouched.
+    """
+    s = str(v or "").strip()
+    if not s:
+        return None
+    s = s.replace(";", " ").replace(",", " ")
+    parts = s.split()
+    d = parts[0].replace("/", "-")
+    t = parts[1] if len(parts) > 1 else ""
+    if len(d) == 8 and d.isdigit():                      # 20260703
+        d = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    if date_only or not t:
+        return d
+    if len(t) == 6 and t.isdigit():                      # 103012
+        t = f"{t[:2]}:{t[2:4]}:{t[4:]}"
+    return f"{d} {t}"
+
+
+def _flex_trades(root):
+    """The order-level rows — the CSV's `DataDiscriminator == "Order"`.
+
+    THE TAG IS THE LEVEL. Flex does not distinguish level of detail by an
+    attribute on a common element: order-level rows come as `<Order>` and
+    execution-level rows as `<Trade>`. A query with both levels ticked emits
+    both, and reading only `<Trade>` then silently reports EXECUTIONS — which
+    is not double-counting so much as a different unit. Against this account
+    that read 75 stock rows where the statement has 60 orders, because a
+    partially-filled order arrives as several executions.
+
+    Orders are the right unit: they are what the CSV records, what the lot book
+    is built from, and what carries one commission rather than a per-fill
+    allocation of it. Executions remain the fallback for a query configured
+    with only that level.
+    """
+    orders = [n for n in root.iter("Order")
+              if str(n.attrib.get("levelOfDetail", "ORDER")).upper() == "ORDER"
+              and n.attrib.get("assetCategory")]
+    if orders:
+        return orders
+    nodes = list(root.iter("Trade"))
+    if not nodes:
+        return []
+    levels = {str(n.attrib.get("levelOfDetail", "")).upper() for n in nodes}
+    for want in ("ORDER", "EXECUTION"):
+        if want in levels:
+            return [n for n in nodes
+                    if str(n.attrib.get("levelOfDetail", "")).upper() == want]
+    return nodes
+
+
+def _flex_comm(a):
+    """Commission the way the CSV states it: brokerage AND tax, one figure.
+
+    Flex splits what the Activity Statement's `Comm/Fee` column combines —
+    `ibCommission` is brokerage, `taxes` is the GST on it (every ASX fill here
+    carries one). Mapping `Comm/Fee` to `ibCommission` alone left the cash
+    reconstruction short by exactly the GST total, 120.83 AUD across 60 orders,
+    while cost bases stayed right because Flex's `cost` already includes both
+    (verified: tradeMoney + ibCommission + taxes == cost, to the cent).
+    """
+    c, t = _num(a.get("ibCommission")), _num(a.get("taxes"))
+    if c is None and t is None:
+        return None
+    return (c or 0.0) + (t or 0.0)
+
+
+def _flex_sections(path):
+    """Yield Flex XML as (section, "Data", {CSV column: value}) rows."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(path).getroot()
+
+    # --- statement period ---------------------------------------------------
+    for st in root.iter("FlexStatement"):
+        a, b = st.attrib.get("fromDate"), st.attrib.get("toDate")
+        if a and b:
+            yield "Statement", "Data", {
+                "Field Name": "Period",
+                "Field Value": f"{_flex_dt(a, True)} - {_flex_dt(b, True)}",
+            }
+        break
+
+    trades = _flex_trades(root)
+
+    # --- listing exchanges --------------------------------------------------
+    # SecuritiesInfo is an optional Flex section; every Trade node carries
+    # listingExchange anyway, so derive it and the user needn't tick an extra
+    # box to get ASX symbols mapped onto the engine's .AX convention.
+    seen = {}
+    for n in root.iter("SecurityInfo"):
+        s = str(n.attrib.get("symbol", "")).strip().upper()
+        if s:
+            seen[s] = str(n.attrib.get("listingExchange", "")).strip().upper()
+    for n in trades:
+        s = str(n.attrib.get("symbol", "")).strip().upper()
+        if s and s not in seen:
+            seen[s] = str(n.attrib.get("listingExchange", "")).strip().upper()
+    for s, ex in seen.items():
+        yield "Financial Instrument Information", "Data", {
+            "Symbol": s, "Listing Exch": ex}
+
+    # --- base-currency rates ------------------------------------------------
+    # The CSV's Base Currency Exchange Rate section lists FOREIGN currencies
+    # only — the base's own rate of 1.0 is implied, never printed. Trades carry
+    # fxRateToBase for every currency including the base, so filter it out or
+    # the two formats disagree on a row that means nothing either way.
+    base = next((str(n.attrib.get("currency", "")).strip().upper()
+                 for n in root.iter("AccountInformation")
+                 if n.attrib.get("currency")), None)
+    rates = {}
+    for n in root.iter("ConversionRate"):
+        c = str(n.attrib.get("fromCurrency", "")).strip().upper()
+        r = _num(n.attrib.get("rate"))
+        if len(c) == 3 and r and c != base:
+            rates[c] = r
+    for n in trades:
+        c = str(n.attrib.get("currency", "")).strip().upper()
+        r = _num(n.attrib.get("fxRateToBase"))
+        if len(c) == 3 and r and c not in rates and c != base and r != 1.0:
+            rates[c] = r
+    for c, r in rates.items():
+        yield "Base Currency Exchange Rate", "Data", {"Currency": c, "Rate": r}
+
+    # --- trades -------------------------------------------------------------
+    for n in trades:
+        a = n.attrib
+        cat = str(a.get("assetCategory", "")).strip().upper()
+        when = _flex_dt(a.get("dateTime") or a.get("tradeDate"))
+        sym = str(a.get("symbol", "")).strip().upper()
+        ccy = str(a.get("currency", "")).strip().upper()
+        if not when or not sym:
+            continue
+        if cat == "CASH":
+            # Symbol is a pair (AUD.USD): quantity is the BASE currency sold,
+            # proceeds the QUOTE currency received. Both legs must be booked or
+            # the balance moves in one currency only.
+            comm_ccy = str(a.get("ibCommissionCurrency", "")).strip().upper()
+            row = {
+                "DataDiscriminator": "Order", "Asset Category": "Forex",
+                "Currency": ccy, "Symbol": sym, "Date/Time": when,
+                "Quantity": a.get("quantity"), "T. Price": a.get("tradePrice"),
+                "Proceeds": a.get("proceeds"),
+            }
+            # cash_events books this leg to AUD unconditionally, matching the
+            # CSV's hardcoded "Comm in AUD" column. Only populate it when the
+            # broker agrees, rather than silently crediting the wrong currency.
+            if comm_ccy == "AUD":
+                row["Comm in AUD"] = _flex_comm(a)
+            elif _flex_comm(a):
+                print(f"[flex][WARN] FX commission in {comm_ccy}, not AUD "
+                      f"({sym} {when}) - not booked to cash.")
+            yield "Trades", "Data", row
+        elif cat == "STK":
+            yield "Trades", "Data", {
+                "DataDiscriminator": "Order", "Asset Category": "Stocks",
+                "Currency": ccy, "Symbol": sym, "Date/Time": when,
+                "Quantity": a.get("quantity"), "T. Price": a.get("tradePrice"),
+                "Proceeds": a.get("proceeds"), "Comm/Fee": _flex_comm(a),
+                # Flex `cost` == Activity Statement `Basis`: commission
+                # included (AU ITAA s110-25) and signed with quantity.
+                "Basis": a.get("cost"),
+                "Realized P/L": a.get("fifoPnlRealized"),
+            }
+
+    # --- cash movements -----------------------------------------------------
+    # Borrow fees are deliberately NOT mapped into Interest: as in the CSV they
+    # already sit inside the broker-interest rows, and counting them twice
+    # overstated the drain by exactly their total (-38.87 AUD / -3.29 USD).
+    for n in root.iter("CashTransaction"):
+        a = n.attrib
+        kind = str(a.get("type", "")).strip().lower()
+        ccy = str(a.get("currency", "")).strip().upper()
+        amt = a.get("amount")
+        settle = _flex_dt(a.get("settleDate") or a.get("dateTime"), True)
+        when = _flex_dt(a.get("dateTime") or a.get("settleDate"), True)
+        if "deposit" in kind or "withdrawal" in kind:
+            yield "Deposits & Withdrawals", "Data", {
+                "Settle Date": settle, "Currency": ccy, "Amount": amt}
+        elif "dividend" in kind or "lieu" in kind or "withholding" in kind:
+            yield "Dividends", "Data", {
+                "Date": when, "Currency": ccy, "Amount": amt}
+        elif "interest" in kind:
+            yield "Interest", "Data", {
+                "Date": when, "Currency": ccy, "Amount": amt}
+        else:
+            # "Other Fees", "Commission Adjustments" — the CSV lands these in a
+            # Fees section that cash_events ignores. Mirror that exactly rather
+            # than improve it here: the reconciliation that closes to the cent
+            # was validated against the CSV's behaviour.
+            yield "Fees", "Data", {
+                "Date": when, "Currency": ccy, "Amount": amt}
+
+    # --- opening balances ---------------------------------------------------
+    for n in root.iter("CashReportCurrency"):
+        a = n.attrib
+        yield "Cash Report", "Data", {
+            "Currency Summary": "Starting Cash",
+            "Currency": str(a.get("currency", "")).strip().upper(),
+            "Total": a.get("startingCash"),
+        }
+
+
+def resolve_statement_path(app_dir):
+    """The statement to read: the auto-refreshed Flex XML, else the manual CSV.
+
+    Both are the same account's history from the same broker; the XML is
+    preferred only because it can be refreshed without a human. The CSV stays
+    as the archival record and the fallback, so losing the token or the network
+    degrades to yesterday's behaviour rather than to no statement at all.
+    """
+    app_dir = Path(app_dir)
+    xml = app_dir / FLEX_XML_NAME
+    csv_path = app_dir / "ibkr_activity_statement.csv"
+    if not is_flex_xml(xml):
+        return csv_path
+    if not csv_path.exists():
+        return xml
+    # A Flex query with too short a date range covers LESS than the CSV, which
+    # would silently amputate history — the same class of failure as trimming
+    # before accumulating in compute_nav_from_statement. Say so and fall back
+    # rather than pick the shorter source silently.
+    try:
+        x0 = parse_trades(xml)["DateTime"].min()
+        c0 = parse_trades(csv_path)["DateTime"].min()
+        if pd.notna(x0) and pd.notna(c0) and x0 > c0:
+            print(f"[flex][WARN] Flex XML starts {x0:%Y-%m-%d} but the CSV "
+                  f"starts {c0:%Y-%m-%d} - widen the Flex query date range. "
+                  f"Using the CSV.")
+            return csv_path
+    except Exception as e:
+        print(f"[flex][WARN] could not compare statement coverage ({e}); using XML.")
+    return xml

@@ -333,6 +333,26 @@ def _first_broker_cash(path=None) -> float:
         return 0.0
 
 
+def statement_path_for(app_dir) -> Path:
+    """Which statement file to read under `app_dir`. Never raises.
+
+    Takes app_dir EXPLICITLY rather than defaulting to the module's APP_DIR,
+    and the spliced-NAV entry point still treats statement_path=None as "no
+    statement". Making None mean "go and find one" looked tidier but was a
+    footgun: nav.APP_DIR defaults to Path("."), so a caller that passed its own
+    fills and seed paths — a test, or anything running before the engine syncs
+    APP_DIR — silently picked up whichever real account statement happened to
+    be in the working directory and rebuilt NAV from that instead. Resolution
+    belongs where APP_DIR is actually known.
+    """
+    try:
+        import ibkr_statement as _s
+        return _s.resolve_statement_path(app_dir)
+    except Exception as e:
+        print(f"[nav] statement resolve failed ({type(e).__name__}: {e}); using CSV")
+        return Path(app_dir) / "ibkr_activity_statement.csv"
+
+
 def compute_nav_from_statement(prices, statement_path, fx_usdaud=None) -> pd.Series:
     """Full NAV path rebuilt from an IBKR Activity Statement.
 
@@ -408,7 +428,15 @@ def compute_nav_from_statement(prices, statement_path, fx_usdaud=None) -> pd.Ser
                 print(f"[nav][WARN] {tkr} held in the performance window but "
                       f"absent from the price panel — NAV understated")
             continue
-        units = g.groupby("Day")["Units"].sum().reindex(dates, fill_value=0.0).cumsum()
+        # Same guard as the cash block below, for the same reason: trades
+        # dated before the window are an OPENING POSITION, and reindexing
+        # them onto `dates` drops them. `dates` normally starts at the first
+        # trade so nothing precedes it — but that holds only while the price
+        # panel reaches back that far, and a panel that started later would
+        # silently zero every holding bought before it. Fold, don't drop.
+        opening = float(g.loc[g["Day"] < dates[0], "Units"].sum())
+        units = (g.loc[g["Day"] >= dates[0]].groupby("Day")["Units"].sum()
+                  .reindex(dates, fill_value=0.0).cumsum() + opening)
         p = pd.to_numeric(px[tkr].reindex(dates), errors="coerce").ffill().fillna(0.0)
         if fxs is not None and not str(tkr).endswith(".AX") and not str(tkr).startswith("^"):
             p = p * fxs
@@ -417,8 +445,20 @@ def compute_nav_from_statement(prices, statement_path, fx_usdaud=None) -> pd.Ser
     # --- cash: per-currency running balance, translated daily ---------------
     if events is not None and not events.empty:
         for ccy, g in events.groupby("Currency"):
-            bal = (g.groupby("Date")["Amount"].sum()
-                    .reindex(dates, fill_value=0.0).cumsum() + float(start.get(ccy, 0.0)))
+            # Cash that moved BEFORE the first trade is opening balance, not
+            # noise — `reindex(dates)` drops it, and `start` describes a
+            # different day, so the two together lose it entirely. Harmless
+            # while the statement began mid-life with its opening balance
+            # already stated (the CSV: start 1,000,000 at 2026-06-22, nothing
+            # before it). The Flex feed starts from a genuinely empty account
+            # and carries the funding deposit as an EVENT — 1,000,000 on
+            # 2026-05-30, three weeks before the first trade — so the same
+            # code computed closing cash of -988,327 instead of +11,673.
+            # Fold anything earlier into the opening balance instead.
+            opening = (float(start.get(ccy, 0.0))
+                       + float(g.loc[g["Date"] < dates[0], "Amount"].sum()))
+            bal = (g.loc[g["Date"] >= dates[0]].groupby("Date")["Amount"].sum()
+                    .reindex(dates, fill_value=0.0).cumsum() + opening)
             if ccy != "AUD":
                 if fxs is None:
                     continue

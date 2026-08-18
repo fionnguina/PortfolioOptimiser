@@ -1082,7 +1082,13 @@ def test_deck_reuses_the_engines_validated_nav_series():
     i = src.index('_actual_nav_series_local = globals().get("LIVE_NAV_SERIES")')
     block = src[i:i + 1200]
     assert "fx_usdaud=globals().get(" in block
-    assert "statement_path=APP_DIR" in block
+    # Both call sites must resolve the statement the same way — Flex XML when
+    # the token has refreshed it, else the exported CSV. Asserting the shared
+    # resolver rather than a hardcoded filename is the point: the original bug
+    # was the deck answering the same question differently from the engine.
+    assert "statement_path=_nav_mod.statement_path_for(APP_DIR)" in block
+    assert "statement_path=_nav_mod.statement_path_for(APP_DIR)" in _SRC, \
+        "the engine's own call must use the same resolver"
     assert 'globals()["LIVE_NAV_SERIES"] = _live_nav' in _SRC, "engine must publish it"
 
 

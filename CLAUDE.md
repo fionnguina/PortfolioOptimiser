@@ -45,9 +45,21 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
 - `tlh_pairs.json` — TLH substitutes. Keys must match engine symbols EXACTLY
   (`IVV.AX` not `IVV`); substitutes must be in the sheet to be priced/buyable.
 - `lots_seed.json` + `ibkr_fills_log.jsonl` — lot book truth (rebuilt fresh every run).
+- `ibkr_statement.py` — parses the account statement into trades/lots/FX/cash. **Two
+  wire formats, one set of rules:** the Client Portal CSV and the Flex Web Service XML,
+  which `_sections` dispatches on and translates into the CSV's column vocabulary — so
+  the traps (forex two-leg split, SubTotal double-count, borrow-fee exclusion) are
+  written once. COMPILED INTO THE EXE (nav.py imports it inside a function).
+  `resolve_statement_path()` prefers the auto-refreshed XML, falls back to the CSV, and
+  refuses an XML that covers LESS than the CSV.
 - `portfolio_state.json` — NAV state; drives OOS starting NAV. `regions.json` — FF5 region overrides.
 - **Live-ops (all run from SOURCE — no rebuild):**
   `ibkr_paper_exec.py` (the executor: order build/price/submit, reconcile, deferrals),
+  `ibkr_flex.py` (Flex Web Service client — refreshes the statement before each
+  morning run; `--status` / `--fetch` / `--verify`. Token+query id from env or the
+  gitignored `flex_config.json`; see FLEX_SETUP.md. `--verify` cross-checks the live
+  feed against the known-good CSV and is the acceptance test. Non-fatal everywhere:
+  no token or no network falls back to the CSV),
   `jsonl_logs.py` (rec-log writer — carries the verdict, see below),
   `ops_assertions.py` + `ops_expected.json` (declared intent vs reality + run-ledger
   heartbeat — **`ops_expected.json` is the source of truth**; if reality is right and it
@@ -68,7 +80,7 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
 ## Live pipeline — three scheduled tasks (2026-08-10)
 | when | task | does |
 |---|---|---|
-| 10:20 AEST MON–FRI | `daily_auto.ps1` | engine → verdict → **ASX** execution → reconcile → ops check |
+| 10:20 AEST MON–FRI | `daily_auto.ps1` | **statement refresh** → engine → verdict → **ASX** execution → reconcile → ops check |
 | 18:00 AEST MON–FRI | `evidence_run.ps1` | scale-sensitivity sweep. Places NO orders. |
 | 02:00 local TUE–SAT | `us_session_run.ps1` | **US** legs of the morning's approved plan |
 

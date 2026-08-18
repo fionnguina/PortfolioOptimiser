@@ -8,6 +8,13 @@ PROJECT_NAME = "Portfolio Optimiser"
 
 # Modules we know often appear at runtime even if not imported explicitly
 EXTRA_RUNTIME_DEPS = [
+    # First-party modules imported INSIDE functions rather than at module top.
+    # extract_top_level_imports() cannot see those, so they reach the binary
+    # only via PyInstaller's own bytecode scan — declared here so the
+    # dependency is stated rather than incidental. nav.compute_nav_from_statement
+    # imports this lazily, and without it the statement-based NAV path returns
+    # an empty Series in the frozen build and silently falls back.
+    "ibkr_statement",
     # requests stack
     "requests", "urllib3", "idna", "certifi", "charset_normalizer",
     # date parsing / tz

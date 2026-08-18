@@ -543,12 +543,16 @@ def export_to_ppt(results, trades, charts=None):
         if not isinstance(_actual_nav_series_local, pd.Series) or _actual_nav_series_local.empty:
             _actual_nav_series_local = pd.Series(dtype=float)
             try:
+                # Flex XML if the token has refreshed it, else the manually
+                # exported CSV. Imported here rather than added to the ~55
+                # engine globals this module already has synced by name.
+                import nav as _nav_mod
                 _actual_nav_series_local = compute_actual_nav_series_spliced(
                     prices,
                     APP_DIR / "ibkr_fills_log.jsonl",
                     APP_DIR / "lots_seed.json",
                     fx_usdaud=globals().get("fx_usdaud"),
-                    statement_path=APP_DIR / "ibkr_activity_statement.csv",
+                    statement_path=_nav_mod.statement_path_for(APP_DIR),
                 )
             except Exception as _e_nav:
                 print(f"[chart] Actual NAV computation failed: {_e_nav}")

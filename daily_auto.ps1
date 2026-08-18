@@ -290,6 +290,29 @@ try {
     Write-Log "Could not truncate $LogPath ($($_.Exception.Message)); continuing."
 }
 
+# --- Refresh the IBKR statement BEFORE the engine (2026-08-18) ---
+# The lot book, every CGT cost base and the reconstructed NAV are all derived
+# from the account statement, and the TWS API serves no trade history to check
+# them against (verified 2026-08-17). Until now that statement arrived only when
+# a human exported it from Client Portal, so between exports the engine was
+# reasoning about a portfolio that had already moved on. The Flex Web Service is
+# the same data on a token.
+#
+# Non-fatal by design: on a missing token, an expired one or a network failure
+# the engine falls back to ibkr_activity_statement.csv and the run proceeds
+# exactly as it did before. A stale statement is a worse answer, not no answer.
+# Runs from SOURCE — editing ibkr_flex.py needs no exe rebuild.
+try {
+    $flexPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $flexScript = Join-Path $ScriptDir "ibkr_flex.py"
+    if ((Test-Path $flexPy) -and (Test-Path $flexScript)) {
+        $flexOut = & $flexPy $flexScript --fetch 2>&1 | Select-Object -Last 3
+        Write-Log "Flex statement refresh: $flexOut"
+    }
+} catch {
+    Write-Log "Flex statement refresh failed (non-fatal, CSV fallback): $($_.Exception.Message)"
+}
+
 # --- Reconcile Holdings sheet to broker truth BEFORE the engine (2026-07-23) ---
 # The engine builds the trade plan from the sheet's Units column. Real fills move
 # the BROKER but the sheet goes stale (2026-07-20: 3-day drift → every plan built

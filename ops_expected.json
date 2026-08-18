@@ -92,12 +92,13 @@
     "tlh_pairs.json"
   ],
   "exe": {
-    "_why": "engine_sources are the files COMPILED INTO the binary. ibkr_paper_exec.py is deliberately absent: it runs from source, so editing it must not flag the exe as stale.",
+    "_why": "engine_sources are the files COMPILED INTO the binary. ibkr_paper_exec.py and ibkr_flex.py are deliberately absent: they run from source, so editing them must not flag the exe as stale. ibkr_statement.py IS compiled in (nav.py imports it inside a function, so PyInstaller's bytecode scan picks it up) and was missing from this list until 2026-08-18 — meaning an edit to the statement parser did not mark the exe stale, which is precisely the silent-stale-exe failure this list exists to prevent.",
     "path": "dist/Portfolio Optimiser.exe",
     "engine_sources": [
       "Main.py",
       "Portfolio_Optimiser.py",
       "cgt.py",
+      "ibkr_statement.py",
       "jsonl_logs.py",
       "metrics.py",
       "ensemble.py",

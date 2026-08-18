@@ -7971,7 +7971,9 @@ if USE_XLWINGS:
                         APP_DIR / "ibkr_fills_log.jsonl",
                         APP_DIR / "lots_seed.json",
                         fx_usdaud=globals().get("fx_usdaud"),
-                        statement_path=APP_DIR / "ibkr_activity_statement.csv",
+                        # Flex XML if the token has refreshed it, else the
+                        # manually exported CSV.
+                        statement_path=_nav_mod.statement_path_for(APP_DIR),
                     )
                 except Exception as _e_nav_src:
                     print(f"[drift] actual-NAV series failed ({_e_nav_src}); "

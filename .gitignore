@@ -78,3 +78,14 @@ engine_done.flag
 *.bak-*
 deferred_orders.json
 tax_settlements.json
+
+# IBKR Flex Web Service (2026-08-18). The TOKEN is a bearer credential for the
+# brokerage account — it must never reach a commit. The statement XML is
+# refreshed on every scheduled run, so tracking it would churn the tree and
+# make the build stamp's -dirty marker meaningless again; it is re-fetchable
+# from IBKR at any time, and ibkr_activity_statement.csv remains the archival
+# copy in git.
+flex_config.json
+ibkr_flex_statement.xml
+ibkr_flex_statement.xml.bak
+ibkr_flex_statement.xml.tmp
