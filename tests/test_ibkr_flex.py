@@ -757,3 +757,107 @@ def test_the_lag_is_revertible_by_a_single_constant(tmp_path, monkeypatch):
     lagged = nav.compute_nav_from_statement(px, x)
     assert len(raw) == len(lagged) + 1
     assert lagged.iloc[-1] == pytest.approx(raw.iloc[-2])
+
+
+# --------------------------------------------------------------------------
+# The validation gate must be a test, not a coin flip
+# --------------------------------------------------------------------------
+
+def _nav_env(tmp_path, recon_vals, broker_vals, dates):
+    """A statement whose reconstruction we control, plus a broker log."""
+    import json
+
+    seed = tmp_path / "lots_seed.json"
+    seed.write_text("[]", encoding="utf-8")
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text("", encoding="utf-8")
+    bk = tmp_path / "nav.jsonl"
+    bk.write_text("\n".join(json.dumps({
+        "ts": pd.Timestamp(d).tz_localize("Australia/Sydney").isoformat(),
+        "account": "DUQ1", "net_liquidation_aud": float(v),
+    }) for d, v in zip(dates, broker_vals)), encoding="utf-8")
+    # The statement file must EXIST — the splice checks for it before calling
+    # compute_nav_from_statement, so without it the patched reconstruction is
+    # never reached and the whole validation block is skipped silently.
+    (tmp_path / "s.xml").write_text(_FLEX, encoding="utf-8")
+    return seed, fills, bk
+
+
+def test_one_monthly_observation_cannot_fail_the_gate(tmp_path, monkeypatch, capsys):
+    """A max over ONE monthly return is not a test. The live account has two
+    months of history, so the resample yielded a single observation (2026-08)
+    and the gate failed on it at 1.48% — on a month whose US session moved
+    -1.7% overnight. It could not tell a broken reconstruction from a volatile
+    month, and would keep firing at random until a year of history exists."""
+    import nav
+
+    dates = pd.bdate_range("2026-07-06", periods=25)
+    # Tracks the broker closely day to day, but the single monthly return
+    # differs by well over the 1% monthly threshold.
+    broker = pd.Series(100000.0 * (1 + pd.Series(range(25), index=dates) * 0.004))
+    recon = broker * 1.0
+    recon.iloc[-1] = broker.iloc[-1] * 1.03
+
+    monkeypatch.setattr(nav, "_load_broker_nav_series", lambda p=None: broker)
+    monkeypatch.setattr(nav, "compute_nav_from_statement",
+                        lambda *a, **k: recon)
+    monkeypatch.setattr(nav, "compute_actual_nav_series",
+                        lambda *a, **k: pd.Series(dtype=float))
+    seed, fills, bk = _nav_env(tmp_path, recon, broker, dates)
+    px = pd.DataFrame({"X": [1.0] * 25}, index=dates)
+
+    out = nav.compute_actual_nav_series_spliced(
+        px, fills, seed, broker_nav_path=bk, statement_path=tmp_path / "s.xml")
+    log = capsys.readouterr().out
+    assert "too few to gate monthly" in log, log
+    assert "FAILED" not in log, "one monthly observation must not fail the gate"
+    assert len(out) >= len(broker), "the reconstruction should still be spliced"
+
+
+def test_a_genuinely_broken_reconstruction_still_fails(tmp_path, monkeypatch, capsys):
+    """The floor must not become a licence. A reconstruction that misses by
+    percent-level margins — the seed-snapshot era ran 11-15% below broker —
+    has to be rejected on daily error even with one month of data."""
+    import nav
+
+    dates = pd.bdate_range("2026-07-06", periods=25)
+    broker = pd.Series(100000.0 * (1 + pd.Series(range(25), index=dates) * 0.004))
+    # Day-to-day moves that bear no relation to the broker's.
+    noise = pd.Series([1.0, 0.95, 1.06, 0.93, 1.05] * 5, index=dates)
+    recon = broker * noise
+
+    monkeypatch.setattr(nav, "_load_broker_nav_series", lambda p=None: broker)
+    monkeypatch.setattr(nav, "compute_nav_from_statement", lambda *a, **k: recon)
+    monkeypatch.setattr(nav, "compute_actual_nav_series",
+                        lambda *a, **k: pd.Series(dtype=float))
+    seed, fills, bk = _nav_env(tmp_path, recon, broker, dates)
+    px = pd.DataFrame({"X": [1.0] * 25}, index=dates)
+
+    nav.compute_actual_nav_series_spliced(
+        px, fills, seed, broker_nav_path=bk, statement_path=tmp_path / "s.xml")
+    log = capsys.readouterr().out
+    assert "FAILED" in log and "median daily" in log, log
+    assert "broker NetLiq only" in nav.LAST_NAV_SOURCE
+
+
+def test_the_monthly_gate_returns_once_there_is_enough_history(tmp_path, monkeypatch, capsys):
+    """With enough months the original gate applies again, unchanged."""
+    import nav
+
+    dates = pd.bdate_range("2026-01-05", periods=180)
+    broker = pd.Series(100000.0 * (1 + pd.Series(range(180), index=dates) * 0.0005))
+    recon = broker.copy()
+    recon.iloc[-1] = broker.iloc[-1] * 1.05          # blows a late month
+
+    monkeypatch.setattr(nav, "_load_broker_nav_series", lambda p=None: broker)
+    monkeypatch.setattr(nav, "compute_nav_from_statement", lambda *a, **k: recon)
+    monkeypatch.setattr(nav, "compute_actual_nav_series",
+                        lambda *a, **k: pd.Series(dtype=float))
+    seed, fills, bk = _nav_env(tmp_path, recon, broker, dates)
+    px = pd.DataFrame({"X": [1.0] * 180}, index=dates)
+
+    nav.compute_actual_nav_series_spliced(
+        px, fills, seed, broker_nav_path=bk, statement_path=tmp_path / "s.xml")
+    log = capsys.readouterr().out
+    assert "worst monthly error" in log, log
+    assert "too few to gate monthly" not in log

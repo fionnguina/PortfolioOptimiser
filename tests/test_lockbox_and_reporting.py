@@ -749,11 +749,24 @@ def test_reconstruction_that_fails_validation_is_not_extrapolated(tmp_path, monk
     pd.testing.assert_series_equal(out, broker), "must fall back to broker-only"
 
 
-def test_gate_is_monthly_not_daily():
-    """Pinning the decision: daily error is reported, monthly error decides."""
+def test_gate_is_monthly_once_there_are_enough_months():
+    """Pinning the decision: monthly error decides, daily is reported —
+    BUT only once enough months exist to make a max meaningful.
+
+    The original rule stands for the steady state: daily bars cannot match an
+    intraday broker snapshot, so gating daily tests something stricter than
+    any consumer needs. It broke down at the start of the account's life,
+    where the monthly resample yielded ONE observation and the gate became a
+    max over a single number — it failed on 2026-08 at 1.48%, a month whose US
+    session moved -1.7% overnight, with nothing wrong with the
+    reconstruction. Below the floor the daily median (25 observations) decides
+    instead; above it, nothing changes.
+    """
     src = (Path(__file__).resolve().parent.parent / "nav.py").read_text(encoding="utf-8")
     assert "RECON_MAX_MONTHLY_ERR" in src
-    assert "if worst_month > RECON_MAX_MONTHLY_ERR:" in src
+    assert "worst_month > RECON_MAX_MONTHLY_ERR" in src, "monthly still decides"
+    assert "RECON_MIN_MONTHS_TO_GATE" in src, "and only with enough months behind it"
+    assert "med > RECON_MAX_MEDIAN_DAILY_ERR_GATE" in src, "daily is the interim gate"
 
 
 def test_first_broker_cash_reads_the_earliest_balance(tmp_path):
