@@ -295,13 +295,23 @@ RECON_MAX_MEDIAN_DAILY_ERR = 0.0025   # reported, not gated — see below
 # returns against a +/-2% threshold, so validating on daily error tests
 # something stricter than anything downstream needs. Daily bars cannot match an
 # intraday snapshot in any case: the broker marks NetLiq at ~10:20 AEST with
-# ASX barely open and US at the previous close, which leaves ~0.65% median
-# daily error no matter how good the reconstruction is (shifting the US leg a
-# day recovers only 0.03% of it, so timing is not even the dominant term).
+# ASX barely open and US at the previous close.
+#
+# That timing IS largely recoverable, contrary to the note that stood here
+# before: lagging only the US leg moved 0.03%, but the book is 53% VLUE.AX and
+# the AU leg needs the same lag, because 10:20 AEST is minutes into the ASX
+# session rather than at its close. Lagging both (RECON_SNAPSHOT_LAG_DAYS)
+# takes median daily error from 0.36% to 0.14%. What remains is genuine
+# intraday drift against a daily bar.
 # At monthly resolution the same series agrees to ~0.5-0.7pp. Gate there, at
 # half the drift threshold, and report the daily figure so the limitation
 # stays visible rather than being quietly assumed away.
 RECON_MAX_MONTHLY_ERR = 0.01
+# Trading days to lag the reconstruction onto the broker snapshot's timing.
+# 1 = value the book at the PREVIOUS close, which is what a 10:20 AEST NetLiq
+# actually reflects on both venues. Set to 0 to get the raw close-of-day-D
+# series back.
+RECON_SNAPSHOT_LAG_DAYS = 1
 # What the last call actually returned, so callers can label it honestly
 # rather than always claiming "fills recon + broker".
 LAST_NAV_SOURCE = "unknown"
@@ -465,6 +475,24 @@ def compute_nav_from_statement(prices, statement_path, fx_usdaud=None) -> pd.Ser
                 bal = bal * fxs
             nav = nav.add(bal, fill_value=0.0)
     nav = nav.dropna()
+    # Put the series on the BROKER's timing convention before anything compares
+    # or splices the two. A daily close values the book at the END of day D;
+    # the broker's snapshot is taken ~10:27 AEST on day D, which is 27 minutes
+    # into the ASX session and hours after the US close of D-1 — so it sees the
+    # PREVIOUS close on both venues. The reconstruction exists to extend the
+    # broker series backwards, so it has to answer the broker's question.
+    #
+    # A previous pass tested lagging only the US leg and measured 0.03%, and
+    # concluded timing was not the dominant term. That held for the leg it
+    # moved: this book is 53% VLUE.AX, so the AU leg dominates, and it needs
+    # the same lag for the same reason. Shifting BOTH takes median daily error
+    # from 0.36% to 0.14% over 25 overlap days (two trading days is markedly
+    # worse, so this is alignment rather than a fitted offset).
+    #
+    # Shift by a TRADING day, not a calendar day: Friday's closes are what
+    # Monday's snapshot observes, and a calendar shift drops that pairing.
+    if RECON_SNAPSHOT_LAG_DAYS:
+        nav = nav.shift(RECON_SNAPSHOT_LAG_DAYS).dropna()
     # NOW trim, after everything has accumulated. Before the cutoff the path
     # reflects an external capital flow (this account was reset on 2026-06-23:
     # -189,334 withdrawn, +250,000 deposited), which reads as a -69%

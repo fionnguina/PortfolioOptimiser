@@ -684,3 +684,76 @@ def test_positions_bought_before_the_price_panel_are_not_zeroed(tmp_path):
     # And the holding is actually in there, not merely equal-and-both-wrong.
     cash = 300000 - 178332.48 - 156.9325824 - 102177.8 - 2.041016669
     assert after.iloc[-1] == pytest.approx(cash + 3259 * 54.72, abs=0.01)
+
+
+# --------------------------------------------------------------------------
+# Reconstruction timing vs the broker snapshot
+# --------------------------------------------------------------------------
+
+def test_reconstruction_is_lagged_onto_the_broker_snapshot_convention(tmp_path):
+    """A daily close values the book at the END of day D. The broker's NetLiq
+    snapshot is taken ~10:27 AEST on day D — minutes into the ASX session and
+    hours after the US close of D-1 — so it sees the PREVIOUS close on both
+    venues. The reconstruction exists to extend that series backwards, so it
+    has to answer the same question or the two are a day out of phase.
+    """
+    import nav
+
+    p = tmp_path / "s.xml"
+    p.write_text(_FLEX.replace("</FlexStatement>", '''
+<CashTransactions>
+  <CashTransaction type="Deposits/Withdrawals" currency="AUD" amount="300000"
+                   dateTime="20260530" settleDate="20260530" />
+</CashTransactions>
+</FlexStatement>'''), encoding="utf-8")
+
+    # A step in the price on the third day makes the phase visible.
+    idx = pd.date_range("2026-06-22", periods=4)
+    px = pd.DataFrame({"GOLD.AX": [50.0, 50.0, 60.0, 60.0]}, index=idx)
+    got = nav.compute_nav_from_statement(px, p)
+
+    cash = 300000 - 178489.4125824 - 102177.8 - 2.041016669
+    # The 50 -> 60 step happens on the 3rd bar, so it must reach the series on
+    # the 4th day, not the 3rd.
+    assert got.loc[idx[2]] == pytest.approx(cash + 3259 * 50.0, abs=0.01), \
+        "day D must carry the close of D-1"
+    assert got.loc[idx[3]] == pytest.approx(cash + 3259 * 60.0, abs=0.01)
+
+
+def test_the_lag_is_a_trading_day_not_a_calendar_day(tmp_path):
+    """Friday's closes are what Monday's snapshot observes. A calendar-day
+    shift lands on Saturday and loses the pairing entirely — which is also why
+    an early measurement of this looked better than it was: it silently
+    dropped every Friday/Monday pair from the comparison."""
+    import nav
+
+    p = tmp_path / "s.xml"
+    p.write_text(_FLEX.replace("</FlexStatement>", '''
+<CashTransactions>
+  <CashTransaction type="Deposits/Withdrawals" currency="AUD" amount="300000"
+                   dateTime="20260530" settleDate="20260530" />
+</CashTransactions>
+</FlexStatement>'''), encoding="utf-8")
+
+    # 2026-06-25/26 are Thu/Fri; 06-29 is the Monday. No weekend bars.
+    idx = pd.DatetimeIndex(["2026-06-24", "2026-06-25", "2026-06-26", "2026-06-29"])
+    px = pd.DataFrame({"GOLD.AX": [50.0, 50.0, 60.0, 70.0]}, index=idx)
+    got = nav.compute_nav_from_statement(px, p)
+    cash = 300000 - 178489.4125824 - 102177.8 - 2.041016669
+    assert pd.Timestamp("2026-06-29") in got.index, "Monday must be valued, not dropped"
+    assert got.loc[pd.Timestamp("2026-06-29")] == pytest.approx(
+        cash + 3259 * 60.0, abs=0.01), "Monday carries FRIDAY's close"
+
+
+def test_the_lag_is_revertible_by_a_single_constant(tmp_path, monkeypatch):
+    import nav
+
+    _, x = _pair(tmp_path)
+    idx = pd.date_range("2026-06-22", periods=4)
+    px = pd.DataFrame({"GOLD.AX": [50.0, 50.0, 60.0, 60.0]}, index=idx)
+    monkeypatch.setattr(nav, "RECON_SNAPSHOT_LAG_DAYS", 0)
+    raw = nav.compute_nav_from_statement(px, x)
+    monkeypatch.setattr(nav, "RECON_SNAPSHOT_LAG_DAYS", 1)
+    lagged = nav.compute_nav_from_statement(px, x)
+    assert len(raw) == len(lagged) + 1
+    assert lagged.iloc[-1] == pytest.approx(raw.iloc[-2])
