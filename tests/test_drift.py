@@ -235,3 +235,71 @@ def test_monthly_nav_drift_inactive_when_start_none(tmp_path, drift):
     df = drift["compute_monthly_nav_drift"](s, pd.Series(dtype=float),
                                             live_start_date=None)
     assert df.empty
+
+
+# --------------------------------------------------------------------------
+# A partial first month is a stub, not a month (2026-08-20)
+# --------------------------------------------------------------------------
+
+def _drift_env(start_nav="2026-06-24"):
+    idx = pd.bdate_range(start_nav, "2026-08-20")
+    nav = pd.Series(250000.0 * (1 + pd.Series(range(len(idx)), index=idx) * 0.0002))
+    # Big enough that even the five-day June stub breaches the 2% gate —
+    # otherwise the "never warned on" test passes for the wrong reason.
+    oos = pd.Series(0.006, index=idx)
+    return nav, oos
+
+
+def test_a_five_day_first_month_is_marked_partial():
+    """2026-06 was five trading days (24th-30th) during which the book was
+    about a third built — 39 of 60 trades executed after the 30th. Comparing
+    that against a fully invested OOS expectation is not tracking error, but it
+    read as -2.10% and breached the gate the moment the NAV reconstruction was
+    extended back far enough to include it."""
+    import drift as D
+
+    nav, oos = _drift_env()
+    df = D.compute_monthly_nav_drift(nav, oos, "2026-06-22")
+    assert df.iloc[0]["Month"] == "2026-06"
+    assert df.iloc[0]["Partial"] is True or bool(df.iloc[0]["Partial"])
+    assert not any(bool(r["Partial"]) for _, r in df.iloc[1:].iterrows()), \
+        "only the first row can be partial — every later baseline is a month-end"
+
+
+def test_a_month_started_on_the_first_is_not_partial():
+    """Coverage, not a month-end test on the baseline. An earlier version
+    asked 'is the baseline a month-end' and called a series starting 1 July
+    partial, which would have suppressed a real warning for a whole month."""
+    import drift as D
+
+    nav, oos = _drift_env()
+    df = D.compute_monthly_nav_drift(nav, oos, "2026-07-01")
+    assert df.iloc[0]["Month"] == "2026-07"
+    assert not bool(df.iloc[0]["Partial"])
+
+
+def test_a_partial_month_is_reported_but_never_warned_on(capsys):
+    """It stays in the table — the number is real and worth seeing — but it
+    cannot raise a [drift][WARN]."""
+    import drift as D
+
+    nav, oos = _drift_env()
+    df = D.compute_monthly_nav_drift(nav, oos, "2026-06-22")
+    assert abs(float(df.iloc[0]["Drift"])) > D.DRIFT_MONTHLY_THRESH, \
+        "fixture must breach the threshold, or this proves nothing"
+    D._print_drift_warnings(pd.DataFrame(), df, -0.01)
+    out = capsys.readouterr().out
+    assert "2026-06" not in out, out
+    assert "2026-07" in out, "full months must still warn"
+
+
+def test_full_months_still_warn_normally():
+    """The guard must not become a licence to miss real drift."""
+    import drift as D
+
+    nav, oos = _drift_env(start_nav="2026-07-01")
+    df = D.compute_monthly_nav_drift(nav, oos, "2026-07-01")
+    breaches = [r for _, r in df.iterrows()
+                if abs(float(r["Drift"])) > D.DRIFT_MONTHLY_THRESH
+                and not bool(r["Partial"])]
+    assert breaches, "a fully-covered month over threshold must still be warnable"

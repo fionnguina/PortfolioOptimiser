@@ -27,6 +27,10 @@ from jsonl_logs import _load_recommendation_log
 # Tuned conservatively for paper-trading discovery. Tighten once live-trading
 # baselines are established (LIVE_TRADING_START_DATE → flip drift v3 active).
 DRIFT_MONTHLY_THRESH       = 0.02   # warn if |monthly drift|       > 2%
+# Fraction of a month the live series must cover before its first month counts
+# as a month at all. Only the FIRST row can fall short — every later baseline
+# is the previous month-end.
+PARTIAL_MONTH_COVERAGE     = 0.80
 DRIFT_CUMULATIVE_THRESH    = 0.05   # warn if |cumulative drift|    > 5%
 DRIFT_DD_ALERT_THRESH      = -0.10  # warn if live MaxDD            < -10%
 DRIFT_SLIPPAGE_BPS_THRESH  = 25.0   # warn if |slippage|            > 25 bps
@@ -231,6 +235,24 @@ def compute_monthly_nav_drift(
             oos_ret = oos_ret_ex = tax_in_month = 0.0
         # Compare like with like: live NetLiq does not book the FY tax charge.
         drift = live_ret - oos_ret_ex
+        # Only the FIRST row can be partial: prev_dt starts at the live series'
+        # own first date (mid-month) and is a month-end for every iteration
+        # after. Mark it, so a stub is not warned on as though it were a month.
+        #
+        # 2026-06 was five trading days (24th-30th) during which the book was
+        # about a third built — 39 of 60 trades executed after the 30th — and
+        # it was compared against a fully-invested OOS expectation. That is not
+        # tracking error, but it read as -2.10% and breached the +/-2% gate the
+        # moment the reconstruction was extended back far enough to include it.
+        # Measure COVERAGE rather than testing the baseline date. Starting on
+        # the 1st is a full month; starting on the 24th is a stub. A simple
+        # "is the baseline a month-end" test called both of them partial.
+        if len(months) == 0:
+            span = len(pd.bdate_range(prev_dt, month_end))
+            whole = len(pd.bdate_range(month_end.to_period("M").start_time, month_end))
+            partial = bool(whole and span < PARTIAL_MONTH_COVERAGE * whole)
+        else:
+            partial = False
         months.append({
             "Month": month_end.strftime("%Y-%m"),
             "Live Return": round(live_ret, 6),
@@ -238,6 +260,7 @@ def compute_monthly_nav_drift(
             "OOS Tax": round(tax_in_month, 6),
             "OOS ex-Tax": round(oos_ret_ex, 6),
             "Drift": round(drift, 6),
+            "Partial": bool(partial),
         })
         prev_nav = float(end_nav)
         prev_dt = month_end
@@ -285,6 +308,10 @@ def _print_drift_warnings(
     # Monthly + cumulative NAV drift
     if nav_drift_df is not None and not nav_drift_df.empty:
         for _, r in nav_drift_df.iterrows():
+            # A partial first month is a stub, not a month — see
+            # compute_monthly_nav_drift. Reported in the table, never warned on.
+            if bool(r.get("Partial", False)):
+                continue
             if abs(float(r["Drift"])) > DRIFT_MONTHLY_THRESH:
                 _tax = float(r.get("OOS Tax", 0.0) or 0.0)
                 _ex = float(r.get("OOS ex-Tax", r["OOS Return"]))
