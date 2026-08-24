@@ -80,3 +80,97 @@ reads backwards to a non-quant.
   reset read as a −69% drawdown.
 - **A recurring warning is a live bug.** This whole session started from one
   `[lots][WARN]` that had been printing for weeks.
+
+---
+
+# Session 2026-08-18 → 08-20 — Flex Web Service + four correctness fixes
+
+Branch `fix/broker-truth-and-reporting-integrity` (renamed from
+`fix/fills-log-gap-and-deferral-race`; PR #1 closed when the old remote branch
+was deleted). 616 tests.
+
+```
+8ee10cb fix: a five-day stub is not a month, and construction is not tracking error
+ef75276 fix: a max over one monthly return is not a validation gate
+dba7951 fix: the NAV reconstruction was a day ahead of the broker it validates against
+d82faa8 feat: the statement refreshes itself — IBKR Flex Web Service
+```
+
+## The statement now refreshes itself
+
+`ibkr_flex.py` (source-run, no rebuild) fetches the Activity Flex report before
+each 10:20 run. `ibkr_statement._sections()` dispatches CSV vs Flex XML and
+translates the XML into the CSV's column vocabulary, so every consumer and
+every trap it encodes is written once. Non-fatal throughout: no token, an
+expired one or no network falls back to `ibkr_activity_statement.csv`.
+
+Setup and the Flex query field list: `FLEX_SETUP.md`.
+**Token expires 2027-07-20** — recorded in the gitignored `flex_config.json`;
+`--status` and every scheduled run warn from 45 days out.
+
+## Each fix uncovered the next — none were visible from the code
+
+1. **`<Order>` vs `<Trade>` is the level of detail**, not an attribute on one
+   element. Reading `<Trade>` reported 75 executions for 60 orders.
+2. **`taxes` is separate from `ibCommission`** where the CSV's `Comm/Fee`
+   combines them. Cash ran short by exactly the GST — 120.83 AUD over 60
+   orders — while cost bases stayed correct, so nothing looked wrong.
+3. **The reconstruction was a day ahead.** A 10:27 AEST NetLiq sees the
+   PREVIOUS close on both venues. `RECON_SNAPSHOT_LAG_DAYS=1` took median daily
+   error 0.36% -> 0.14%. The prior note in nav.py said this was worth only
+   0.03% — true of the US leg it tested; the book is 53% VLUE.AX and the AU leg
+   needed the same lag.
+4. **The validation gate maxed over ONE monthly observation** and failed at
+   1.48% on a volatile month. Below `RECON_MIN_MONTHS_TO_GATE=3` the median
+   daily error decides instead. Series went 24 samples -> 35.
+5. **The restored June head then breached the drift gate** — five trading days
+   with the book a third built (39 of 60 trades came after 30 June).
+   `PARTIAL_MONTH_COVERAGE=0.80` marks a stub `Partial`: reported, never warned
+   on. `LIVE_TRADING_START_DATE` 2026-06-22 -> **2026-07-01**.
+
+## Open
+
+- **Daily interim gate (0.5%) governs until ~November**, when three monthly
+  observations exist and the monthly gate resumes automatically. Set from one
+  account over 25 days; untested across a genuinely volatile stretch.
+- **`LIVE_TRADING_START_DATE` could defensibly be 2026-07-09**, after the
+  07-06/07-08 build-out finished. One line.
+- **A rebuild wipes `dist/`**, taking the timestamped engine logs with it —
+  lost the ability to diff against the prior run on 08-19.
+- **7 `[ibkr-price][WARN]`/run** (IBKR live vs yfinance previous close at
+  10:20). Structural, not a defect, but it is most of the warning count.
+
+## Confirmed in production — 2026-08-21 and 08-24
+
+Both runs on the 8ee10cb binary, both clean:
+
+```
+[nav] reconstruction PASSED validation — median daily error 0.26% / 0.31% vs 0.50%
+[drift] tracker: NAV samples=36 / 37 ... warnings=0
+Warnings in log: 2      Errors in log: 0
+```
+
+The drift table now measures something real — June's stub gone, both months
+`Partial=False`, and July's FY tax settlement netted out correctly (OOS -7.53%
+raw, +6.91% tax, -0.76% ex-tax), which is the convention difference that used
+to breach every July:
+
+| Month | Live | OOS ex-Tax | Drift |
+|---|---|---|---|
+| 2026-07 | -1.52% | -0.76% | -0.76% |
+| 2026-08 | +2.88% | +3.12% | -0.24% |
+
+Cumulative drift -1.00% against a +/-5% threshold. Warning count fell 8 -> 2,
+both structural `[ibkr-price]` (IBKR live quote vs yfinance previous close at
+10:20).
+
+**Watch the reconstruction's median daily error**: 0.26% -> 0.31% across those
+two runs, 8 of 26 days above 50bps. Headroom to the 0.50% interim gate is
+0.19pp. If it drifts toward 0.45%, find out why rather than raising the number.
+
+## Verified live
+
+60/60 trades matching the CSV, every per-security unit and cost base, FX worst
+diff 0.000000, both sources reconciling to the broker's own closing cash
+(AUD 11,672.93). `ibkr_flex.py --verify` re-runs that comparison and is the
+acceptance test — **run it after ANY change to the statement parser.**
