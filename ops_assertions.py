@@ -24,6 +24,7 @@ assertions can be edited without a rebuild.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -215,16 +216,69 @@ def check_required_files(root: Path, names: list) -> list:
     return out
 
 
-def check_exe_freshness(exe_path: Path, code_paths: list) -> list:
-    """Flag engine sources newer than the binary that is actually run.
+def _digest(path) -> str | None:
+    """SHA-256 of a file's bytes, or None if unreadable."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
 
-    The [build] line already reports the exe's sha, but nothing compares it to
+
+def check_exe_freshness(exe_path: Path, code_paths: list) -> list:
+    """Flag engine sources whose CODE differs from what went into the binary.
+
+    The [build] line already reports the exe's sha, but nothing compared it to
     what is on disk — working out whether the exe was stale took a manual diff
     on 2026-08-10.
+
+    Compares CONTENT against dist/build_manifest.json, which build_helper
+    writes with a SHA-256 per compiled source. The original mtime comparison
+    asked "was this file written after the build", which is a different
+    question: git rewrites mtimes on checkout without changing a byte, so
+    merging a branch on 2026-08-24 reported 11 sources stale while the exe's
+    code was identical. A false alarm on the one check that says "do not trust
+    this binary" is worse than no check — it teaches you to skip it.
+
+    Falls back to mtime when no manifest exists, so a binary built before this
+    existed still gets the weaker check rather than none.
     """
     exe = Path(exe_path)
     if not exe.exists():
         return [f"EXE MISSING: {exe_path}"]
+
+    manifest = exe.parent / "build_manifest.json"
+    recorded = None
+    try:
+        if manifest.exists():
+            recorded = (json.loads(manifest.read_text(encoding="utf-8"))
+                        or {}).get("sources") or None
+    except Exception:
+        recorded = None
+
+    if recorded:
+        changed = []
+        for p in code_paths:
+            p = Path(p)
+            if not p.exists():
+                continue
+            was = recorded.get(p.name) or recorded.get(str(p.name))
+            if was is None:
+                # In engine_sources but absent from the manifest: the two lists
+                # have diverged, which is itself worth saying out loud.
+                changed.append(f"{p.name} (not in manifest)")
+            elif _digest(p) != was:
+                changed.append(p.name)
+        if changed:
+            return [f"EXE STALE: {len(changed)} engine source(s) differ from the "
+                    f"binary ({', '.join(sorted(changed)[:6])}"
+                    f"{' ...' if len(changed) > 6 else ''}) — rebuild before "
+                    f"relying on a production run."]
+        return []
+
     exe_mtime = exe.stat().st_mtime
     newer = [Path(p).name for p in code_paths
              if Path(p).exists() and Path(p).stat().st_mtime > exe_mtime]
@@ -232,7 +286,7 @@ def check_exe_freshness(exe_path: Path, code_paths: list) -> list:
         return [f"EXE STALE: {len(newer)} engine source(s) newer than the "
                 f"binary ({', '.join(sorted(newer)[:6])}"
                 f"{' ...' if len(newer) > 6 else ''}) — rebuild before relying "
-                f"on a production run."]
+                f"on a production run (no build manifest; mtime comparison)."]
     return []
 
 

@@ -117,6 +117,57 @@ RUNTIME_STATE = {
 LOG_ARCHIVE_DIRNAME = "logs/engine_runs"
 LOG_ARCHIVE_KEEP = 120
 
+BUILD_MANIFEST_NAME = "build_manifest.json"
+
+
+def source_digest(path) -> str | None:
+    """SHA-256 of one file's bytes, or None if unreadable."""
+    import hashlib
+
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def write_build_manifest(root: Path, sources: list, sha: str, ts: str) -> Path | None:
+    """Record what actually went INTO the binary, by content.
+
+    The staleness check compared source mtimes against the exe's. mtime answers
+    "was this file written after the build", which is not the question — git
+    rewrites mtimes on checkout without changing a byte, so merging a branch on
+    2026-08-24 reported 11 engine sources stale when the exe's code was
+    identical. A false alarm on the one check that says "do not trust this
+    binary" is worse than no check, because it teaches you to skip it.
+
+    Hashes answer the actual question. Written beside the exe so it describes
+    that binary and is replaced whenever the binary is.
+    """
+    import json
+
+    dest = root / "dist"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        digests = {}
+        for rel in sources:
+            d = source_digest(root / rel)
+            if d:
+                digests[str(rel)] = d
+        out = dest / BUILD_MANIFEST_NAME
+        out.write_text(json.dumps(
+            {"git_sha": sha, "build_time": ts, "sources": digests},
+            indent=1, sort_keys=True), encoding="utf-8")
+        print(f"[build] manifest: {len(digests)} engine source hash(es) -> "
+              f"dist/{BUILD_MANIFEST_NAME}")
+        return out
+    except Exception as e:
+        print(f"[build] could not write build manifest ({type(e).__name__}: {e})")
+        return None
+
 
 def _preserve_run_logs(root: Path) -> int:
     """Move dist/run*.log somewhere a rebuild will not delete. Returns count.
@@ -318,6 +369,21 @@ def build():
                 print(f"[build] WARNING: failed to copy {name}: {e}")
         else:
             print(f"[build] skip runtime data {name}: source not found")
+
+    # Record the CONTENT of every compiled source, so the staleness check can
+    # ask "has the code changed" rather than "has a file been touched".
+    # engine_sources lives in ops_expected.json — that file is the declared
+    # intent for the pipeline, and duplicating the list here would let the two
+    # drift apart silently, which is the failure ops_expected exists to catch.
+    try:
+        import json as _json
+        _exp = _json.loads((root / "ops_expected.json").read_text(encoding="utf-8"))
+        _srcs = list((_exp.get("exe") or {}).get("engine_sources") or [])
+    except Exception as e:
+        _srcs = []
+        print(f"[build] could not read engine_sources from ops_expected.json ({e})")
+    if _srcs:
+        write_build_manifest(root, _srcs, sha, ts)
 
     print("\n[OK] Build complete. Check the 'dist' folder for your new .exe.")
 

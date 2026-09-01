@@ -308,3 +308,80 @@ def test_several_missed_days_are_summarised_not_listed_in_full():
         now=datetime(2026, 8, 10, 14, 0))
     assert len(found) == 1 and "MISSED RUN" in found[0]
     assert "earlier)" in found[0], "a week of misses must not print as a wall"
+
+
+# --------------------------------------------------------------------------
+# Staleness by CONTENT, not mtime (2026-09-01)
+# --------------------------------------------------------------------------
+
+def _exe_env(tmp_path, body="print(1)"):
+    (tmp_path / "dist").mkdir(parents=True, exist_ok=True)
+    exe = tmp_path / "dist" / "app.exe"
+    exe.write_text("bin", encoding="utf-8")
+    src = tmp_path / "engine.py"
+    src.write_text(body, encoding="utf-8")
+    return exe, src
+
+
+def _manifest(exe, srcs):
+    import json as _j
+    (exe.parent / "build_manifest.json").write_text(
+        _j.dumps({"sources": {p.name: ops._digest(p) for p in srcs}}),
+        encoding="utf-8")
+
+
+def test_a_touched_but_unchanged_source_is_not_stale(tmp_path):
+    """THE 2026-08-24 false alarm. Merging a branch checked out 35 commits, so
+    git rewrote mtimes on byte-identical files and the check reported 11 stale
+    engine sources while the exe's code was the same. A false alarm on the one
+    check that says 'do not trust this binary' teaches you to skip it."""
+    import os
+    import time
+
+    exe, src = _exe_env(tmp_path)
+    _manifest(exe, [src])
+    time.sleep(0.05)
+    os.utime(src, None)                       # what a checkout does
+    assert ops.check_exe_freshness(exe, [src]) == []
+
+
+def test_changed_content_is_still_caught(tmp_path):
+    """The guard must not become a licence — 2026-09-01's warning was real."""
+    exe, src = _exe_env(tmp_path)
+    _manifest(exe, [src])
+    src.write_text("print(2)", encoding="utf-8")
+    found = ops.check_exe_freshness(exe, [src])
+    assert len(found) == 1 and "EXE STALE" in found[0] and "engine.py" in found[0]
+
+
+def test_a_source_missing_from_the_manifest_is_reported(tmp_path):
+    """engine_sources and the manifest diverging is itself the failure
+    ops_expected.json exists to catch, so say it rather than pass silently."""
+    exe, src = _exe_env(tmp_path)
+    other = tmp_path / "other.py"
+    other.write_text("y", encoding="utf-8")
+    # Non-empty, but missing engine.py — the shape you get when engine_sources
+    # gains a file and nobody rebuilds. An EMPTY manifest is treated as no
+    # manifest and falls back to mtime, which is the right call for it.
+    _manifest(exe, [other])
+    found = ops.check_exe_freshness(exe, [src])
+    assert len(found) == 1 and "not in manifest" in found[0]
+
+
+def test_without_a_manifest_it_falls_back_to_mtime(tmp_path):
+    """A binary built before manifests existed still gets the weaker check
+    rather than none at all."""
+    import os
+    import time
+
+    exe, src = _exe_env(tmp_path)
+    time.sleep(0.05)
+    os.utime(src, None)
+    found = ops.check_exe_freshness(exe, [src])
+    assert len(found) == 1 and "mtime comparison" in found[0]
+
+
+def test_a_missing_exe_still_reports_missing(tmp_path):
+    src = tmp_path / "engine.py"
+    src.write_text("x", encoding="utf-8")
+    assert "EXE MISSING" in ops.check_exe_freshness(tmp_path / "nope.exe", [src])[0]
