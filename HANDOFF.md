@@ -240,21 +240,54 @@ would have been the first time that path was ever exercised. Watch that run.
   against the 0.50% interim gate. Self-resolves ~October when the third monthly
   observation arrives and the monthly gate resumes. If it reaches ~0.45%,
   diagnose it — do not raise the threshold.
-- **Slide 5 overstates divergence ~5x.** The strategy line is rebased to the
-  chart window start (25 May), Actual NAV to its own first point (24 Jun), so
-  the orange line carries a **+5.19%** head start before the blue line begins.
-  It is also today's target weights projected backwards, not what was held, and
-  gross of ~296bps/yr costs. The drift table is the honest number: **cumulative
-  -1.00%**. Rebasing the strategy line to the NAV's first date was offered and
-  not actioned — investor-facing, so it is a judgement call.
+- **Slide 5's strategy line is still a projection, not a track record.** The
+  rebasing is fixed (80958be) but two caveats remain when reading it: the
+  orange line is TODAY's target weights projected backwards, not what was
+  actually held, and it is gross of ~296bps/yr in brokerage and CGT. The drift
+  table remains the honest tracking number.
 - **`LIVE_TRADING_START_DATE` could defensibly be 2026-07-09**, after the
   07-06/07-08 build-out. One line. (Carried forward.)
 
 ## Closed since the previous section
 
+- **Slide 5 rebasing — fixed (80958be).** Actual NAV was rebased to the
+  account's inception while the strategy AND the benchmarks were rebased to the
+  chart window start a month earlier, so the strategy carried a **+5.19%** head
+  start and the slide read as ~5x the drift table's actual -1.00% cumulative.
+  All three now share the NAV's origin via `rebase_to()`, every line crosses
+  zero there, and the title names the date. Benchmarks were rebased too —
+  fixing only the strategy would have left a subtler inconsistency than the
+  original.
 - `dist/` log wiping — fixed (7f85356).
 - The `[ibkr-price][WARN]` cluster is **explained, not a defect**: at 10:20 AEST
   IBKR quotes a US close yfinance has not published yet. The leveraged pairs
   prove it — TQQQ/QQQ = 2.96x, SOXL/SOXX = 2.90x, both landing on their 3x
   factor. The engine uses the *fresher* price; the warning measures yfinance's
   lag.
+
+
+## Verified live — 2026-09-01 18:00 evidence run
+
+First unattended run carrying the whole week's work. The rec-log suppression is
+confirmed, with the previous evening as a clean control:
+
+```
+2026-08-31T10:22:48  SKIP    <- morning
+2026-08-31T18:02:55  SKIP    <- evening sweep, BEFORE the fix
+2026-09-01T10:22:44  SKIP    <- morning
+                             <- no 18:0x entry: the fix
+[drift] PORTOPT_NO_REC_LOG set — recommendation NOT logged
+```
+
+202 rec-log lines before and after. Reconstruction passed, `warnings=0` on the
+drift tracker, 44 NAV samples, 9 slides, 0 errors, 125s awake.
+
+The single `[WARN]` was environmental, not a defect: the deck could not
+overwrite `Reports/Portfolio_Report.pptx` because it was open in PowerPoint, so
+it wrote `Portfolio_Report.2026-09-01_180202.pptx` and said so. Graceful
+degradation working — but it means the canonical deck stops updating in place
+while anyone has it open.
+
+**Next thing to watch: the ~14 September RUN day.** 28 of 42 cadence days had
+elapsed on 09-01. That run is the first time the morning-plan/US-pass path is
+exercised for real, and the whole reason the rec-log fix exists.
