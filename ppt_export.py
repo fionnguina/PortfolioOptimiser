@@ -41,6 +41,41 @@ from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
 NAV_GAP_BRIDGE_DAYS = 3
 
 
+def rebase_to(obj, when):
+    """Normalise a Series/DataFrame so its value at `when` is 1.0.
+
+    Every line on the performance slide must share an origin or the chart
+    answers a question nobody asked. It did not: Actual NAV was rebased to its
+    own first observation (the account's inception) while the strategy and the
+    benchmarks were rebased to the chart window's start, a month earlier. The
+    strategy therefore carried a head start — +5.19% over 25 May → 23 Jun on
+    the live book's weights — before the NAV line began at zero, so the slide
+    read as roughly five times more divergence than the drift table's actual
+    -1.00% cumulative.
+
+    Falls back to the first row when `when` is absent or unusable, which is the
+    pre-inception behaviour and the right answer for a hypothetical run.
+    """
+    try:
+        if when is None or when not in obj.index:
+            return obj.div(obj.iloc[0])
+        base = obj.ffill().loc[when]
+        # A zero or missing base would blow the whole line up rather than
+        # rebase it; the window start is a worse origin but a finite one.
+        import numpy as _np
+        if _np.ndim(base) == 0:
+            if not _np.isfinite(base) or base == 0:
+                return obj.div(obj.iloc[0])
+        else:
+            base = base.where(_np.isfinite(base) & (base != 0))
+            if base.isna().all():
+                return obj.div(obj.iloc[0])
+            base = base.fillna(obj.iloc[0])
+        return obj.div(base)
+    except Exception:
+        return obj.div(obj.iloc[0])
+
+
 def bridge_short_gaps(series, max_days: int = NAV_GAP_BRIDGE_DAYS):
     """Interpolate across NaN runs of `max_days` or fewer. Returns (series, n).
 
@@ -619,9 +654,13 @@ def export_to_ppt(results, trades, charts=None):
                   + (f"; {_left} left as visible gaps (outage > "
                      f"{NAV_GAP_BRIDGE_DAYS}d)" if _left else ""))
         _first_valid_nav = _nav_in_window.first_valid_index()
+        # Every other line on this chart is rebased here too — see rebase_to.
+        # None means no live NAV, so the window start stands.
+        _chart_origin = None
         if _first_valid_nav is not None:
             _base = float(_nav_in_window.loc[_first_valid_nav])
             if _base > 0:
+                _chart_origin = _first_valid_nav
                 portfolio_returns = (_nav_in_window / _base) - 1.0
                 portfolio_legend_label = (
                     f"Actual NAV (since {_first_valid_nav.strftime('%d %b')})"
@@ -635,7 +674,7 @@ def export_to_ppt(results, trades, charts=None):
             portfolio_returns = (pval / pval.iloc[0]) - 1.0
             portfolio_legend_label = "Portfolio (Hypothetical)"
             print("[chart] no actual NAV data — falling back to hypothetical")
-        benchmark_returns = bench.div(bench.iloc[0]).subtract(1.0)
+        benchmark_returns = rebase_to(bench, _chart_origin).subtract(1.0)
                 
         # --- Strategy line: synthetic projection of the AUTO-SELECTED plan ---
         # Previously hardcoded to "With Tilts" even when the auto-picker chose
@@ -670,8 +709,7 @@ def export_to_ppt(results, trades, charts=None):
 
                 r_tilt = (returns_wide_df[common].reindex(pval.index).fillna(0.0) @ w_ser).astype(float)
                 tilted_curve = (1.0 + r_tilt).cumprod()
-                tilted_curve = tilted_curve / float(tilted_curve.iloc[0])
-                tilted_returns = tilted_curve - 1.0
+                tilted_returns = rebase_to(tilted_curve, _chart_origin) - 1.0
         except Exception:
             tilted_returns = None
 
@@ -852,7 +890,13 @@ def export_to_ppt(results, trades, charts=None):
         ax.tick_params(axis="x", which="minor", labelsize=7, rotation=0, colors="#888888")
         fig.subplots_adjust(bottom=0.22)
 
-        ax.set_title("Portfolio vs ASX, S&P 500, NASDAQ (3-Month Performance)")
+        # Name the origin. Every line is now rebased to the account's first NAV
+        # observation, so all of them cross zero there — without saying so, a
+        # reader has to infer why the benchmarks start below zero.
+        _origin_note = (f", rebased {_chart_origin:%d %b}"
+                        if locals().get("_chart_origin") is not None else "")
+        ax.set_title("Portfolio vs ASX, S&P 500, NASDAQ "
+                     f"(3-Month Performance{_origin_note})")
         ax.set_ylabel("Return (%)")
         ax.legend(loc="upper left", frameon=False)
         ax.grid(True, linestyle="--", alpha=0.4)

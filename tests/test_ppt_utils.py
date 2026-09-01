@@ -197,3 +197,68 @@ def test_a_clean_series_is_returned_untouched():
     s = pd.Series(range(len(idx)), index=idx, dtype=float)
     out, n = P.bridge_short_gaps(s)
     assert n == 0 and out.equals(s)
+
+
+# --------------------------------------------------------------------------
+# Every line on the performance slide must share an origin (2026-09-01)
+# --------------------------------------------------------------------------
+
+def test_rebasing_removes_the_strategy_head_start():
+    """Actual NAV was rebased to the account's inception while the strategy and
+    benchmarks were rebased to the chart window's start, a month earlier. The
+    strategy therefore carried a head start — +5.19% over 25 May -> 23 Jun on
+    the live book's weights — before the NAV line began at zero, so the slide
+    read as ~5x more divergence than the drift table's actual -1.00%."""
+    import numpy as np
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-05-25", "2026-08-25")
+    # +5% before inception, +5% after.
+    s = pd.Series(np.linspace(1.0, 1.05, 22).tolist()
+                  + np.linspace(1.05, 1.10, len(idx) - 22).tolist(), index=idx)
+    origin = idx[22]
+
+    assert P.rebase_to(s, None).iloc[-1] == pytest.approx(1.10)        # old
+    assert P.rebase_to(s, origin).iloc[-1] == pytest.approx(1.10 / 1.05)
+    assert P.rebase_to(s, origin).loc[origin] == pytest.approx(1.0), \
+        "the origin is where every line must cross zero"
+
+
+def test_rebasing_handles_a_frame_of_benchmarks():
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-05-25", "2026-07-25")
+    df = pd.DataFrame({"ASX": range(len(idx)), "SPX": range(len(idx))},
+                      dtype=float) + 100.0
+    df.index = idx
+    origin = idx[10]
+    out = P.rebase_to(df, origin)
+    assert list(out.loc[origin]) == pytest.approx([1.0, 1.0])
+
+
+def test_rebasing_falls_back_when_the_origin_is_unusable():
+    """No live NAV yet (hypothetical run), or a zero/absent base — the window
+    start is a worse origin but a finite one, and the line must still render."""
+    import numpy as np
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-05-25", "2026-06-25")
+    s = pd.Series(np.arange(len(idx), dtype=float) + 1.0, index=idx)
+
+    assert P.rebase_to(s, None).iloc[0] == pytest.approx(1.0)
+    # An origin outside the index
+    assert P.rebase_to(s, pd.Timestamp("2030-01-01")).iloc[0] == pytest.approx(1.0)
+    # A zero base must not blow the series up to inf
+    z = pd.Series(0.0, index=idx)
+    assert np.isfinite(P.rebase_to(z, idx[5]).replace([np.inf, -np.inf], np.nan)
+                       .fillna(0.0)).all()
+
+
+def test_the_slide_rebases_all_three_series_together():
+    """Source-text guard: the fix is only a fix if strategy AND benchmarks use
+    the same origin the NAV line does. Rebasing one of them would leave the
+    chart inconsistent in a subtler way than before."""
+    src = (_Path(__file__).resolve().parent.parent / "ppt_export.py").read_text(encoding="utf-8")
+    assert "rebase_to(bench, _chart_origin)" in src, "benchmarks must share it"
+    assert "rebase_to(tilted_curve, _chart_origin)" in src, "strategy must share it"
+    assert "_chart_origin = _first_valid_nav" in src, "and it is the NAV's own origin"
