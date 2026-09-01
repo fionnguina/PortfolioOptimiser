@@ -789,21 +789,26 @@ ANNUAL_TRADING_DAYS = 252  # For Sharpe calculation
 # once IBKR is connected. Until then drift NAV tracking stays dormant but the
 # infrastructure (recommendation log, fill sheet, NAV history) keeps running.
 # ============================================================================
-LIVE_TRADING_START_DATE: str | None = "2026-07-01"  # first FULL month with the book built; see below. Update to real-money start once AFSL issues + first live fill.
-# Was "2026-06-22" (the day paper trading commenced) until 2026-08-20. That is
-# the honest answer to "when did trading start", but it is the wrong baseline
-# for measuring tracking error, and those are different questions:
+LIVE_TRADING_START_DATE: str | None = "2026-07-09"  # first day the book was fully built; see below. Update to real-money start once AFSL issues + first live fill.
+# History: "2026-06-22" (the day paper trading commenced) until 2026-08-20,
+# then "2026-07-01", now 2026-07-09. "When did trading start" and "from when is
+# tracking error measurable" are different questions, and this constant answers
+# the second:
 #   * 2026-06-23 was the account reset — a -189,334 withdrawal and a +250,000
 #     deposit — so nothing before 06-24 is performance at all.
 #   * What follows is the book being CONSTRUCTED: 39 of 60 trades executed
-#     after 30 June. Comparing a third-built portfolio against a fully invested
-#     backtest is not tracking error, but it read as -2.10% over June's five
-#     trading days and breached the +/-2% gate.
-# July is the first month that is both complete and fully invested. This costs
-# five days (24-30 June) that were never a track record.
-# A stricter reading starts at 2026-07-09, after the 07-06/07-08 build-out
-# finished — another week traded for a cleaner baseline, and a one-line change
-# if the fund would rather claim it that way.
+#     after 30 June, and the last build-out trades landed 07-06 (7) and 07-08
+#     (5). Comparing a partly-built portfolio against a fully invested backtest
+#     is not tracking error — it read as -2.10% over June's five trading days
+#     and breached the +/-2% gate on nothing.
+# 2026-07-09 is the first day the book was actually built, which is the
+# earliest date the comparison means anything.
+#
+# CONSEQUENCE, deliberate: July is now a 17-of-23-business-day stub, so
+# PARTIAL_MONTH_COVERAGE marks 2026-07 partial — reported in the drift table,
+# never warned on. The first fully-comparable month is 2026-08. That is the
+# honest position: the fund has one month of measurable tracking history, not
+# two, and the drift gate should not pretend otherwise.
 # DRIFT_* threshold canonical definitions moved to drift.py (Phase 4 split).
 # Imported at top of file.
 # "Drift vs target" in the cash ledger anchors to the account's ACTUAL NAV
