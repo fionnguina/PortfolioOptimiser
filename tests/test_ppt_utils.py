@@ -133,3 +133,67 @@ def test_add_change_run_signs_and_zero():
     assert " (+12.50)" in texts
     assert " (-3.00)" in texts
     assert "" in texts
+
+
+# --------------------------------------------------------------------------
+# Actual-NAV chart gaps (2026-08-25)
+# --------------------------------------------------------------------------
+
+def test_short_nav_gaps_are_bridged_for_the_plot():
+    """A day with no broker snapshot becomes NaN once reindexed onto the price
+    panel, and matplotlib breaks the line at every NaN. Six such days —
+    2026-07-09/10 (TWS not logged in, then a locked ibkr_nav_log.jsonl) and
+    07-14 to 07-16 plus 08-13 (machine off) — left the live line shredded. The
+    NAV either side of each hole is correct; only the plot was misleading."""
+    import numpy as np
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-07-06", "2026-07-17")
+    s = pd.Series(np.arange(len(idx), dtype=float), index=idx)
+    for d in ("2026-07-09", "2026-07-10", "2026-07-14", "2026-07-15", "2026-07-16"):
+        s.loc[pd.Timestamp(d)] = np.nan
+
+    out, n = P.bridge_short_gaps(s, max_days=3)
+    assert n == 5 and not out.isna().any()
+    # Linear ramp, so a correct time-interpolation reproduces the originals.
+    assert out.loc[pd.Timestamp("2026-07-14")] == pytest.approx(6.0)
+
+
+def test_a_long_outage_stays_visible_on_the_chart():
+    """Three days covers a missed morning or a long weekend. Longer than that
+    is the pipeline being down, and smoothing it into a straight line would
+    imply data we do not have."""
+    import numpy as np
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-07-06", "2026-07-24")
+    s = pd.Series(np.arange(len(idx), dtype=float), index=idx)
+    s.loc[pd.Timestamp("2026-07-13"):pd.Timestamp("2026-07-17")] = np.nan  # 5 days
+
+    out, n = P.bridge_short_gaps(s, max_days=3)
+    assert n == 0, "a five-day outage must not be bridged"
+    assert int(out.isna().sum()) == 5
+
+
+def test_bridging_never_invents_nav_outside_the_observed_range():
+    """limit_area='inside' — the live series must not be extrapolated backwards
+    to before the account had a NAV, nor forward past the last snapshot."""
+    import numpy as np
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-07-06", "2026-07-15")
+    s = pd.Series(np.nan, index=idx)
+    s.iloc[3:6] = [1.0, 2.0, 3.0]
+
+    out, _ = P.bridge_short_gaps(s, max_days=3)
+    assert out.iloc[:3].isna().all(), "nothing before the first observation"
+    assert out.iloc[6:].isna().all(), "nothing after the last"
+
+
+def test_a_clean_series_is_returned_untouched():
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-07-06", "2026-07-10")
+    s = pd.Series(range(len(idx)), index=idx, dtype=float)
+    out, n = P.bridge_short_gaps(s)
+    assert n == 0 and out.equals(s)

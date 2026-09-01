@@ -32,6 +32,38 @@ from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
 # All other names (config, runtime pipeline state, helper functions) are injected
 # by the engine's _sync_ppt_export() before each call — see _PPT_EXPORT_INJECT.
 
+# Longest run of missing actual-NAV days to bridge when PLOTTING the live line.
+# A day with no broker snapshot is NaN once reindexed onto the price panel, and
+# matplotlib breaks the line at every NaN. Three days covers a long weekend or
+# a missed morning; anything longer is the pipeline being down and must stay
+# visible on the chart. Affects the plot only — never stored NAV, never the
+# return table.
+NAV_GAP_BRIDGE_DAYS = 3
+
+
+def bridge_short_gaps(series, max_days: int = NAV_GAP_BRIDGE_DAYS):
+    """Interpolate across NaN runs of `max_days` or fewer. Returns (series, n).
+
+    Fills a hole ENTIRELY or not at all. A plain `limit=` fills the first N days
+    of a long outage and stops, drawing a line that marches confidently into
+    nothing — a different lie from the one being fixed. `limit_area="inside"`
+    keeps it from inventing NAV before the first observation or after the last.
+    """
+    import pandas as _pd
+
+    if series is None or not isinstance(series, _pd.Series) or series.empty:
+        return series, 0
+    na = series.isna()
+    if not na.any():
+        return series, 0
+    run = na.groupby((na != na.shift()).cumsum()).transform("sum")
+    fillable = na & (run <= int(max_days))
+    if not fillable.any():
+        return series, 0
+    return (series.where(~fillable,
+                         series.interpolate(method="time", limit_area="inside")),
+            int(fillable.sum()))
+
 
 def export_to_ppt(results, trades, charts=None):
     """
@@ -559,6 +591,33 @@ def export_to_ppt(results, trades, charts=None):
         # Stash for the table section below so we don't compute twice.
         actual_nav_for_table = _actual_nav_series_local
         _nav_in_window = _actual_nav_series_local.reindex(pval.index)
+        # Bridge SHORT holes so the line reads as a line. A day with no broker
+        # NAV snapshot becomes NaN here, and matplotlib breaks the series at
+        # every NaN — six such days (07-09, 07-10, 07-14 to 07-16, 08-13) left
+        # the live line visibly shredded. The NAV either side of each hole is
+        # correct; only the plot was misleading.
+        #
+        # Bounded deliberately at NAV_GAP_BRIDGE_DAYS. A missed morning is a
+        # cosmetic artifact worth hiding; a week of silence is the pipeline
+        # being down, which must stay visible on the chart rather than being
+        # smoothed into a straight line that implies data we do not have.
+        # Interpolation is time-weighted and touches the PLOT only — nothing
+        # stored, and the return table below still reads the raw series.
+        _nav_in_window, _bridged = bridge_short_gaps(
+            _nav_in_window, NAV_GAP_BRIDGE_DAYS)
+        if _bridged:
+            # Count only INTERIOR holes. Everything before the live series
+            # begins is NaN too — 22 days here, since the chart opens on
+            # 2026-05-25 and the account's NAV starts 2026-06-24 — and calling
+            # those an "outage" reports a pipeline failure that never happened.
+            _fv = _nav_in_window.first_valid_index()
+            _lv = _nav_in_window.last_valid_index()
+            _left = (int(_nav_in_window.loc[_fv:_lv].isna().sum())
+                     if _fv is not None and _lv is not None else 0)
+            print(f"[chart] actual-NAV: bridged {_bridged} missing day(s) in "
+                  f"the plot"
+                  + (f"; {_left} left as visible gaps (outage > "
+                     f"{NAV_GAP_BRIDGE_DAYS}d)" if _left else ""))
         _first_valid_nav = _nav_in_window.first_valid_index()
         if _first_valid_nav is not None:
             _base = float(_nav_in_window.loc[_first_valid_nav])
