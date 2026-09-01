@@ -245,11 +245,16 @@ would have been the first time that path was ever exercised. Watch that run.
   orange line is TODAY's target weights projected backwards, not what was
   actually held, and it is gross of ~296bps/yr in brokerage and CGT. The drift
   table remains the honest tracking number.
-- **`LIVE_TRADING_START_DATE` could defensibly be 2026-07-09**, after the
-  07-06/07-08 build-out. One line. (Carried forward.)
 
 ## Closed since the previous section
 
+- **`LIVE_TRADING_START_DATE` 2026-07-01 -> 2026-07-09 (b0a276a).** The last
+  build-out trades landed 07-06 (7) and 07-08 (5); before that the comparison
+  measures construction, not tracking. **Deliberate consequence:** July is now
+  a 17-of-23-day stub (74%), so `PARTIAL_MONTH_COVERAGE` marks 2026-07 partial
+  — reported, never warned on. The first fully comparable month is 2026-08, so
+  the fund has ONE month of measurable tracking history, not two. If the deck's
+  July row now reads partial where it did not, that is why.
 - **Slide 5 rebasing — fixed (80958be).** Actual NAV was rebased to the
   account's inception while the strategy AND the benchmarks were rebased to the
   chart window start a month earlier, so the strategy carried a **+5.19%** head
@@ -291,3 +296,24 @@ while anyone has it open.
 **Next thing to watch: the ~14 September RUN day.** 28 of 42 cadence days had
 elapsed on 09-01. That run is the first time the morning-plan/US-pass path is
 exercised for real, and the whole reason the rec-log fix exists.
+
+
+## Proven end to end — 2026-09-02 02:00 US pass
+
+The rec-log fix, verified unattended in production. The plan the US legs loaded,
+before and after:
+
+```
+2026-09-01 02:00   plan @ 2026-08-31T18:02:55   <- the EVENING sweep (before)
+2026-09-02 02:00   plan @ 2026-09-01T10:22:44   <- the MORNING plan (after)
+```
+
+Both refused correctly (`verdict=SKIP, within-cadence`, exit 3), but the second
+is chasing the approved morning target. That is the whole point of the fix, and
+it now holds without anyone watching.
+
+**Still the date that matters: the ~14 September RUN day.** Everything until
+then is a cadence-gated SKIP that exercises the refusal path, not the execution
+path. That run is the first time the morning plan is actually traded across
+both venues, and the first real test of whether the half-rebalance failure is
+genuinely closed.
