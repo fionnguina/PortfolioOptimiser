@@ -128,7 +128,8 @@ Setup and the Flex query field list: `FLEX_SETUP.md`.
    `PARTIAL_MONTH_COVERAGE=0.80` marks a stub `Partial`: reported, never warned
    on. `LIVE_TRADING_START_DATE` 2026-06-22 -> **2026-07-01**.
 
-## Open
+## Open  *(SUPERSEDED — see the 08-25 → 09-01 section below; two of these are
+now closed)*
 
 - **Daily interim gate (0.5%) governs until ~November**, when three monthly
   observations exist and the monthly gate resumes automatically. Set from one
@@ -174,3 +175,86 @@ two runs, 8 of 26 days above 50bps. Headroom to the 0.50% interim gate is
 diff 0.000000, both sources reconciling to the broker's own closing cash
 (AUD 11,672.93). `ibkr_flex.py --verify` re-runs that comparison and is the
 acceptance test — **run it after ANY change to the statement parser.**
+
+---
+
+# Session 2026-08-25 → 09-01 — five defects, each found by reviewing a healthy-looking run
+
+`main`, pushed, 636 tests. The Flex work from the previous session is live and
+has needed no attention since.
+
+```
+386cb28 fix: staleness by content, so a checkout stops crying wolf about the binary
+7f85356 fix: the build destroyed the evidence trail it exists to produce
+5701381 fix: the live NAV line was shredded by days the pipeline never ran
+869b84d fix: the unattended pipeline could not see its own missed day, or its own sweep
+```
+
+Every one of these came out of a run that reported `warnings=0` and `exit=0`.
+None were visible from reading the code. **The daily review is what finds
+these** — the pipeline reporting itself healthy is not evidence that it is.
+
+## The one that could have cost money
+
+The 02:00 US pass loads the **latest** rec-log entry. The 18:00 evidence run
+also runs the engine and wrote its own entry, so the US legs would have chased
+the evening sweep rather than the morning's approved plan — contradicting the
+invariant in CLAUDE.md that both halves of the day chase the same target.
+
+Never diverged across 39 days, because every one was a cadence-gated SKIP. On a
+RUN day it inverts: the morning fills the ASX legs → the 10:30 snapshot moves
+`last_position_change_date` to today → the 18:00 run sees 0 days since the last
+fill and writes SKIP → at 02:00 the US legs load that SKIP and refuse. ASX
+traded, US not, and the anchor now claims a fresh rebalance, so no retry for six
+weeks. **That is the standing SMH-underweight symptom, and this is its
+mechanism.**
+
+`PORTOPT_NO_REC_LOG=1`, set by `evidence_run.ps1`. Verified: 202 rec-log lines
+before and after, verdict still stamped, metrics still written.
+
+**The next RUN day is ~14 September** (28 of 42 days elapsed as of 09-01) and
+would have been the first time that path was ever exercised. Watch that run.
+
+## The others
+
+- **The heartbeat could not see a job's own missed day.** `daily_auto.ps1`
+  stamps the ledger *before* checking, so the latest success always satisfied
+  yesterday's due time. 2026-08-13 was missed by all three jobs; only
+  `evidence_run` was reported, purely because it runs at 18:00 and had not yet
+  stamped. Now checks every due occurrence over 7 days, bounded by the job's
+  first ledger entry (a job cannot miss a day before it existed).
+- **Staleness compared mtimes**, so the 08-24 merge checkout reported 11 stale
+  sources against a byte-identical binary. Now compares SHA-256 against
+  `dist/build_manifest.json`, written at build time from `ops_expected.json`'s
+  `engine_sources`. Falls back to mtime when no manifest exists, and says which
+  comparison ran.
+- **A rebuild wiped `dist/`** and its engine logs — cost a review twice.
+  `build_helper._preserve_run_logs()` moves them to `logs/engine_runs/` first.
+- **The live NAV line was shredded** by six days with no broker snapshot.
+  `bridge_short_gaps()` fills holes of ≤3 days entirely or not at all; a longer
+  outage stays visible. Plot only.
+
+## Open — current
+
+- **Median daily reconstruction error is trending up**: 0.26% → 0.31% → 0.35%
+  against the 0.50% interim gate. Self-resolves ~October when the third monthly
+  observation arrives and the monthly gate resumes. If it reaches ~0.45%,
+  diagnose it — do not raise the threshold.
+- **Slide 5 overstates divergence ~5x.** The strategy line is rebased to the
+  chart window start (25 May), Actual NAV to its own first point (24 Jun), so
+  the orange line carries a **+5.19%** head start before the blue line begins.
+  It is also today's target weights projected backwards, not what was held, and
+  gross of ~296bps/yr costs. The drift table is the honest number: **cumulative
+  -1.00%**. Rebasing the strategy line to the NAV's first date was offered and
+  not actioned — investor-facing, so it is a judgement call.
+- **`LIVE_TRADING_START_DATE` could defensibly be 2026-07-09**, after the
+  07-06/07-08 build-out. One line. (Carried forward.)
+
+## Closed since the previous section
+
+- `dist/` log wiping — fixed (7f85356).
+- The `[ibkr-price][WARN]` cluster is **explained, not a defect**: at 10:20 AEST
+  IBKR quotes a US close yfinance has not published yet. The leveraged pairs
+  prove it — TQQQ/QQQ = 2.96x, SOXL/SOXX = 2.90x, both landing on their 3x
+  factor. The engine uses the *fresher* price; the warning measures yfinance's
+  lag.
