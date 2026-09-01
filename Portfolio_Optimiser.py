@@ -7926,6 +7926,22 @@ if USE_XLWINGS:
             # === Drift tracker (Tier-1 #3): recommendation log =================
             # One JSONL line per run. Foundation for later fill/slippage compare
             # once IBKR API or manual fill sheet is wired up.
+            # A research sweep must not be able to overwrite a plan the
+            # pipeline may act on. The 02:00 US pass loads the LATEST rec-log
+            # entry, so the evening evidence run — which re-runs the engine at
+            # 18:00 purely to accrue scale metrics — was silently becoming the
+            # plan those US legs would chase, not the morning's approved one.
+            #
+            # It has never diverged, because all 39 days with both entries were
+            # cadence-gated SKIPs. On a RUN day it inverts: the morning fills
+            # the ASX legs, the 10:30 snapshot moves last_position_change_date
+            # to today, and the 18:00 run therefore sees 0 days since the last
+            # fill and writes SKIP. At 02:00 the US legs load that SKIP and
+            # refuse — ASX traded, US not, and the cadence anchor now reads
+            # "just rebalanced" so it will not retry for six weeks. That is the
+            # standing SMH-underweight symptom, arriving by this route.
+            _no_rec_log = str(os.environ.get("PORTOPT_NO_REC_LOG", "")).strip().lower() \
+                in ("1", "true", "yes")
             try:
                 _drift_log_path = APP_DIR / "trade_recommendation_log.jsonl"
                 if (portfolio_value_override is not None
@@ -7936,27 +7952,32 @@ if USE_XLWINGS:
                     _cu = pd.to_numeric(trade_rec.get("Curr Units", 0), errors="coerce").fillna(0)
                     _lp = pd.to_numeric(trade_rec.get("Last Px (AUD)", 0), errors="coerce").fillna(0)
                     _portfolio_val_for_log = float((_cu * _lp).sum())
-                append_trade_recommendation_log(
-                    _drift_log_path,
-                    selected_mode=_tp_mode,
-                    trade_df=trade_rec,
-                    w_target=w_tradeplan,
-                    current_units=pd.Series(units),
-                    portfolio_value_aud=_portfolio_val_for_log,
-                    regime_mix=globals().get("ensemble_mix_live", pd.Series(dtype=float)),
-                    expected_brokerage_aud=float(costs_rec.get("brokerage", 0.0)),
-                    expected_cgt_aud=float(costs_rec.get("cgt_tax", 0.0)),
-                    broker_name=str(BROKER_CONFIG.get("name", "unknown")),
-                    cgt_mtr=float(CGT_CONFIG.get("marginal_tax_rate", 0.30)),
-                    universe_size=int(len(w_tradeplan)),
-                    tlh_events=globals().get("LIVE_TLH_EVENTS", []) or [],
-                    # Absent globals mean the verdict block never ran (a mode
-                    # that skips it, or it raised) — UNKNOWN, not approval.
-                    verdict=str(globals().get("REBAL_TRIGGER_VERDICT")
-                                or "UNKNOWN"),
-                    skip_reason=str(globals().get("REBAL_TRIGGER_SKIP_REASON")
-                                    or ""),
-                )
+                if _no_rec_log:
+                    print("[drift] PORTOPT_NO_REC_LOG set — recommendation NOT "
+                          "logged (research run; the executable plan must come "
+                          "from the pipeline, not a sweep)")
+                else:
+                    append_trade_recommendation_log(
+                        _drift_log_path,
+                        selected_mode=_tp_mode,
+                        trade_df=trade_rec,
+                        w_target=w_tradeplan,
+                        current_units=pd.Series(units),
+                        portfolio_value_aud=_portfolio_val_for_log,
+                        regime_mix=globals().get("ensemble_mix_live", pd.Series(dtype=float)),
+                        expected_brokerage_aud=float(costs_rec.get("brokerage", 0.0)),
+                        expected_cgt_aud=float(costs_rec.get("cgt_tax", 0.0)),
+                        broker_name=str(BROKER_CONFIG.get("name", "unknown")),
+                        cgt_mtr=float(CGT_CONFIG.get("marginal_tax_rate", 0.30)),
+                        universe_size=int(len(w_tradeplan)),
+                        tlh_events=globals().get("LIVE_TLH_EVENTS", []) or [],
+                        # Absent globals mean the verdict block never ran (a mode
+                        # that skips it, or it raised) — UNKNOWN, not approval.
+                        verdict=str(globals().get("REBAL_TRIGGER_VERDICT")
+                                    or "UNKNOWN"),
+                        skip_reason=str(globals().get("REBAL_TRIGGER_SKIP_REASON")
+                                        or ""),
+                    )
             except Exception as _e_drift:
                 print(f"[drift] recommendation log skipped: {_e_drift}")
 

@@ -162,9 +162,16 @@ def test_never_recorded_job_is_reported():
 
 
 def test_latest_entry_wins_regardless_of_file_order():
+    """Rows out of order must not confuse the check.
+
+    Uses CONSECUTIVE scheduled days (Fri 08-07, Mon 08-10) because the check
+    now verifies every due occurrence, not just the most recent — the previous
+    fixture skipped 08-07 and that hole is a real miss the old single-
+    occurrence check simply could not see.
+    """
     found = ops.check_heartbeat(
         [_row("daily_auto", "2026-08-10T10:25:00"),
-         _row("daily_auto", "2026-08-06T09:31:00")],
+         _row("daily_auto", "2026-08-07T09:31:00")],
         {"daily_auto": {"start_time": "10:20", "days": WEEKDAYS,
                         "grace_minutes": 120}},
         now=datetime(2026, 8, 10, 14, 0))
@@ -244,3 +251,60 @@ def test_corrupt_ledger_lines_are_skipped(tmp_path):
 
 def test_missing_ledger_reads_empty(tmp_path):
     assert ops.read_ledger(tmp_path / "nope.jsonl") == []
+
+
+# --------------------------------------------------------------------------
+# A job must be able to report its OWN missed day (2026-08-25)
+# --------------------------------------------------------------------------
+
+def test_a_job_reports_its_own_missed_day_even_after_running_today():
+    """daily_auto.ps1 stamps the ledger BEFORE running the check, so the latest
+    success is always today's. The old check compared only that latest success
+    against the PREVIOUS due occurrence, which today's run always satisfies —
+    so 2026-08-13 was missed and never reported. The same check caught
+    evidence_run's miss that morning only because that job runs at 18:00 and
+    had not yet stamped."""
+    found = ops.check_heartbeat(
+        [_row("daily_auto", "2026-08-12T10:26:30"),
+         _row("daily_auto", "2026-08-14T10:27:01")],   # 08-13 absent
+        {"daily_auto": {"start_time": "10:20", "days": WEEKDAYS,
+                        "grace_minutes": 120}},
+        now=datetime(2026, 8, 14, 10, 27))
+    assert len(found) == 1, found
+    assert "MISSED RUN" in found[0] and "2026-08-13" in found[0], found[0]
+
+
+def test_a_fresh_ledger_does_not_report_the_week_before_it_existed():
+    """The ledger was introduced on 2026-08-10. Without this the first check
+    reports seven missed runs, and so does every newly added job — noise that
+    trains the reader to ignore the block."""
+    found = ops.check_heartbeat(
+        [_row("daily_auto", "2026-08-10T10:26:00")],
+        {"daily_auto": {"start_time": "10:20", "days": WEEKDAYS,
+                        "grace_minutes": 120}},
+        now=datetime(2026, 8, 10, 14, 0))
+    assert found == [], found
+
+
+def test_a_day_that_ran_and_failed_is_a_failure_not_an_absence():
+    """Different cause, different fix — a run that errored is not a machine
+    that was asleep."""
+    found = ops.check_heartbeat(
+        [_row("daily_auto", "2026-08-10T10:26:00"),
+         _row("daily_auto", "2026-08-11T10:26:00", outcome="error")],
+        {"daily_auto": {"start_time": "10:20", "days": WEEKDAYS,
+                        "grace_minutes": 120}},
+        now=datetime(2026, 8, 11, 14, 0))
+    assert len(found) == 1, found
+    assert "RUN FAILED" in found[0] and "2026-08-11" in found[0], found[0]
+
+
+def test_several_missed_days_are_summarised_not_listed_in_full():
+    found = ops.check_heartbeat(
+        [_row("daily_auto", "2026-08-03T10:26:00"),
+         _row("daily_auto", "2026-08-10T10:26:00")],
+        {"daily_auto": {"start_time": "10:20", "days": WEEKDAYS,
+                        "grace_minutes": 120}},
+        now=datetime(2026, 8, 10, 14, 0))
+    assert len(found) == 1 and "MISSED RUN" in found[0]
+    assert "earlier)" in found[0], "a week of misses must not print as a wall"

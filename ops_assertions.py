@@ -106,42 +106,101 @@ def previous_expected_run(now: datetime, start_time: str, days: list,
     return None
 
 
-def check_heartbeat(ledger_rows: list, jobs: dict, now: datetime) -> list:
-    """Did each job actually run when it was supposed to?
+HEARTBEAT_LOOKBACK_DAYS = 7
 
-    A job is healthy when its most recent SUCCESS is at or after the previous
-    expected occurrence. Anything else is reported — including a job that ran
-    and failed, which the ledger records but which is not a success.
+
+def expected_occurrences(now: datetime, start_time: str, days: list,
+                         grace_minutes: int = 90,
+                         lookback_days: int = HEARTBEAT_LOOKBACK_DAYS) -> list:
+    """Every scheduled occurrence in the lookback window that is already due.
+
+    previous_expected_run answers "the latest one" and is kept for the
+    schedule checks; this answers "all of them", which is what catching a gap
+    requires.
+    """
+    try:
+        hh, mm = (int(x) for x in str(start_time).split(":"))
+    except (TypeError, ValueError):
+        return []
+    want = {str(d).lower() for d in (days or [])}
+    out = []
+    for back in range(0, max(1, int(lookback_days)) + 1):
+        day = now - timedelta(days=back)
+        if want and _DAYS[day.weekday()].lower() not in want:
+            continue
+        occ = day.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if (now - occ).total_seconds() >= grace_minutes * 60:
+            out.append(occ)
+    return sorted(out)
+
+
+def check_heartbeat(ledger_rows: list, jobs: dict, now: datetime) -> list:
+    """Did each job actually run EVERY time it was supposed to?
+
+    Checks every due occurrence in the last week, not just the most recent
+    one. The single-occurrence version could not see a job's own missed day:
+    daily_auto.ps1 stamps the ledger BEFORE running this check (deliberately,
+    so today's run is not reported as absent), so by check time the latest
+    success is always today's and always satisfies yesterday's due time.
+    2026-08-13 was missed and went unreported for exactly that reason — the
+    same check caught evidence_run's miss the same morning, only because that
+    job runs at 18:00 and had not yet stamped.
+
+    Anything that ran and FAILED is still reported: the ledger records it, but
+    a failure is not a success.
     """
     out = []
-    by_job = {}
+    ok_dates: dict = {}
+    any_dates: dict = {}
+    first_seen: dict = {}
+    latest: dict = {}
     for r in ledger_rows:
         job = str(r.get("job", ""))
         ts = _parse_ts(r.get("finished") or r.get("started"))
         if not job or ts is None:
             continue
-        prev = by_job.get(job)
+        outcome = str(r.get("outcome", "")).lower()
+        any_dates.setdefault(job, set()).add(ts.date())
+        if outcome == "ok":
+            ok_dates.setdefault(job, set()).add(ts.date())
+        if job not in first_seen or ts < first_seen[job]:
+            first_seen[job] = ts
+        prev = latest.get(job)
         if prev is None or ts > prev[0]:
-            by_job[job] = (ts, str(r.get("outcome", "")).lower())
+            latest[job] = (ts, outcome)
 
     for job, cfg in sorted(jobs.items()):
+        grace = int(cfg.get("grace_minutes", 90))
         due = previous_expected_run(
-            now, cfg.get("start_time", ""), cfg.get("days") or [],
-            int(cfg.get("grace_minutes", 90)))
+            now, cfg.get("start_time", ""), cfg.get("days") or [], grace)
         if due is None:
             continue
-        seen = by_job.get(job)
-        if seen is None:
+        if job not in latest:
             out.append(f"NO RUN RECORDED: '{job}' has never stamped the ledger; "
                        f"expected one by {due:%Y-%m-%d %H:%M}.")
             continue
-        ts, outcome = seen
-        if ts < due:
-            out.append(f"MISSED RUN: '{job}' last succeeded {ts:%Y-%m-%d %H:%M}, "
-                       f"but was due by {due:%Y-%m-%d %H:%M}.")
-        elif outcome != "ok":
-            out.append(f"RUN FAILED: '{job}' last finished {ts:%Y-%m-%d %H:%M} "
-                       f"with outcome '{outcome}'.")
+        # A job cannot have missed a day before it existed. Without this the
+        # week the ledger itself was introduced reads as seven missed runs, and
+        # so does any newly added job — noise that would train the reader to
+        # ignore the whole block.
+        begin = first_seen[job].date()
+        occs = [o for o in expected_occurrences(
+            now, cfg.get("start_time", ""), cfg.get("days") or [], grace)
+            if o.date() >= begin]
+        seen_ok, seen_any = ok_dates.get(job, set()), any_dates.get(job, set())
+        # A day that HAS a ledger row but no successful one is a failure, not
+        # an absence. Different cause, different fix, different message.
+        gaps = [o for o in occs if o.date() not in seen_ok and o.date() not in seen_any]
+        fails = [o for o in occs if o.date() not in seen_ok and o.date() in seen_any]
+        if gaps:
+            shown = ", ".join(f"{g:%Y-%m-%d}" for g in gaps[-3:])
+            more = f" (+{len(gaps) - 3} earlier)" if len(gaps) > 3 else ""
+            out.append(f"MISSED RUN: '{job}' had no run at all on {shown}{more} "
+                       f"(due {gaps[-1]:%H:%M}).")
+        for f in fails[-2:]:
+            _, outcome = latest[job]
+            out.append(f"RUN FAILED: '{job}' ran on {f:%Y-%m-%d} but did not "
+                       f"succeed (latest outcome '{outcome}').")
     return out
 
 

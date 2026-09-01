@@ -92,6 +92,15 @@ try {
     $psi.CreateNoWindow = $true
     $psi.WindowStyle = "Hidden"
     $psi.EnvironmentVariables["SCALE_SENSITIVITY"] = "1"
+    # This is a research sweep, not a trading decision. Without this it wrote a
+    # rec-log entry at 18:00 that superseded the morning's — and the 02:00 US
+    # pass loads the LATEST entry, so the US legs would chase the evening plan
+    # instead of the approved morning one. Harmless so far only because every
+    # day has been a cadence-gated SKIP; on a RUN day the morning fills the ASX
+    # legs, which moves the cadence anchor to today, so the 18:00 run returns
+    # SKIP and the US legs are then refused at 02:00 — half a rebalance, with
+    # the anchor claiming it just rebalanced.
+    $psi.EnvironmentVariables["PORTOPT_NO_REC_LOG"] = "1"
     $proc = [System.Diagnostics.Process]::Start($psi)
 } catch {
     Write-Log "Engine launch threw: $($_.Exception.Message)"

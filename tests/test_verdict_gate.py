@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -145,3 +146,44 @@ def test_stamped_entry_round_trips_through_the_gate(tmp_path):
     assert ex._verdict_gate(skip, execute=True)[0] is False
     run = _write_rec(tmp_path, verdict="RUN")
     assert ex._verdict_gate(run, execute=True)[0] is True
+
+
+# --------------------------------------------------------------------------
+# A research sweep must not become the plan the US legs execute (2026-09-01)
+# --------------------------------------------------------------------------
+
+def test_evidence_run_suppresses_the_rec_log():
+    """The 02:00 US pass loads the LATEST rec-log entry, so the 18:00 evidence
+    sweep was silently becoming the plan those legs would chase instead of the
+    morning's approved one.
+
+    Never diverged in 39 days — every one was a cadence-gated SKIP. On a RUN
+    day it inverts: the morning fills the ASX legs, the 10:30 snapshot moves
+    last_position_change_date to today, so the 18:00 run sees 0 days since the
+    last fill and writes SKIP. At 02:00 the US legs load that SKIP and refuse —
+    ASX traded, US not, and the anchor now claims a fresh rebalance, so it will
+    not retry for six weeks.
+    """
+    src = (Path(__file__).resolve().parent.parent / "Portfolio_Optimiser.py").read_text(encoding="utf-8")
+    assert 'PORTOPT_NO_REC_LOG' in src, "the suppression flag must exist"
+    i = src.index("_no_rec_log = ")
+    block = src[i:i + 2600]
+    assert "if _no_rec_log:" in block and "else:" in block, \
+        "the append must be gated, not merely warned about"
+    # The guard has to sit BEFORE the append, or it logs anyway.
+    assert block.index("if _no_rec_log:") < block.index("append_trade_recommendation_log"), \
+        "the flag is checked after the write — it would suppress nothing"
+
+
+def test_the_evidence_wrapper_actually_sets_the_flag():
+    """The engine-side guard is inert unless evidence_run.ps1 sets it."""
+    ps1 = (Path(__file__).resolve().parent.parent / "evidence_run.ps1").read_text(encoding="utf-8")
+    assert 'PORTOPT_NO_REC_LOG' in ps1 and '"1"' in ps1
+    assert "SCALE_SENSITIVITY" in ps1, "and must still run the sweep it exists for"
+
+
+def test_daily_auto_does_not_set_it():
+    """The morning run is the one whose plan the pipeline executes — it must
+    keep logging, or the US pass has nothing to load at all."""
+    ps1 = (Path(__file__).resolve().parent.parent / "daily_auto.ps1").read_text(encoding="utf-8")
+    assert "PORTOPT_NO_REC_LOG" not in ps1
