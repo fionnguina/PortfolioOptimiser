@@ -114,6 +114,64 @@ RUNTIME_STATE = {
 }
 
 
+LOG_ARCHIVE_DIRNAME = "logs/engine_runs"
+LOG_ARCHIVE_KEEP = 120
+
+
+def _preserve_run_logs(root: Path) -> int:
+    """Move dist/run*.log somewhere a rebuild will not delete. Returns count.
+
+    Main._setup_logging writes the engine's timestamped log beside the
+    executable — i.e. into dist/ — and this script then deletes dist/ wholesale
+    on every build. So rebuilding destroys the evidence trail for every run
+    since the last build, which is exactly when you most want it: twice now a
+    post-run review has lost the engine-side log to a rebuild started minutes
+    afterwards (2026-08-19, and again 2026-09-01).
+
+    Moving them out is the conservative fix. Redirecting the engine's log
+    elsewhere would be tidier but daily_auto.ps1 reports `dist\\run.log` as the
+    run's log path and scans the timestamped file by name, so the writer stays
+    put and the archive happens here.
+    """
+    import datetime  # module-local, matching _write_version_file's style
+
+    src = root / "dist"
+    if not src.is_dir():
+        return 0
+    dest = root / LOG_ARCHIVE_DIRNAME
+    moved = 0
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for p in sorted(src.glob("run*.log")):
+            target = dest / p.name
+            # run.log is overwritten every run, so several builds would collide
+            # on the same name. Keep the newest under a suffixed name rather
+            # than silently dropping either.
+            if target.exists():
+                stamp = datetime.datetime.fromtimestamp(
+                    p.stat().st_mtime).strftime("%Y-%m-%d_%H-%M-%S")
+                target = dest / f"{p.stem}.{stamp}{p.suffix}"
+            try:
+                shutil.move(str(p), str(target))
+                moved += 1
+            except Exception:
+                pass
+        # Bounded, or an archive of an archive grows without limit.
+        keep = sorted(dest.glob("run*.log"), key=lambda q: q.stat().st_mtime,
+                      reverse=True)
+        for old in keep[LOG_ARCHIVE_KEEP:]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[build] could not preserve run logs ({type(e).__name__}: {e})")
+        return moved
+    if moved:
+        print(f"[build] preserved {moved} engine run log(s) -> {LOG_ARCHIVE_DIRNAME}/")
+    return moved
+
+
 def _write_version_file(root: Path) -> tuple[str, str]:
     """Write _version.py with git SHA + build timestamp. Returns (sha, ts)."""
     import datetime
@@ -180,6 +238,9 @@ def build():
     print(f"[build] version stamp: GIT_SHA={sha}, BUILD_TIME={ts}")
 
     _free_dist_exe(root)
+
+    # Rescue the engine's run logs BEFORE dist/ is deleted below.
+    _preserve_run_logs(root)
 
     # Clean old artefacts
     for p in [root / "build", root / "dist", root / f"{PROJECT_NAME}.spec"]:
