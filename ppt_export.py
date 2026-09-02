@@ -638,6 +638,16 @@ def export_to_ppt(results, trades, charts=None):
         # smoothed into a straight line that implies data we do not have.
         # Interpolation is time-weighted and touches the PLOT only — nothing
         # stored, and the return table below still reads the raw series.
+        # Capture WHICH days before filling them — a bare count cannot be
+        # reconciled after the fact. Twice the reported number differed by one
+        # from what the missing broker snapshots explain (6 known holes vs a
+        # count of 7 on 08-27 and again on 09-02), and it could not be
+        # reproduced outside the engine: same window, same 67 rows, same
+        # universe, same snapshot timing all give 6. The likely culprit is a
+        # NaN in the engine's own processed panel — compute_nav_from_statement
+        # ends with nav.dropna(), so one missing price drops a whole date from
+        # the series — but naming the dates settles it instead of inferring it.
+        _gap_days = list(_nav_in_window.index[_nav_in_window.isna()])
         _nav_in_window, _bridged = bridge_short_gaps(
             _nav_in_window, NAV_GAP_BRIDGE_DAYS)
         if _bridged:
@@ -649,8 +659,11 @@ def export_to_ppt(results, trades, charts=None):
             _lv = _nav_in_window.last_valid_index()
             _left = (int(_nav_in_window.loc[_fv:_lv].isna().sum())
                      if _fv is not None and _lv is not None else 0)
+            _filled = [d for d in _gap_days
+                       if d >= _fv and d <= _lv] if (_fv is not None and _lv is not None) else _gap_days
             print(f"[chart] actual-NAV: bridged {_bridged} missing day(s) in "
-                  f"the plot"
+                  f"the plot ({', '.join(d.strftime('%Y-%m-%d') for d in _filled[:10])}"
+                  f"{' ...' if len(_filled) > 10 else ''})"
                   + (f"; {_left} left as visible gaps (outage > "
                      f"{NAV_GAP_BRIDGE_DAYS}d)" if _left else ""))
         _first_valid_nav = _nav_in_window.first_valid_index()
