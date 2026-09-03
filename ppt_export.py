@@ -95,9 +95,18 @@ def bridge_short_gaps(series, max_days: int = NAV_GAP_BRIDGE_DAYS):
     fillable = na & (run <= int(max_days))
     if not fillable.any():
         return series, 0
-    return (series.where(~fillable,
-                         series.interpolate(method="time", limit_area="inside")),
-            int(fillable.sum()))
+    out = series.where(~fillable,
+                       series.interpolate(method="time", limit_area="inside"))
+    # Count what was ACTUALLY filled, not what we hoped to fill. `fillable`
+    # includes short NaN runs at the head or tail, but limit_area="inside"
+    # rightly refuses those — so counting `fillable` over-reported by one on
+    # every 10:20 run, where the series ends at yesterday's broker snapshot
+    # while the panel already has today's row. That one-day trailing gap is
+    # why the count read 7 against six explicable days on 08-27 and 09-02, and
+    # why it never reproduced at midday or in the evening: by then the
+    # snapshot exists and the trailing NaN is gone. The chart was always
+    # right; only the number was wrong.
+    return out, int((na & out.notna()).sum())
 
 
 def export_to_ppt(results, trades, charts=None):

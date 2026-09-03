@@ -262,3 +262,53 @@ def test_the_slide_rebases_all_three_series_together():
     assert "rebase_to(bench, _chart_origin)" in src, "benchmarks must share it"
     assert "rebase_to(tilted_curve, _chart_origin)" in src, "strategy must share it"
     assert "_chart_origin = _first_valid_nav" in src, "and it is the NAV's own origin"
+
+
+def test_a_trailing_gap_is_not_counted_as_bridged():
+    """THE 08-27 / 09-02 miscount. `fillable` includes short NaN runs at the
+    head or tail, but limit_area="inside" rightly refuses those — so counting
+    intent rather than effect over-reported by one on every 10:20 run, where
+    the series ends at yesterday's broker snapshot while the panel already has
+    today's row. It never reproduced at midday or in the evening because by
+    then the snapshot exists and the trailing NaN is gone."""
+    import numpy as np
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-06-24", "2026-07-20")
+    s = pd.Series(np.arange(len(idx), dtype=float), index=idx)
+    s.loc[pd.Timestamp("2026-07-09")] = np.nan      # interior, fillable
+    s.iloc[-1] = np.nan                              # trailing, must NOT count
+
+    out, n = P.bridge_short_gaps(s, 3)
+    assert n == 1, f"only the interior gap was filled, got {n}"
+    assert pd.isna(out.iloc[-1]), "the trailing day must stay empty"
+    assert not pd.isna(out.loc[pd.Timestamp("2026-07-09")])
+
+
+def test_a_leading_gap_is_not_counted_either():
+    import numpy as np
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-06-24", "2026-07-20")
+    s = pd.Series(np.arange(len(idx), dtype=float), index=idx)
+    s.iloc[0] = np.nan
+    out, n = P.bridge_short_gaps(s, 3)
+    assert n == 0 and pd.isna(out.iloc[0])
+
+
+def test_the_count_always_matches_what_was_filled():
+    """The count and the named days are printed together — they must agree by
+    construction, or the log invites exactly the investigation this came from."""
+    import numpy as np
+    import ppt_export as P
+
+    idx = pd.bdate_range("2026-06-01", "2026-08-31")
+    s = pd.Series(np.arange(len(idx), dtype=float), index=idx)
+    for d in ("2026-06-10", "2026-07-09", "2026-07-10", "2026-08-13"):
+        s.loc[pd.Timestamp(d)] = np.nan
+    s.iloc[0] = np.nan
+    s.iloc[-1] = np.nan
+
+    before = s.isna()
+    out, n = P.bridge_short_gaps(s, 3)
+    assert n == int((before & out.notna()).sum()) == 4
