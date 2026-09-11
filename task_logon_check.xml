@@ -1,0 +1,87 @@
+<?xml version="1.0"?>
+<!--
+  Portfolio Optimiser Logon Check — the alarm that survives a missed day.
+
+  WHY THIS EXISTS (2026-09-11)
+  All three scheduled tasks run with LogonType=InteractiveToken, because the
+  engine drives Excel and PowerPoint over COM and that needs a desktop session.
+  The consequence bit on 2026-09-10: Windows force-restarted for an OS upgrade
+  at 19:33 the previous evening, nobody signed back in, and Task Scheduler
+  logged event 332 ("not logged on") for all three. Four runs never happened.
+  Because the ops_assertions check ran only INSIDE those jobs, the miss-detector
+  died with the thing it polices — the gap surfaced two days later only because
+  a human went looking.
+
+  Adding that check to evidence_run narrowed the window to same-day. This closes
+  it: the check runs on the next LOGON, whenever that is, so a machine that sat
+  at the login screen for a week still reports the moment someone returns.
+
+  It cannot spam. ops_assertions dedupes on a hash of the finding SET (12h
+  window); a changed set always mails. So logging in three times a day costs at
+  most one mail, and only when something is actually wrong.
+
+  DELIBERATELY NOT in ops_expected.json's "jobs" block: a logon task has no
+  schedule to be late against, and declaring one would make the heartbeat
+  demand a daily login. It IS declared under "scheduled_tasks" so its absence,
+  its trigger type and its quoted command line are all asserted.
+
+  REGISTER (per reference_windows_task_admin: always /XML, never flag-based
+  /Create, which silently defaults WakeToRun=False):
+      Register-ScheduledTask -TaskName "Portfolio Optimiser Logon Check" `
+          -Xml (Get-Content -Raw "task_logon_check.xml") -Force
+
+  The quoted argument path is load-bearing: this home directory contains a
+  space, and an unquoted -File path is what made the US Session task die at
+  0xFFFD0000 for two days in 2026-08 while passing every time/day check.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Runs ops_assertions --check on logon, so a day when no scheduled job ran at all still reports itself. Read-only: places no orders, runs no engine.</Description>
+    <URI>\Portfolio Optimiser Logon Check</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>LAPTOP-SJ0J93HG\Fionn Guina</UserId>
+      <!-- Let the desktop and network settle; the check may need to send mail. -->
+      <Delay>PT3M</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-3724473535-243170090-1268091772-1001</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <!-- LeastPrivilege is enough: this reads task state and the run ledger,
+           then mails. Unlike the Daily task it never touches Excel COM. -->
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <!-- Irrelevant for a logon trigger (there is no missed start to catch up
+         on) and WakeToRun likewise: logging on means the machine is awake. -->
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Users\Fionn Guina\Portfolio_Optimiser\.venv\Scripts\python.exe</Command>
+      <Arguments>"C:\Users\Fionn Guina\Portfolio_Optimiser\ops_assertions.py" --check --email</Arguments>
+      <WorkingDirectory>C:\Users\Fionn Guina\Portfolio_Optimiser</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

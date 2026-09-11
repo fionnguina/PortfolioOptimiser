@@ -3,7 +3,7 @@
     "Declared INTENT for the live pipeline. ops_assertions.py --check compares",
     "the running system against this file and reports every disagreement.",
     "This file is the source of truth: if reality is right and this is wrong,",
-    "change this file deliberately \u2014 do not let the two silently diverge,",
+    "change this file deliberately — do not let the two silently diverge,",
     "which is the exact failure it exists to catch."
   ],
   "scheduled_tasks": {
@@ -46,6 +46,13 @@
       "must_be_enabled": true,
       "action_contains": "\"C:\\Users\\Fionn Guina\\Portfolio_Optimiser\\us_session_run.ps1\"",
       "_why_action": "The QUOTES are the assertion. Registered unquoted on 2026-08-10, this task fired at 02:00 for two days and died at 0xFFFD0000 before logging, because the home directory contains a space."
+    },
+    "Portfolio Optimiser Logon Check": {
+      "_why": "The alarm that survives a missed day. All three jobs need an interactive session (Excel/PowerPoint COM), so when nobody signed in after the 2026-09-09 OS-upgrade reboot, Task Scheduler event 332 killed all of them on 2026-09-10 - including daily_auto, which is where the miss-detector lived. This one fires on the next LOGON instead of a clock, so a machine left at the login screen still reports itself the moment someone returns.",
+      "trigger_type": "Logon",
+      "must_be_enabled": true,
+      "action_contains": "\"C:\\Users\\Fionn Guina\\Portfolio_Optimiser\\ops_assertions.py\" --check --email",
+      "_why_no_job_entry": "Deliberately absent from 'jobs': a logon task has no schedule to be late against, so a heartbeat entry would demand a daily login to stay green."
     }
   },
   "jobs": {

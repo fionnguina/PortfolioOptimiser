@@ -79,6 +79,15 @@ def check_task_schedule(actual: dict, expected: dict) -> list:
         if want_a and want_a not in got_a:
             out.append(f"TASK ACTION: '{name}' command line does not contain "
                        f"{want_a!r} — got {got_a!r}.")
+        # Trigger kind. Only asserted when declared, so the three clock-driven
+        # tasks are unaffected. The Logon Check has no start_time or days to
+        # compare, and firing on logon instead of a clock is the entire point
+        # of it, so that is the property worth pinning.
+        want_tt = str(want.get("trigger_type", "")).strip()
+        got_tt = str(got.get("trigger", "") or "").strip()
+        if want_tt and got_tt != want_tt:
+            out.append(f"TASK TRIGGER: '{name}' fires on {got_tt or '?'}, "
+                       f"expected {want_tt}.")
     return out
 
 
@@ -359,7 +368,14 @@ def observe_scheduled_tasks(names: list) -> dict:
         "for($i=0;$i -lt 7;$i++){ if ((([int]$tr.DaysOfWeek) -band [math]::Pow(2,$i)) -ne 0){ $m+=$names2[$i] } } $dow=$m }; "
         "$ac = $t.Actions[0]; "
         "$cmd = if ($ac) { (''+$ac.Execute+' '+$ac.Arguments).Trim() } else { '' }; "
-        "$out[$n]=@{ start_time=$hm; enabled=[bool]$t.Settings.Enabled; days=$dow; action=$cmd } } }; "
+        # Trigger KIND, normalised: MSFT_TaskLogonTrigger -> 'Logon'. A logon
+        # task has no start_time or days to assert, so without this the only
+        # thing that makes it useful — firing on logon rather than a clock —
+        # could be changed and every other check would still pass.
+        "$tt = if ($tr) { ([string]$tr.CimClass.CimClassName) -replace "
+        "'^MSFT_Task','' -replace 'Trigger$','' } else { '' }; "
+        "$out[$n]=@{ start_time=$hm; enabled=[bool]$t.Settings.Enabled; days=$dow; "
+        "action=$cmd; trigger=$tt } } }; "
         "$out | ConvertTo-Json -Depth 5 -Compress"
     )
     try:

@@ -445,3 +445,59 @@ def test_unreadable_timestamp_fails_loud(tmp_path, monkeypatch):
         '{"key": "%s", "sent_at": "not-a-date"}' % ops._findings_key(findings),
         encoding="utf-8")
     assert ops._should_email(findings)
+
+
+# === logon-triggered check task (2026-09-11) ==================================
+# A logon task has no start_time and no days, so every existing assertion is
+# silent on it. Firing on logon rather than a clock is the whole reason it
+# exists, so that is the property worth pinning.
+
+def test_logon_task_with_no_clock_fields_is_clean():
+    actual = {"Logon Check": {"start_time": "", "enabled": True, "days": None,
+                              "action": 'py "x/ops_assertions.py" --check --email',
+                              "trigger": "Logon"}}
+    expected = {"Logon Check": {"trigger_type": "Logon", "must_be_enabled": True,
+                                "action_contains": '"x/ops_assertions.py" --check'}}
+    assert ops.check_task_schedule(actual, expected) == []
+
+
+def test_trigger_type_change_is_caught():
+    """Re-pointing it at a clock would silently undo the fix."""
+    actual = {"Logon Check": {"start_time": "10:20", "enabled": True, "days": None,
+                              "action": "py x", "trigger": "Weekly"}}
+    expected = {"Logon Check": {"trigger_type": "Logon", "must_be_enabled": True}}
+    f = ops.check_task_schedule(actual, expected)
+    assert len(f) == 1 and "TASK TRIGGER" in f[0] and "Weekly" in f[0]
+
+
+def test_trigger_type_unasserted_when_not_declared():
+    """The three clock tasks declare no trigger_type and must stay unaffected."""
+    actual = {"Daily": {"start_time": "10:20", "enabled": True,
+                        "days": ["Monday"], "action": "py x", "trigger": "Weekly"}}
+    expected = {"Daily": {"start_time": "10:20", "days": ["Monday"],
+                          "must_be_enabled": True}}
+    assert ops.check_task_schedule(actual, expected) == []
+
+
+def test_missing_logon_task_is_reported():
+    expected = {"Logon Check": {"trigger_type": "Logon", "must_be_enabled": True}}
+    f = ops.check_task_schedule({}, expected)
+    assert len(f) == 1 and "TASK MISSING" in f[0]
+
+
+def test_shipped_expectations_declare_the_logon_task_outside_jobs():
+    """Guards the real ops_expected.json, not a fixture.
+
+    A 'jobs' entry would make the heartbeat demand a daily login to stay green.
+    """
+    import json
+    from pathlib import Path
+    cfg = json.loads((Path(__file__).resolve().parent.parent
+                      / "ops_expected.json").read_text(encoding="utf-8"))
+    task = cfg["scheduled_tasks"]["Portfolio Optimiser Logon Check"]
+    assert task["trigger_type"] == "Logon"
+    assert task["must_be_enabled"] is True
+    assert "ops_assertions.py" in task["action_contains"]
+    assert task["action_contains"].startswith('"'), "path must be quoted"
+    assert "Portfolio Optimiser Logon Check" not in cfg["jobs"]
+    assert "logon" not in " ".join(cfg["jobs"]).lower()
