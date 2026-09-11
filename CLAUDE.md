@@ -17,7 +17,7 @@ wholesale-only, AFSL pending). Regime-adaptive 5-slot ensemble (Modest→Stretch
   state files that churn every run are excluded (`build_helper.RUNTIME_STATE`), and the
   offending files are listed by name at build time.
 - Syntax check after edits: `./.venv/Scripts/python.exe -m py_compile Portfolio_Optimiser.py cgt.py`
-- Tests: `./.venv/Scripts/python.exe -m pytest tests/` (469 tests).
+- Tests: `./.venv/Scripts/python.exe -m pytest tests/` (668 tests).
 
 ## File map
 - `Portfolio_Optimiser.py` — the monolith (~16k lines). Config constants ~400-700,
