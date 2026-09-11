@@ -4,9 +4,13 @@ Extracted from Portfolio_Optimiser.py for testability + module-split prep.
 Three layers of drift detection:
 
   v1  Recommendation log    written by jsonl_logs.append_trade_recommendation_log
-  v2  Fill comparison       compute_fill_drift joins fills_df (from Excel
-                             Actual_Fills sheet) against the rec log,
-                             computes slippage_bps + fee_delta + adherence.
+  v2  Fill comparison       compute_fill_drift joins fills_df against the rec
+                             log, computing slippage_bps + fee_delta +
+                             adherence. Fills come from the BROKER STATEMENT
+                             (ibkr_statement.fills_aud), the only source
+                             carrying a real fill price — the Actual_Fills
+                             sheet mirrors submit-time state and is the
+                             fallback (2026-09-11).
   v3  Monthly NAV drift     compute_monthly_nav_drift compares live NAV
                              month-over-month vs OOS-expected returns.
 
@@ -35,6 +39,13 @@ DRIFT_CUMULATIVE_THRESH    = 0.05   # warn if |cumulative drift|    > 5%
 DRIFT_DD_ALERT_THRESH      = -0.10  # warn if live MaxDD            < -10%
 DRIFT_SLIPPAGE_BPS_THRESH  = 25.0   # warn if |slippage|            > 25 bps
 DRIFT_FEE_MULTIPLIER       = 2.0    # warn if actual fees           > 2x expected
+# Per-fill slippage/fee warnings fire only for fills this recent. Before fills
+# came from the broker statement the frame was empty and this never mattered;
+# with 51 real fills reaching back to the fund's founding, a per-fill warning
+# printed 33 [drift][WARN] lines EVERY run about trades weeks past changing —
+# which is how a channel stops being read. Recent fills are actionable and get
+# individual warnings; the history is summarised in one informational line.
+DRIFT_FILL_WARN_DAYS       = 7
 
 
 def _match_fill_to_recommendation(fill_row: pd.Series, recs: list[dict]) -> dict | None:
@@ -70,6 +81,24 @@ def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
     if fills_df is None or fills_df.empty:
         return pd.DataFrame()
     recs = _load_recommendation_log(log_path)
+    # Adherence is undefined before there was anything to adhere to. The
+    # broker statement reaches back a rolling 365 days, far earlier than the
+    # rec log, and _match_fill_to_recommendation has no lower bound — so every
+    # pre-rec-log fill would come back Recommended=False and the warning would
+    # report the fund's own founding trades as a wall of non-adherence.
+    if recs:
+        try:
+            earliest = min(pd.Timestamp(r["run_at"]) for r in recs if r.get("run_at"))
+            n_before = int((pd.to_datetime(fills_df["Fill Date"]) < earliest).sum())
+            if n_before:
+                fills_df = fills_df[pd.to_datetime(fills_df["Fill Date"]) >= earliest]
+                print(f"[drift] {n_before} fill(s) predate the recommendation log "
+                      f"({earliest.date()}) — excluded from adherence, which has "
+                      f"no opinion on trades made before it existed.")
+            if fills_df.empty:
+                return pd.DataFrame()
+        except (ValueError, TypeError, KeyError):
+            pass                          # no usable timestamps — join them all
 
     def _num(v):
         """float(v) or None — treats NaN and non-numeric as missing so an
@@ -283,14 +312,52 @@ def compute_monthly_nav_drift(
     return df
 
 
+def _summarise_historical_fills(df: pd.DataFrame) -> None:
+    """One informational line for fills too old to act on, split by venue.
+
+    ASX legs fill in the same session the plan was priced in; US legs are
+    priced from an AU-morning bar and fill at the US open hours later, so their
+    slippage is dominated by the overnight gap rather than execution quality.
+    Averaging the two together hides exactly the thing --reprice-to-targets
+    exists to address, so they are reported apart.
+    """
+    slip = pd.to_numeric(df.get("Slippage (bps)"), errors="coerce")
+    ok = slip.notna()
+    if not ok.any():
+        return
+    venue = df.loc[ok, "Ticker"].astype(str).map(
+        lambda t: "ASX" if t.endswith(".AX") else "US")
+    parts = []
+    for v, g in slip[ok].groupby(venue):
+        parts.append(f"{v} n={len(g)} median {g.median():+.1f}bps "
+                     f"worst {g.abs().max():.0f}bps")
+    print(f"[drift] historical slippage (older than {DRIFT_FILL_WARN_DAYS}d, "
+          f"informational): " + "; ".join(parts))
+
+
 def _print_drift_warnings(
     fills_drift_df: pd.DataFrame,
     nav_drift_df: pd.DataFrame,
     live_dd: float,
+    now=None,
 ) -> int:
     """Print warnings on threshold breaches. Returns count of warnings issued."""
     n_warn = 0
+    all_fills = fills_drift_df
     # Slippage / fee warnings per fill
+    if fills_drift_df is not None and not fills_drift_df.empty:
+        # Split recent (actionable -> warn per fill) from historical
+        # (summarised). See DRIFT_FILL_WARN_DAYS.
+        try:
+            _now = pd.Timestamp(now) if now is not None else pd.Timestamp.now()
+            _cut = _now - pd.Timedelta(days=DRIFT_FILL_WARN_DAYS)
+            _fd = pd.to_datetime(fills_drift_df["Fill Date"], errors="coerce")
+            _recent = _fd >= _cut
+            if not _recent.all():
+                _summarise_historical_fills(fills_drift_df[~_recent])
+            fills_drift_df = fills_drift_df[_recent]
+        except Exception:
+            pass                          # unparseable dates — warn on them all
     if fills_drift_df is not None and not fills_drift_df.empty:
         slip = pd.to_numeric(fills_drift_df.get("Slippage (bps)"), errors="coerce")
         fee_delta = pd.to_numeric(fills_drift_df.get("Fee Delta (AUD)"), errors="coerce")
@@ -310,8 +377,12 @@ def _print_drift_warnings(
                   f"fees {r['Fees Actual (AUD)']:.2f} > {DRIFT_FEE_MULTIPLIER:.0f}x expected "
                   f"({r['Fee Expected (AUD)']:.2f})")
             n_warn += 1
-        # Non-adherent fills (recommendation missing)
-        non_adherent = fills_drift_df[fills_drift_df["Recommended"] == False]
+    # Non-adherent fills (recommendation missing). Judged over ALL history, not
+    # just the recent window — a fill that never had a recommendation is a
+    # governance fact that does not stop mattering after seven days. Already a
+    # single summary line, so it cannot spam the way per-fill slippage did.
+    if all_fills is not None and not all_fills.empty:
+        non_adherent = all_fills[all_fills["Recommended"] == False]
         if not non_adherent.empty:
             print(f"[drift][WARN] {len(non_adherent)} fill(s) had NO matching "
                   f"recommendation in the log "

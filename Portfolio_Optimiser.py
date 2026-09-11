@@ -8100,7 +8100,32 @@ if USE_XLWINGS:
                     _nav_src = "live_nav_history (fallback)"
                 _live_dd = compute_live_max_drawdown(_live_nav)
                 _ensure_actual_fills_sheet(wb)
-                _fills_df = _read_actual_fills(wb)
+                # Fills come from the STATEMENT, not the Actual_Fills sheet.
+                # The sheet mirrors ibkr_fills_log.jsonl — script-side state at
+                # submit time — and on this account IBKR leaves qty_filled=0
+                # with Avg Fill Px blank, so slippage was permanently None and
+                # adherence permanently 0/0. The statement is the only source
+                # carrying the price a fill actually happened at (2026-09-11).
+                # The sheet remains the fallback: no statement, no network, or
+                # a parse failure must not blind the tracker entirely.
+                _fills_df = pd.DataFrame()
+                _fills_src = "Actual_Fills sheet (no statement)"
+                try:
+                    import ibkr_statement as _stmt_f
+                    _fp = _stmt_f.resolve_statement_path(APP_DIR)
+                    _fills_df = _stmt_f.fills_aud(
+                        _stmt_f.parse_trades(_fp),
+                        fx_usdaud=globals().get("fx_usdaud"),
+                        flat_rates=_stmt_f.fx_to_base(_fp),
+                        stmt_fx=_stmt_f.fx_from_statement(_fp))
+                    if not _fills_df.empty:
+                        _fills_src = f"broker statement ({Path(_fp).name})"
+                except Exception as _e_sf:
+                    print(f"[drift] statement fills unavailable ({_e_sf}); "
+                          f"falling back to the Actual_Fills sheet.")
+                if _fills_df.empty:
+                    _fills_df = _read_actual_fills(wb)
+                print(f"[drift] fill source: {_fills_src} — {len(_fills_df)} fill(s)")
                 _fills_drift = compute_fill_drift(_fills_df, _drift_log_path)
                 _oos_ret = globals().get("oos_returns_daily", pd.Series(dtype=float))
                 # Net out the simulated FY tax so drift measures PERFORMANCE.

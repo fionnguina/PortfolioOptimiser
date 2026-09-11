@@ -399,6 +399,46 @@ def to_aud(lots: pd.DataFrame, fx_usdaud=None, flat_rates: dict | None = None,
     return df
 
 
+def fills_aud(trades: pd.DataFrame, fx_usdaud=None,
+              flat_rates: dict | None = None, stmt_fx=None) -> pd.DataFrame:
+    """Executed fills in the drift tracker's schema, from BROKER TRUTH.
+
+    Columns: Fill Date | Ticker | Units (signed) | Px AUD | Fees AUD | Qty Confirmed
+
+    The Actual_Fills sheet is script-side state written at submit time, and on
+    this account IBKR leaves qty_filled=0 with Avg Fill Px blank — so slippage
+    could never be computed from it and fill adherence read 0/0 for its whole
+    life. The statement is the only place the REAL fill price exists.
+
+    Prices and commissions are translated at each trade's own date rate, like
+    `to_aud` does for a cost base: a USD fill compared against an AUD
+    recommendation at today's rate would book the FX move as slippage.
+
+    Rows whose currency has no rate are dropped rather than priced at zero —
+    a zero price reads as -100% slippage, which is worse than a missing row.
+    """
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    df = trades.copy()
+    rate = _fx_rate_fn(fx_usdaud, flat_rates, stmt_fx)
+    fx = df.apply(lambda r: rate(r.get("Currency"), r.get("DateTime")), axis=1)
+    keep = fx > 0
+    if not keep.any():
+        return pd.DataFrame()
+    df, fx = df.loc[keep], fx[keep]
+    out = pd.DataFrame(index=df.index)
+    out["Fill Date"] = pd.to_datetime(df["DateTime"])
+    out["Ticker"] = df["Security"].astype(str).str.strip()
+    out["Units"] = pd.to_numeric(df["Units"], errors="coerce")
+    out["Px AUD"] = pd.to_numeric(df["PriceLocal"], errors="coerce") * fx
+    # IBKR signs Comm/Fee negative (money out); the drift join wants a cost.
+    out["Fees AUD"] = -pd.to_numeric(df["CommLocal"], errors="coerce").fillna(0.0) * fx
+    out["Qty Confirmed"] = True          # the broker's own record of the fill
+    out = out.dropna(subset=["Fill Date", "Ticker", "Units", "Px AUD"])
+    out = out[(out["Units"] != 0) & (out["Px AUD"] > 0)]
+    return out.sort_values("Fill Date").reset_index(drop=True)
+
+
 def commissions_aud(trades: pd.DataFrame, fx_usdaud=None,
                     flat_rates: dict | None = None, stmt_fx=None) -> pd.Series:
     """Commission ACTUALLY PAID, summed per trade date, in AUD.

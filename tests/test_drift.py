@@ -303,3 +303,135 @@ def test_full_months_still_warn_normally():
                 if abs(float(r["Drift"])) > D.DRIFT_MONTHLY_THRESH
                 and not bool(r["Partial"])]
     assert breaches, "a fully-covered month over threshold must still be warnable"
+
+
+# === slippage from the broker statement (2026-09-11) ==========================
+# Fills used to come from the Actual_Fills sheet, which mirrors submit-time
+# state: qty_filled=0 and no fill price on this account. Slippage was therefore
+# permanently None. The statement is the only source with a real fill price.
+
+def _rec_log(tmp_path, run_at="2026-07-06T09:31:00", px=100.0, units=10):
+    p = tmp_path / "rec.jsonl"
+    p.write_text(json.dumps({
+        "run_at": run_at,
+        "recommended_trades": [
+            {"ticker": "SMH", "side": "buy", "delta_units": units,
+             "px_aud": px, "brokerage_aud": 5.0},
+        ],
+    }) + "\n", encoding="utf-8")
+    return p
+
+
+def _stmt_trades():
+    import pandas as pd
+    return pd.DataFrame([
+        {"Security": "SMH", "DateTime": pd.Timestamp("2026-07-06 23:30:00"),
+         "Units": 10.0, "Currency": "USD", "PriceLocal": 70.0, "CommLocal": -1.0},
+        {"Security": "VLUE.AX", "DateTime": pd.Timestamp("2026-07-06 10:00:00"),
+         "Units": 100.0, "Currency": "AUD", "PriceLocal": 37.0, "CommLocal": -5.0},
+    ])
+
+
+def test_fills_aud_builds_the_drift_schema_in_aud():
+    import ibkr_statement as S
+    import drift as D
+    fx = pd.Series({pd.Timestamp("2026-07-06"): 1.50})
+    out = S.fills_aud(_stmt_trades(), fx_usdaud=fx)
+    assert set(out.columns) >= {"Fill Date", "Ticker", "Units", "Px AUD",
+                                "Fees AUD", "Qty Confirmed"}
+    smh = out[out["Ticker"] == "SMH"].iloc[0]
+    assert float(smh["Px AUD"]) == pytest.approx(70.0 * 1.50)   # trade-date rate
+    assert float(smh["Fees AUD"]) == pytest.approx(1.0 * 1.50)  # positive cost
+    assert bool(smh["Qty Confirmed"]) is True
+    aud = out[out["Ticker"] == "VLUE.AX"].iloc[0]
+    assert float(aud["Px AUD"]) == pytest.approx(37.0)          # AUD untouched
+
+
+def test_fills_aud_drops_zero_price_transfer_rows():
+    """The 2026-06-23 account restructure booked 9 sells at PriceLocal 0.0.
+
+    A zero price computes as -100% slippage, so these must drop rather than
+    be priced as if they were fills.
+    """
+    import ibkr_statement as S
+    import drift as D
+    tr = _stmt_trades()
+    tr.loc[len(tr)] = {"Security": "GOLD.AX",
+                       "DateTime": pd.Timestamp("2026-06-23 14:00:00"),
+                       "Units": -3259.0, "Currency": "AUD",
+                       "PriceLocal": 0.0, "CommLocal": 0.0}
+    out = S.fills_aud(tr, fx_usdaud=pd.Series({pd.Timestamp("2026-07-06"): 1.5}))
+    assert "GOLD.AX" not in set(out["Ticker"])
+    assert set(out["Ticker"]) == {"SMH", "VLUE.AX"}   # only the 0.0 row dropped
+
+
+def test_slippage_is_computed_from_the_statement_price(tmp_path):
+    import ibkr_statement as S
+    import drift as D
+    fx = pd.Series({pd.Timestamp("2026-07-06"): 1.50})
+    fills = S.fills_aud(_stmt_trades(), fx_usdaud=fx)
+    d = D.compute_fill_drift(fills, _rec_log(tmp_path, px=100.0))
+    smh = d[d["Ticker"] == "SMH"].iloc[0]
+    # Recommended at 100 AUD, filled at 105 AUD -> +500 bps, paid more on a buy.
+    assert float(smh["Slippage (bps)"]) == pytest.approx(500.0)
+    assert smh["Recommended"] is True or bool(smh["Recommended"])
+
+
+def test_fills_predating_the_rec_log_are_excluded(tmp_path, capsys):
+    """Adherence has no opinion on trades made before it existed."""
+    import ibkr_statement as S
+    import drift as D
+    fills = S.fills_aud(_stmt_trades(), fx_usdaud=pd.Series({pd.Timestamp("2026-07-06"): 1.5}))
+    # Rec log starts AFTER both fills.
+    d = D.compute_fill_drift(fills, _rec_log(tmp_path, run_at="2026-08-01T09:31:00"))
+    assert d.empty
+    assert "predate the recommendation log" in capsys.readouterr().out
+
+
+def test_historical_fills_are_summarised_not_warned(capsys):
+    """51 real fills would otherwise print a [drift][WARN] each, every run."""
+    import drift as D
+    old = pd.Timestamp.now() - pd.Timedelta(days=60)
+    d = pd.DataFrame([
+        {"Fill Date": old, "Ticker": "SMH", "Slippage (bps)": 780.0,
+         "Fees Actual (AUD)": 1.0, "Fee Expected (AUD)": 5.0,
+         "Fee Delta (AUD)": -4.0, "Recommended": True},
+        {"Fill Date": old, "Ticker": "VLUE.AX", "Slippage (bps)": 2.3,
+         "Fees Actual (AUD)": 5.0, "Fee Expected (AUD)": 5.0,
+         "Fee Delta (AUD)": 0.0, "Recommended": True},
+    ])
+    n = D._print_drift_warnings(d, pd.DataFrame(), -0.01)
+    out = capsys.readouterr().out
+    assert n == 0, "historical fills must not warn"
+    assert "historical slippage" in out
+    assert "[drift][WARN]" not in out
+    assert "ASX" in out and "US" in out          # venues reported apart
+
+
+def test_recent_fills_still_warn(capsys):
+    import drift as D
+    recent = pd.Timestamp.now() - pd.Timedelta(days=1)
+    d = pd.DataFrame([
+        {"Fill Date": recent, "Ticker": "SMH", "Slippage (bps)": 780.0,
+         "Fees Actual (AUD)": 1.0, "Fee Expected (AUD)": 5.0,
+         "Fee Delta (AUD)": -4.0, "Recommended": True},
+    ])
+    n = D._print_drift_warnings(d, pd.DataFrame(), -0.01)
+    assert n == 1
+    assert "slippage +780.0 bps" in capsys.readouterr().out
+
+
+def test_non_adherence_is_judged_over_all_history(capsys):
+    """A fill that never had a recommendation keeps mattering after 7 days."""
+    import drift as D
+    import drift as D
+    old = pd.Timestamp.now() - pd.Timedelta(days=60)
+    d = pd.DataFrame([
+        {"Fill Date": old, "Ticker": "MYSTERY.AX", "Slippage (bps)": None,
+         "Fees Actual (AUD)": None, "Fee Expected (AUD)": None,
+         "Fee Delta (AUD)": None, "Recommended": False},
+    ])
+    n = D._print_drift_warnings(d, pd.DataFrame(), -0.01)
+    out = capsys.readouterr().out
+    assert n == 1
+    assert "NO matching recommendation" in out and "MYSTERY.AX" in out
