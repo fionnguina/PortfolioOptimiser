@@ -374,6 +374,51 @@ def observe_scheduled_tasks(names: list) -> dict:
         return {}
 
 
+ALERT_STATE_FILENAME = "ops_alert_state.json"
+_ALERT_REPEAT_HOURS = 12
+
+
+def _findings_key(findings: list) -> str:
+    """Stable hash of a finding SET — order-independent, so a reshuffle of the
+    same problems is recognised as the same alert."""
+    h = hashlib.sha256()
+    for f in sorted(str(x) for x in findings):
+        h.update(f.encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _should_email(findings: list, now: datetime | None = None) -> bool:
+    """True unless this exact finding set was already mailed recently.
+
+    Two wrappers now run --check (daily_auto at 10:20, evidence_run at 18:00) so
+    a missed morning is caught the same day. Without this, a standing drift
+    would mail twice a day forever and train the reader to ignore the channel —
+    the failure the 2026-07-17 audit was about. A CHANGED finding set always
+    mails: new information is never suppressed.
+    """
+    now = now or datetime.now()
+    st = load_json(_SCRIPT_DIR / ALERT_STATE_FILENAME, {})
+    if st.get("key") != _findings_key(findings):
+        return True                       # different problem — always tell someone
+    try:
+        last = datetime.fromisoformat(str(st.get("sent_at")))
+    except (TypeError, ValueError):
+        return True                       # unreadable state — fail loud, not silent
+    return (now - last) >= timedelta(hours=_ALERT_REPEAT_HOURS)
+
+
+def _mark_emailed(findings: list, now: datetime | None = None) -> None:
+    try:
+        (_SCRIPT_DIR / ALERT_STATE_FILENAME).write_text(
+            json.dumps({"key": _findings_key(findings),
+                        "sent_at": (now or datetime.now()).isoformat(timespec="seconds"),
+                        "n_findings": len(findings)}, indent=2),
+            encoding="utf-8")
+    except Exception as e:                # never let bookkeeping break the check
+        print(f"[ops][WARN] could not record alert state ({e}).")
+
+
 def run_check(email: bool = False) -> int:
     cfg = load_json(_SCRIPT_DIR / EXPECTED_FILENAME, {})
     if not cfg:
@@ -412,7 +457,7 @@ def run_check(email: bool = False) -> int:
         print(f"  [!] {f}")
     print("=" * 78)
 
-    if email:
+    if email and _should_email(findings):
         try:
             from send_alert import send
             rc = send(f"[Portfolio Optimiser] OPS DRIFT: {len(findings)} "
@@ -420,8 +465,12 @@ def run_check(email: bool = False) -> int:
                       "The live pipeline does not match its declared "
                       "configuration:\n\n" + "\n".join(f"  - {f}" for f in findings))
             print(f"[ops] --email: sent (rc={rc}).")
+            _mark_emailed(findings)
         except Exception as e:
             print(f"[ops][WARN] --email failed ({e}).")
+    elif email:
+        print("[ops] --email: suppressed (same findings already mailed within "
+              f"{_ALERT_REPEAT_HOURS}h).")
     return 1
 
 

@@ -638,7 +638,16 @@ def compute_actual_nav_series_spliced(prices, fills_path, seed_path,
                   f"({context}; daily bars cannot match an intraday broker "
                   f"snapshot). Extending live NAV back to "
                   f"{recon.index.min().date()}.")
-    except Exception:
-        pass
+    except Exception as _e_val:
+        # Do NOT fall through to the "(validated)" label below. This block is
+        # the only thing standing between a broken reconstruction and a spliced
+        # NAV head the drift tracker treats as truth; if it threw, validation
+        # did not happen and saying otherwise is the same class of untruth as a
+        # health summary reporting OK for a deck that never landed (2026-09-11).
+        print(f"[nav][WARN] NAV reconstruction validation could not run "
+              f"({type(_e_val).__name__}: {_e_val}). Using BROKER-ONLY NAV "
+              f"rather than splicing an unvalidated head.")
+        globals()["LAST_NAV_SOURCE"] = "broker NetLiq only (validation errored)"
+        return broker
     globals()["LAST_NAV_SOURCE"] = "fills recon (validated) + broker NetLiq"
     return out

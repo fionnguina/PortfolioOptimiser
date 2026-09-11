@@ -346,18 +346,14 @@ def open_lots(trades: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out, columns=cols)
 
 
-def to_aud(lots: pd.DataFrame, fx_usdaud=None, flat_rates: dict | None = None,
-           stmt_fx=None) -> pd.DataFrame:
-    """Add CostBaseAUD, translating at each lot's ACQUISITION-date rate.
+def _fx_rate_fn(fx_usdaud=None, flat_rates: dict | None = None, stmt_fx=None):
+    """Return f(currency, when) -> AUD per 1 unit of `currency` on that date.
 
-    AU CGT translates a foreign cost base at the rate prevailing on the
-    acquisition date, not today's — the very thing that made the lot-book
-    reconciliation drift. `fx_usdaud` is a dated Series (preferred);
-    `flat_rates` is a {CCY: rate} fallback from the statement's own table.
+    `fx_usdaud` is a dated Series (preferred); `flat_rates` is a {CCY: rate}
+    fallback from the statement's own table. A return of 0.0 means "no rate
+    for this currency" — callers must DROP those rows, never treat the
+    conversion as free.
     """
-    if lots is None or lots.empty:
-        return lots
-    df = lots.copy()
     ser = None
     if fx_usdaud is not None and len(fx_usdaud):
         ser = pd.Series(fx_usdaud).copy()
@@ -371,21 +367,71 @@ def to_aud(lots: pd.DataFrame, fx_usdaud=None, flat_rates: dict | None = None,
         sf = sf[~sf.index.duplicated(keep="last")].sort_index()
         ser = sf if ser is None else sf.combine_first(ser).sort_index()
 
-    def rate(row):
-        if str(row["Currency"]).upper() == "AUD":
+    def rate(currency, when):
+        if str(currency).upper() == "AUD":
             return 1.0
         if ser is not None:
             try:
-                v = float(ser.asof(pd.Timestamp(row["AcqDate"]).tz_localize(None).normalize()))
+                v = float(ser.asof(pd.Timestamp(when).tz_localize(None).normalize()))
                 if v == v and v > 0:
                     return v
             except Exception:
                 pass
-        return float((flat_rates or {}).get(str(row["Currency"]).upper(), 0) or 0)
+        return float((flat_rates or {}).get(str(currency).upper(), 0) or 0)
 
-    df["FxAtAcq"] = df.apply(rate, axis=1)
+    return rate
+
+
+def to_aud(lots: pd.DataFrame, fx_usdaud=None, flat_rates: dict | None = None,
+           stmt_fx=None) -> pd.DataFrame:
+    """Add CostBaseAUD, translating at each lot's ACQUISITION-date rate.
+
+    AU CGT translates a foreign cost base at the rate prevailing on the
+    acquisition date, not today's — the very thing that made the lot-book
+    reconciliation drift.
+    """
+    if lots is None or lots.empty:
+        return lots
+    df = lots.copy()
+    rate = _fx_rate_fn(fx_usdaud, flat_rates, stmt_fx)
+    df["FxAtAcq"] = df.apply(lambda r: rate(r["Currency"], r["AcqDate"]), axis=1)
     df["CostBaseAUD"] = df["CostBaseLocal"] * df["FxAtAcq"]
     return df
+
+
+def commissions_aud(trades: pd.DataFrame, fx_usdaud=None,
+                    flat_rates: dict | None = None, stmt_fx=None) -> pd.Series:
+    """Commission ACTUALLY PAID, summed per trade date, in AUD.
+
+    Broker truth for "what has this book spent on brokerage" — the statement's
+    own Comm/Fee, translated at each trade's own date rate exactly as `to_aud`
+    translates a cost base, because a USD commission is not an AUD one.
+
+    IBKR signs Comm/Fee negative (money out); this returns a POSITIVE cost, so
+    a genuine rebate stays negative and correctly reduces the total. Trades in
+    a currency with no rate are dropped rather than counted at zero — silently
+    understating the bill is the failure this function exists to prevent.
+
+    Returns an empty Series when there are no trades, so a caller can tell
+    "nothing paid" from "no data".
+    """
+    if trades is None or trades.empty:
+        return pd.Series(dtype=float)
+    df = trades.copy()
+    rate = _fx_rate_fn(fx_usdaud, flat_rates, stmt_fx)
+    fx = df.apply(lambda r: rate(r.get("Currency"), r.get("DateTime")), axis=1)
+    keep = fx > 0
+    if not keep.any():
+        return pd.Series(dtype=float)
+    cost = -pd.to_numeric(df.loc[keep, "CommLocal"], errors="coerce").fillna(0.0)
+    idx = pd.to_datetime(df.loc[keep, "DateTime"])
+    try:
+        idx = idx.dt.tz_localize(None)
+    except TypeError:
+        pass                                   # already naive
+    out = (cost * fx[keep])
+    out.index = idx.dt.normalize()
+    return out.groupby(level=0).sum().sort_index()
 
 
 def build_lots(trades: pd.DataFrame, fx: dict | None = None) -> pd.DataFrame:

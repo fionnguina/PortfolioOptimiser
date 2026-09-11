@@ -385,3 +385,63 @@ def test_a_missing_exe_still_reports_missing(tmp_path):
     src = tmp_path / "engine.py"
     src.write_text("x", encoding="utf-8")
     assert "EXE MISSING" in ops.check_exe_freshness(tmp_path / "nope.exe", [src])[0]
+
+
+# === alert dedupe =============================================================
+# Two wrappers now run --check (daily_auto 10:20, evidence_run 18:00) so a
+# missed morning is caught the same day. That doubles the mail rate unless the
+# same finding set is suppressed — and a muted alarm is worse than no alarm.
+
+def _alert_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(ops, "_SCRIPT_DIR", tmp_path)
+    return tmp_path / ops.ALERT_STATE_FILENAME
+
+
+def test_first_alert_always_sends(tmp_path, monkeypatch):
+    _alert_env(tmp_path, monkeypatch)
+    assert ops._should_email(["TASK TIME: daily_auto at 09:30, expected 10:20"])
+
+
+def test_same_findings_suppressed_within_window(tmp_path, monkeypatch):
+    _alert_env(tmp_path, monkeypatch)
+    f = ["NO RUN RECORDED: daily_auto"]
+    t0 = datetime(2026, 9, 11, 10, 20)
+    ops._mark_emailed(f, now=t0)
+    assert not ops._should_email(f, now=datetime(2026, 9, 11, 18, 0))    # +7h45
+
+
+def test_same_findings_resend_after_window(tmp_path, monkeypatch):
+    _alert_env(tmp_path, monkeypatch)
+    f = ["NO RUN RECORDED: daily_auto"]
+    ops._mark_emailed(f, now=datetime(2026, 9, 11, 10, 20))
+    assert ops._should_email(f, now=datetime(2026, 9, 12, 10, 20))       # +24h
+
+
+def test_changed_findings_always_send(tmp_path, monkeypatch):
+    """New information is never suppressed, even seconds later."""
+    _alert_env(tmp_path, monkeypatch)
+    t0 = datetime(2026, 9, 11, 10, 20)
+    ops._mark_emailed(["NO RUN RECORDED: daily_auto"], now=t0)
+    assert ops._should_email(["NO RUN RECORDED: daily_auto", "EXE STALE"], now=t0)
+
+
+def test_reordered_findings_are_the_same_alert(tmp_path, monkeypatch):
+    _alert_env(tmp_path, monkeypatch)
+    t0 = datetime(2026, 9, 11, 10, 20)
+    ops._mark_emailed(["A", "B"], now=t0)
+    assert not ops._should_email(["B", "A"], now=t0)
+
+
+def test_unreadable_timestamp_fails_loud(tmp_path, monkeypatch):
+    """A corrupt sent_at must not silently mute the channel.
+
+    The key has to MATCH, or _should_email returns True on the mismatch and
+    never reaches the date parse — which would pass this test without
+    exercising anything.
+    """
+    p = _alert_env(tmp_path, monkeypatch)
+    findings = ["NO RUN RECORDED: daily_auto"]
+    p.write_text(
+        '{"key": "%s", "sent_at": "not-a-date"}' % ops._findings_key(findings),
+        encoding="utf-8")
+    assert ops._should_email(findings)

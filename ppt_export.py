@@ -109,10 +109,19 @@ def bridge_short_gaps(series, max_days: int = NAV_GAP_BRIDGE_DAYS):
     return out, int((na & out.notna()).sum())
 
 
+# Set when a save could not overwrite the canonical deck and fell back to a
+# timestamped sibling. Read by the engine's health summary so a diverted deck
+# reports as diverted instead of OK. Reset at the top of every export.
+PPT_DIVERTED_TO: str | None = None
+PPT_CANONICAL_PATH: str | None = None
+
+
 def export_to_ppt(results, trades, charts=None):
     """
     Generates a professional PowerPoint summary based on your custom template.
     """
+    globals()["PPT_DIVERTED_TO"] = None
+    globals()["PPT_CANONICAL_PATH"] = None
     # Use the module-level APP_DIR rather than redefining from __file__:
     # under a PyInstaller frozen build, __file__ resolves to the _MEI* temp dir
     # where Portfolio_Optimiser.py is extracted, NOT where the template lives.
@@ -2575,6 +2584,13 @@ def export_to_ppt(results, trades, charts=None):
             _fallback = ppt_path.replace(".pptx", f".{_stamp}.pptx")
             try:
                 os.replace(tmp_path, _fallback)
+                # Record the diversion for the health summary. Without this it
+                # saw a deck that existed and printed "PPT generated: OK" while
+                # the canonical file the user actually opens went three days
+                # stale — the same symptom-not-cause failure the Excel line was
+                # fixed for on 2026-08-17 (found 2026-09-11).
+                globals()["PPT_DIVERTED_TO"] = _fallback
+                globals()["PPT_CANONICAL_PATH"] = ppt_path
                 print(f"[ppt][WARN] could not overwrite {os.path.basename(ppt_path)} "
                       f"({_e_swap.__class__.__name__}: {_e_swap}). It is most likely "
                       f"still open in PowerPoint. Deck saved instead to: {_fallback}")

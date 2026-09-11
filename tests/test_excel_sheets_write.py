@@ -121,28 +121,57 @@ def test_holdings_sheet_defaults_missing_include_to_true():
 
 # === _write_cash_ledger_sheet — summary + rename ==============================
 
-def test_cash_ledger_sheet_summary_and_rename(monkeypatch):
-    monkeypatch.setattr(excel_sheets, "TARGET_PORTFOLIO_VALUE_AUD", 250_000.0)
-    wb = _FakeWB(["Cash_Ledger"])
-    ledger = pd.DataFrame([
+def _ledger_frame():
+    return pd.DataFrame([
         {"date": "2026-07-10", "selected_mode": "Balanced",
          "portfolio_value_aud": 249_000.0, "cash_balance_aud": 9_000.0,
-         "cum_brokerage_aud": 12.0, "cum_cgt_aud": 100.0,
+         "brokerage_this_run_aud": 52.0, "cgt_this_run_aud": 0.0,
+         "cost_paid_aud": 0.0,
          "drift_vs_start_aud": -500.0, "drift_vs_target_aud": -1_000.0},
         {"date": "2026-07-13", "selected_mode": "Balanced",
          "portfolio_value_aud": 250_500.0, "cash_balance_aud": 8_000.0,
-         "cum_brokerage_aud": 24.0, "cum_cgt_aud": 100.0,
+         "brokerage_this_run_aud": 52.0, "cgt_this_run_aud": 0.0,
+         "cost_paid_aud": 12.0,
          "drift_vs_start_aud": 500.0, "drift_vs_target_aud": 500.0},
     ])
-    excel_sheets._write_cash_ledger_sheet(wb, ledger)
+
+
+def test_cash_ledger_sheet_reports_ACTUAL_cost_not_planned(monkeypatch):
+    monkeypatch.setattr(excel_sheets, "TARGET_PORTFOLIO_VALUE_AUD", 250_000.0)
+    wb = _FakeWB(["Cash_Ledger"])
+    excel_sheets._write_cash_ledger_sheet(
+        wb, _ledger_frame(),
+        actual_brokerage_aud=1_350.81, actual_cgt_aud=0.0,
+        actual_source="60 trades from ibkr_flex_statement.xml")
     s = wb.sheets["Cash_Ledger"]
     assert s.vals["B1"] == 250_000.0                       # target
     assert s.vals["B2"] == 250_500.0                       # latest portfolio (last row)
-    assert s.vals["B7"] == pytest.approx(24.0 + 100.0)     # total cost = cum broke + cum cgt
-    out = s.vals["A10"]
+    # The headline is broker truth, NOT the sum of the two planned columns
+    # (which would be 104.0 here). That confusion put $48,396 on this sheet
+    # against $1,351 actually paid.
+    assert s.vals["B5"] == pytest.approx(1_350.81)
+    assert s.vals["B6"] == pytest.approx(0.0)
+    assert s.vals["B7"] == pytest.approx(1_350.81)
+    assert s.vals["B9"] == 2                               # runs recorded
+    out = s.vals["A11"]
     assert "Portfolio (AUD)" in out.columns                # renamed from portfolio_value_aud
     assert "date" not in out.columns                       # raw name gone
     assert "Mode" in out.columns
+    # Planned columns must say so, and no cumulative of them may survive.
+    assert "Planned Brokerage (AUD)" in out.columns
+    assert "Cost PAID (AUD)" in out.columns
+    assert not [c for c in out.columns if str(c).startswith("Cum.")]
+
+
+def test_cash_ledger_sheet_says_unavailable_rather_than_zero(monkeypatch):
+    """A missing statement must never render as '$0 spent'."""
+    monkeypatch.setattr(excel_sheets, "TARGET_PORTFOLIO_VALUE_AUD", 250_000.0)
+    wb = _FakeWB(["Cash_Ledger"])
+    excel_sheets._write_cash_ledger_sheet(
+        wb, _ledger_frame(), actual_brokerage_aud=None, actual_cgt_aud=None)
+    s = wb.sheets["Cash_Ledger"]
+    for cell in ("B5", "B6", "B7"):
+        assert isinstance(s.vals[cell], str) and "unavailable" in s.vals[cell]
 
 def test_cash_ledger_sheet_empty_stubs():
     wb = _FakeWB(["Cash_Ledger"])

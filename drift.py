@@ -81,10 +81,22 @@ def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
         except (TypeError, ValueError):
             return None
 
+    def _note(fr, unconfirmed):
+        base = str(fr.get("Notes", "") or "")
+        if not unconfirmed:
+            return base
+        tag = "units REQUESTED (broker reported qty_filled=0)"
+        return f"{base}; {tag}" if base else tag
+
     rows: list[dict] = []
     for _, fr in fills_df.iterrows():
         matched = _match_fill_to_recommendation(fr, recs)
         actual_units = float(fr["Units"])
+        # 'Qty Filled' is 0 on every row for this account, so the reader falls
+        # back to 'Qty Req'. Say so on the row: adherence is then honest about
+        # resting on a REQUESTED quantity the broker never confirmed.
+        _unconfirmed = ("Qty Confirmed" in fr.index
+                        and not bool(fr.get("Qty Confirmed")))
         actual_px = _num(fr.get("Px AUD"))
         actual_fees = _num(fr.get("Fees AUD"))
         side_actual = "buy" if actual_units > 0 else ("sell" if actual_units < 0 else "flat")
@@ -97,7 +109,7 @@ def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
                 "Recommended": False, "Px Recommended (AUD)": None,
                 "Units Recommended": None, "Slippage (bps)": None,
                 "Fee Expected (AUD)": None, "Fee Delta (AUD)": None,
-                "Time-to-Fill (days)": None, "Notes": fr.get("Notes", ""),
+                "Time-to-Fill (days)": None, "Notes": _note(fr, _unconfirmed),
             })
             continue
         rec_px = float(matched.get("px_aud") or 0)
@@ -129,7 +141,7 @@ def compute_fill_drift(fills_df: pd.DataFrame, log_path) -> pd.DataFrame:
             "Fee Expected (AUD)": round(rec_broke, 2),
             "Fee Delta (AUD)": round(fee_delta, 2) if fee_delta is not None else None,
             "Time-to-Fill (days)": round(ttf, 2),
-            "Notes": fr.get("Notes", ""),
+            "Notes": _note(fr, _unconfirmed),
         })
     return pd.DataFrame(rows)
 

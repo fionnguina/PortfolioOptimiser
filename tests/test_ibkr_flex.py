@@ -861,3 +861,51 @@ def test_the_monthly_gate_returns_once_there_is_enough_history(tmp_path, monkeyp
     log = capsys.readouterr().out
     assert "worst monthly error" in log, log
     assert "too few to gate monthly" not in log
+
+
+# === commissions_aud — the cash ledger's broker-truth cost source ============
+
+def _comm_trades():
+    return pd.DataFrame([
+        {"Security": "VLUE.AX", "DateTime": pd.Timestamp("2026-07-06 10:00"),
+         "Currency": "AUD", "CommLocal": -22.43},
+        {"Security": "SMH", "DateTime": pd.Timestamp("2026-07-06 23:30"),
+         "Currency": "USD", "CommLocal": -1.00},
+        {"Security": "GOLD.AX", "DateTime": pd.Timestamp("2026-07-08 10:00"),
+         "Currency": "AUD", "CommLocal": -5.68},
+    ])
+
+
+def test_commissions_aud_converts_usd_at_trade_date_rate():
+    import ibkr_statement as S
+
+    fx = pd.Series({pd.Timestamp("2026-07-06"): 1.50})
+    out = S.commissions_aud(_comm_trades(), fx_usdaud=fx)
+    # IBKR signs Comm/Fee negative; the ledger wants a positive cost.
+    assert float(out.loc[pd.Timestamp("2026-07-06")]) == pytest.approx(22.43 + 1.50)
+    assert float(out.loc[pd.Timestamp("2026-07-08")]) == pytest.approx(5.68)
+    assert float(out.sum()) == pytest.approx(29.61)
+
+
+def test_commissions_aud_drops_unconvertible_rather_than_counting_zero():
+    """No rate for a currency must shrink the trade count, never the bill."""
+    import ibkr_statement as S
+
+    out = S.commissions_aud(_comm_trades())          # no USD rate anywhere
+    assert pd.Timestamp("2026-07-06") in out.index
+    assert float(out.sum()) == pytest.approx(22.43 + 5.68)   # USD leg dropped, not zeroed
+
+
+def test_commissions_aud_empty_on_no_trades():
+    import ibkr_statement as S
+
+    assert S.commissions_aud(pd.DataFrame()).empty
+    assert S.commissions_aud(None).empty
+
+
+def test_commissions_aud_keeps_a_rebate_negative():
+    import ibkr_statement as S
+
+    tr = pd.DataFrame([{"Security": "X.AX", "DateTime": pd.Timestamp("2026-07-06"),
+                        "Currency": "AUD", "CommLocal": 1.25}])   # credit, not a charge
+    assert float(S.commissions_aud(tr).sum()) == pytest.approx(-1.25)

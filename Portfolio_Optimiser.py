@@ -1751,6 +1751,41 @@ if _SHOW_METRICS_HISTORY_MODE:
     sys.exit(_exit_code)
 
 
+def _release_com_refs(*names: str) -> int:
+    """Drop lingering xlwings/COM handles and collect, while COM is still up.
+
+    The live pipeline runs at MODULE scope, so `wb`, `app` and friends stay
+    bound in globals long after their `with xw.App(...)` block has exited. The
+    proxies are then finalised by the interpreter at shutdown — after the Excel
+    server is gone — which is what emits the ~26 `Windows fatal exception:
+    0x800706ba` (RPC_S_SERVER_UNAVAILABLE) blocks on every run. They land AFTER
+    the health summary, so the engine cannot count them and they never reach
+    run.log; the wrapper has to explain them away in every post-run scan.
+
+    Releasing deterministically here means the Release() calls happen while the
+    server is still answering. Best-effort by design: a name that is already
+    gone is not an error, and nothing here may break a run that has already
+    produced its artefacts.
+
+    Returns the number of names actually dropped (for the log line).
+    """
+    import gc as _gc
+    dropped = 0
+    g = globals()
+    for n in names:
+        if n in g:
+            try:
+                del g[n]
+                dropped += 1
+            except Exception:
+                pass
+    try:
+        _gc.collect()
+    except Exception:
+        pass
+    return dropped
+
+
 def _reap_excel(pid, where=""):
     """Terminate an Excel instance the ENGINE spawned, if COM teardown left it.
 
@@ -4437,9 +4472,33 @@ def _validate_trade_plan_sanity(
 # NOTE: append_cash_ledger moved to jsonl_logs.py (Phase 4 split).
 
 
-def _load_cash_ledger(ledger_path) -> pd.DataFrame:
-    """Load cash_ledger.jsonl into a DataFrame, computing cumulative columns
-    + drift vs first record + drift vs TARGET_PORTFOLIO_VALUE_AUD anchor."""
+def _is_research_run() -> bool:
+    """True when PORTOPT_NO_REC_LOG marks this a sweep/diagnostic run.
+
+    Such a run must leave no trace in the files the live pipeline reads back:
+    not the rec-log (the executable plan must come from the pipeline), and not
+    the cash ledger (its rows are read as cost history). One helper so the two
+    call sites cannot drift apart again — the ledger was missing this guard
+    while the rec-log had it.
+    """
+    return str(os.environ.get("PORTOPT_NO_REC_LOG", "")).strip().lower() \
+        in ("1", "true", "yes")
+
+
+def _load_cash_ledger(ledger_path, actual_cost_by_date: dict | None = None) -> pd.DataFrame:
+    """Load cash_ledger.jsonl into a DataFrame with drift vs first record and
+    vs the TARGET_PORTFOLIO_VALUE_AUD anchor.
+
+    `actual_cost_by_date` maps 'YYYY-MM-DD' -> AUD actually paid that day
+    (broker truth). It is used for the reconciliation residual only; the
+    headline cost figures come from the broker statement at the call site.
+
+    There is deliberately NO cumulative of the per-run brokerage/CGT columns.
+    Those are the cost of the plan the run RECOMMENDED, and most runs never
+    execute — summing them counted 217 recommendations across 55 days (18 on
+    one dev day alone) and reported $48,396 of "Total Cost" against $1,351
+    actually paid, a 36x overstatement on the sheet the user reads (2026-09-11).
+    """
     p = Path(ledger_path)
     if not p.exists():
         return pd.DataFrame()
@@ -4461,11 +4520,6 @@ def _load_cash_ledger(ledger_path) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
     df = df.sort_values("run_at").reset_index(drop=True)
-    # Cumulative + drift columns
-    df["cum_brokerage_aud"] = pd.to_numeric(df["brokerage_this_run_aud"],
-                                            errors="coerce").fillna(0).cumsum().round(2)
-    df["cum_cgt_aud"] = pd.to_numeric(df["cgt_this_run_aud"],
-                                       errors="coerce").fillna(0).cumsum().round(2)
     first_val = float(df["portfolio_value_aud"].iloc[0]) if not df.empty else 0.0
     df["delta_vs_prev_aud"] = pd.to_numeric(df["portfolio_value_aud"],
                                             errors="coerce").diff().round(2)
@@ -4476,16 +4530,25 @@ def _load_cash_ledger(ledger_path) -> pd.DataFrame:
         pd.to_numeric(df["portfolio_value_aud"], errors="coerce") - TARGET_PORTFOLIO_VALUE_AUD
     ).round(2)
     # Reconciliation: portfolio change between runs SHOULD equal
-    # (market_move) - (brokerage_paid) - (cgt_paid). So
-    # market_move = Δ_portfolio + brokerage + cgt. If market_move is wildly
-    # different from what underlying prices actually did, that's unexplained
-    # drift (slippage, FX, math bug). Blank on the first row — there's no
-    # prior NAV to diff against.
-    df["unexplained_delta_aud"] = (
-        df["delta_vs_prev_aud"]
-        + pd.to_numeric(df["brokerage_this_run_aud"], errors="coerce").fillna(0)
-        + pd.to_numeric(df["cgt_this_run_aud"], errors="coerce").fillna(0)
-    ).round(2)
+    # (market_move) - (cost ACTUALLY PAID). So market_move = Δ_portfolio +
+    # cost_paid. If market_move is wildly different from what underlying
+    # prices actually did, that's unexplained drift (slippage, FX, math bug).
+    # Blank on the first row — there's no prior NAV to diff against.
+    #
+    # The add-back is broker truth, not the plan: adding a SKIP day's
+    # recommended brokerage back inflated the residual on every day the
+    # engine correctly declined to trade.
+    paid = pd.Series(0.0, index=df.index)
+    if actual_cost_by_date:
+        day = df["date"].dt.strftime("%Y-%m-%d")
+        # A day's commission was paid once. Several runs can share a date
+        # (the morning pass, the evening evidence run, any manual re-run), so
+        # attribute it to the first row of that date only — charging it to
+        # each run would over-count it exactly as the old cumsum did.
+        paid = pd.to_numeric(day.map(actual_cost_by_date), errors="coerce").fillna(0.0)
+        paid = paid.where(~day.duplicated(), other=0.0)
+    df["cost_paid_aud"] = paid.round(2)
+    df["unexplained_delta_aud"] = (df["delta_vs_prev_aud"] + paid).round(2)
     return df
 
 
@@ -7945,8 +8008,7 @@ if USE_XLWINGS:
             # refuse — ASX traded, US not, and the cadence anchor now reads
             # "just rebalanced" so it will not retry for six weeks. That is the
             # standing SMH-underweight symptom, arriving by this route.
-            _no_rec_log = str(os.environ.get("PORTOPT_NO_REC_LOG", "")).strip().lower() \
-                in ("1", "true", "yes")
+            _no_rec_log = _is_research_run()
             try:
                 _drift_log_path = APP_DIR / "trade_recommendation_log.jsonl"
                 if (portfolio_value_override is not None
@@ -8110,21 +8172,76 @@ if USE_XLWINGS:
                                           errors="coerce").fillna(0.0).sum()
                         )
                         _cash_total_portfolio = _cash_net_invested + _cash_balance_local
-                append_cash_ledger(
-                    _cash_ledger_path,
-                    portfolio_value_aud=_cash_total_portfolio,
-                    net_invested_aud=_cash_net_invested,
-                    cash_balance_aud=_cash_balance_local,
-                    brokerage_this_run_aud=_cash_total_brokerage,
-                    cgt_this_run_aud=float(costs_rec.get("cgt_tax", 0.0)),
-                    loss_cf_tax_aud=float(
-                        costs_rec.get("breakdown", {}).get("loss_carry_forward", 0.0)
-                    ) * float(CGT_CONFIG.get("marginal_tax_rate", 0.30)),
-                    selected_mode=_tp_mode,
-                    broker_name=str(BROKER_CONFIG.get("name", "unknown")),
-                )
-                _ledger_df = _load_cash_ledger(_cash_ledger_path)
-                _write_cash_ledger_sheet(wb, _ledger_df)
+                # A research run must not write a cost row. The same guard as
+                # the rec-log (PORTOPT_NO_REC_LOG) — it was applied there and
+                # not here, so sweeps still landed in the ledger: 18 rows on
+                # 2026-06-29 alone (fixed 2026-09-11).
+                if _is_research_run():
+                    print("[cash] PORTOPT_NO_REC_LOG set — ledger row NOT "
+                          "appended (research run)")
+                else:
+                    append_cash_ledger(
+                        _cash_ledger_path,
+                        portfolio_value_aud=_cash_total_portfolio,
+                        net_invested_aud=_cash_net_invested,
+                        cash_balance_aud=_cash_balance_local,
+                        brokerage_this_run_aud=_cash_total_brokerage,
+                        cgt_this_run_aud=float(costs_rec.get("cgt_tax", 0.0)),
+                        loss_cf_tax_aud=float(
+                            costs_rec.get("breakdown", {}).get("loss_carry_forward", 0.0)
+                        ) * float(CGT_CONFIG.get("marginal_tax_rate", 0.30)),
+                        selected_mode=_tp_mode,
+                        broker_name=str(BROKER_CONFIG.get("name", "unknown")),
+                    )
+                # Cost ACTUALLY PAID — broker truth, not the plan. Commission
+                # from the account statement; CGT from the FY ledger built off
+                # executed fills. Either may be unavailable (no statement, no
+                # sells yet); None propagates so the sheet says so rather than
+                # showing a zero that reads as "spent nothing".
+                _paid_by_date, _paid_brokerage, _paid_cgt = {}, None, None
+                _paid_src = []
+                try:
+                    import ibkr_statement as _stmt
+                    _stmt_path = _stmt.resolve_statement_path(APP_DIR)
+                    _stmt_trades = _stmt.parse_trades(_stmt_path)
+                    _ser = _stmt.commissions_aud(
+                        _stmt_trades, fx_usdaud=globals().get("fx_usdaud"),
+                        flat_rates=_stmt.fx_to_base(_stmt_path),
+                        stmt_fx=_stmt.fx_from_statement(_stmt_path))
+                    if len(_ser):
+                        _paid_by_date = {d.strftime("%Y-%m-%d"): float(v)
+                                         for d, v in _ser.items()}
+                        _paid_brokerage = float(_ser.sum())
+                    else:
+                        _paid_brokerage = 0.0
+                    _paid_src.append(
+                        f"{len(_stmt_trades)} trades from {Path(_stmt_path).name}")
+                except Exception as _e_comm:
+                    print(f"[cash] actual brokerage unavailable: {_e_comm}")
+                try:
+                    _fyl = globals().get("FY_TAX_LEDGER_DF")
+                    if _fyl is None:
+                        _fyl = compute_fy_tax_ledger(
+                            APP_DIR / "ibkr_fills_log.jsonl",
+                            seed_path=APP_DIR / "lots_seed.json",
+                            fx_map=globals().get("fx_map_all"),
+                            lot_match_method=LOT_MATCH_METHOD,
+                        )
+                    _paid_cgt = (float(pd.to_numeric(
+                        _fyl["CGT at Lodgement (AUD)"], errors="coerce").fillna(0).sum())
+                        if _fyl is not None and not _fyl.empty else 0.0)
+                    _paid_src.append(
+                        f"FY tax ledger ({len(_fyl)} FY row(s))"
+                        if _fyl is not None and not _fyl.empty
+                        else "no sells executed yet")
+                except Exception as _e_cgt:
+                    print(f"[cash] actual CGT unavailable: {_e_cgt}")
+                _ledger_df = _load_cash_ledger(_cash_ledger_path, _paid_by_date)
+                _write_cash_ledger_sheet(
+                    wb, _ledger_df,
+                    actual_brokerage_aud=_paid_brokerage,
+                    actual_cgt_aud=_paid_cgt,
+                    actual_source="; ".join(_paid_src) or "no source available")
                 if not _ledger_df.empty:
                     _latest = _ledger_df.iloc[-1]
                     _runs = len(_ledger_df)
@@ -8132,11 +8249,12 @@ if USE_XLWINGS:
                     _unex_str = (f"${float(_unex):,.0f}"
                                  if _unex is not None and not pd.isna(_unex)
                                  else "(first run — no prior to compare)")
+                    _fmt = (lambda v: f"${v:,.0f}" if v is not None else "n/a")
                     print(f"[cash] ledger: {_runs} run(s) recorded. "
                           f"Drift vs ${TARGET_PORTFOLIO_VALUE_AUD:,.0f}: "
                           f"${float(_latest['drift_vs_target_aud']):,.0f} | "
-                          f"Cum. brokerage ${float(_latest['cum_brokerage_aud']):,.0f} | "
-                          f"Cum. CGT ${float(_latest['cum_cgt_aud']):,.0f} | "
+                          f"Brokerage PAID {_fmt(_paid_brokerage)} | "
+                          f"CGT realised {_fmt(_paid_cgt)} | "
                           f"Unexplained Δ {_unex_str}")
             except Exception as _e_cash:
                 print(f"[cash] ledger skipped: {_e_cash}")
@@ -9172,6 +9290,11 @@ if USE_XLWINGS:
         # Outside the context manager: Quit has run (or failed). Reap only if
         # the PID we spawned is still resident.
         _reap_excel(_xl_pid, " (workbook write)")
+        # Then drop the COM handles this module-scope pipeline left bound, so
+        # they are released now rather than against a dead server at exit.
+        _n_rel = _release_com_refs("wb", "app", "sht", "_tax_sht")
+        if _n_rel:
+            print(f"[xl] Released {_n_rel} COM handle(s) before teardown.")
 
     except SanityViolation:
         # NEVER swallow a sanity violation here. The whole point of the
@@ -9363,6 +9486,7 @@ try:
                 _book.save()
                 _book.close()
             _reap_excel(_post_pid, " (OPT post-write)")
+            _release_com_refs("_book", "_ws", "_app")
             _written = True
             print(f"[post] Wrote OPT validation + layout fixes to: {_xl}")
         except Exception as _e_xlw:
@@ -9603,10 +9727,32 @@ def _print_run_health_summary():
     if ppt_path and os.path.exists(ppt_path):
         try:
             from pptx import Presentation as _P
-            _p = _P(ppt_path)
-            print(f"  PPT generated:        OK ({len(_p.slides)} slides)")
+            _n_slides = f" ({len(_P(ppt_path).slides)} slides)"
         except Exception:
-            print(f"  PPT generated:        OK")
+            _n_slides = ""
+        # A deck that saved to a timestamped sibling is NOT a deck that landed:
+        # the canonical file is what gets reviewed before trading, and it had
+        # gone three days stale while this line read OK (2026-09-11).
+        try:
+            import ppt_export as _ppt_mod
+            _ppt_diverted = getattr(_ppt_mod, "PPT_DIVERTED_TO", None)
+            _ppt_canon = getattr(_ppt_mod, "PPT_CANONICAL_PATH", None)
+        except Exception:
+            _ppt_diverted = _ppt_canon = None
+        if _ppt_diverted:
+            _canon_age = ""
+            try:
+                if _ppt_canon and os.path.exists(_ppt_canon):
+                    _canon_age = (f"; it last changed "
+                                  f"{int((_time_for_health.time() - os.path.getmtime(_ppt_canon)) / 60)}m ago")
+            except Exception:
+                pass
+            print(f"  PPT generated:        DIVERTED{_n_slides} — wrote "
+                  f"{os.path.basename(_ppt_diverted)}, NOT "
+                  f"{os.path.basename(_ppt_canon or 'the canonical deck')} "
+                  f"(locked, most likely open in PowerPoint{_canon_age})")
+        else:
+            print(f"  PPT generated:        OK{_n_slides}")
     else:
         print(f"  PPT generated:        FAILED / not saved")
 

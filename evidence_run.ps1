@@ -175,12 +175,24 @@ if ($proc.HasExited) {
 }
 # Stamp the run ledger so a missing evening run becomes visible tomorrow
 # morning instead of being indistinguishable from a healthy quiet night.
-# No --check here: the 09:30/10:20 run owns the reporting.
+#
+# --check runs here TOO (2026-09-11). It used to live only in daily_auto, on the
+# reasoning that the morning run owns the reporting — but that made the
+# miss-detector ride on the job it polices. On 2026-09-10 nobody signed in after
+# an OS-upgrade reboot, all three tasks hit Task Scheduler event 332
+# ("not logged on"), and because daily_auto was one of them, its own alarm never
+# fired either. Four missed runs surfaced only when a human went looking.
+# 18:00 is eight hours after the morning run, so the evening pass now catches a
+# missed morning the SAME DAY rather than waiting for the next daily_auto.
+# ops_assertions now dedupes alerts (same finding set within 12h is suppressed;
+# a CHANGED finding set always mails), so the two --check calls do not spam.
 try {
     $opsPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
     $opsScript = Join-Path $ScriptDir "ops_assertions.py"
     if ((Test-Path $opsPy) -and (Test-Path $opsScript)) {
         & $opsPy $opsScript --record evidence_run --outcome $outcome --detail $why | Out-Null
+        $opsOut = & $opsPy $opsScript --check --email 2>&1 | Select-Object -Last 10
+        Write-Log "Ops assertions: $opsOut"
     }
 } catch { Write-Log "Ledger stamp failed (non-fatal): $($_.Exception.Message)" }
 

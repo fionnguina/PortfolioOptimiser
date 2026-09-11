@@ -115,6 +115,20 @@ def _read_actual_fills(wb) -> pd.DataFrame:
         out["Fill Date"] = pd.to_datetime(led["Exec TS"], errors="coerce")
         out["Ticker"] = led["Ticker"].astype(str).str.strip()
         qty = pd.to_numeric(led["Qty Filled"], errors="coerce")
+        # 'Qty Filled' is script-side state at write time and IBKR leaves it at
+        # 0 on this account — the same permanently-zero field that forced the
+        # 6W cadence anchor onto NAV position changes. Every row read 0 here,
+        # the `Units != 0` filter below then dropped all of them, and fill
+        # adherence silently reported 0/0 from the day it shipped (2026-09-11).
+        # Fall back to what was REQUESTED: the position history confirms these
+        # orders filled, and adherence asks "was this trade in the plan?",
+        # which the requested quantity answers. Slippage stays None — there is
+        # no fill price to compare, and inventing one would be worse.
+        req = pd.to_numeric(led.get("Qty Req"), errors="coerce") \
+            if "Qty Req" in led.columns else pd.Series(float("nan"), index=led.index)
+        confirmed = qty.fillna(0) != 0
+        qty = qty.where(confirmed, req)
+        out["Qty Confirmed"] = confirmed
         side = led.get("Side", "").astype(str).str.upper() if "Side" in led.columns \
             else pd.Series("", index=led.index)
         out["Units"] = qty * side.map(lambda s: -1.0 if str(s).startswith("SELL") else 1.0)
@@ -165,8 +179,17 @@ def _write_drift_sheets(
         print(f"[drift] could not write Drift_NAV sheet: {e}")
 
 
-def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame) -> None:
-    """Render the cash ledger to an Excel sheet. Overwrites each run."""
+def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame, *,
+                             actual_brokerage_aud: float | None = None,
+                             actual_cgt_aud: float | None = None,
+                             actual_source: str = "") -> None:
+    """Render the cash ledger to an Excel sheet. Overwrites each run.
+
+    The headline cost figures are BROKER TRUTH, passed in by the caller —
+    commission from the account statement, CGT from the FY tax ledger's actual
+    fills. Pass None for either when that source could not be read: the cell
+    then says so, because a blank or a zero would read as "spent nothing".
+    """
     try:
         sht = get_or_clear_sheet(wb, "Cash_Ledger")
         if ledger_df is None or ledger_df.empty:
@@ -183,22 +206,34 @@ def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame) -> None:
         sht.range("B3").value = float(latest["drift_vs_target_aud"])
         sht.range("A4").value = "Total Drift vs Start (run 1)"
         sht.range("B4").value = float(latest["drift_vs_start_aud"])
-        sht.range("A5").value = "Cum. Brokerage (all runs)"
-        sht.range("B5").value = float(latest["cum_brokerage_aud"])
-        sht.range("A6").value = "Cum. CGT (all runs)"
-        sht.range("B6").value = float(latest["cum_cgt_aud"])
-        sht.range("A7").value = "Total Cost (Brokerage + CGT)"
-        sht.range("B7").value = float(latest["cum_brokerage_aud"] + latest["cum_cgt_aud"])
-        sht.range("A8").value = "Runs recorded"
-        sht.range("B8").value = int(n_runs)
+        _UNAVAIL = "unavailable — source not read this run"
+        sht.range("A5").value = "Brokerage PAID (broker statement)"
+        sht.range("B5").value = (round(float(actual_brokerage_aud), 2)
+                                 if actual_brokerage_aud is not None else _UNAVAIL)
+        sht.range("A6").value = "CGT REALISED (FY ledger, actual fills)"
+        sht.range("B6").value = (round(float(actual_cgt_aud), 2)
+                                 if actual_cgt_aud is not None else _UNAVAIL)
+        sht.range("A7").value = "Total Cost ACTUALLY PAID"
+        if actual_brokerage_aud is not None and actual_cgt_aud is not None:
+            sht.range("B7").value = round(float(actual_brokerage_aud)
+                                          + float(actual_cgt_aud), 2)
+        else:
+            sht.range("B7").value = _UNAVAIL
+        sht.range("A8").value = "Cost basis"
+        sht.range("B8").value = (actual_source or "broker statement + FY tax ledger")
+        sht.range("A9").value = "Runs recorded (engine invocations, not trades)"
+        sht.range("B9").value = int(n_runs)
         # Per-run detail starts below.
+        # No cumulative of the planned columns: most runs never execute, so a
+        # running total of what they proposed is not money and must not sit in
+        # a column a reader will take for spend.
         display_cols = [
             "date", "selected_mode",
             "portfolio_value_aud", "net_invested_aud", "cash_balance_aud",
             "delta_vs_prev_aud",
             "brokerage_this_run_aud", "cgt_this_run_aud",
             "loss_carry_forward_tax_aud",
-            "cum_brokerage_aud", "cum_cgt_aud",
+            "cost_paid_aud",
             "drift_vs_start_aud", "drift_vs_target_aud",
             "unexplained_delta_aud",
         ]
@@ -211,16 +246,15 @@ def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame) -> None:
             "net_invested_aud": "Net Invested (AUD)",
             "cash_balance_aud": "Cash (AUD)",
             "delta_vs_prev_aud": "Δ vs Prior (AUD)",
-            "brokerage_this_run_aud": "Brokerage (AUD)",
-            "cgt_this_run_aud": "CGT (AUD)",
+            "brokerage_this_run_aud": "Planned Brokerage (AUD)",
+            "cgt_this_run_aud": "Planned CGT (AUD)",
             "loss_carry_forward_tax_aud": "Tax Saved (AUD)",
-            "cum_brokerage_aud": "Cum. Brokerage",
-            "cum_cgt_aud": "Cum. CGT",
+            "cost_paid_aud": "Cost PAID (AUD)",
             "drift_vs_start_aud": "Drift vs Start",
             "drift_vs_target_aud": "Drift vs Target",
             "unexplained_delta_aud": "Unexplained Δ",
         }, inplace=True)
-        sht.range("A10").options(index=False).value = out_df
+        sht.range("A11").options(index=False).value = out_df
     except Exception as e:
         print(f"[cash] could not write Cash_Ledger sheet: {e}")
 

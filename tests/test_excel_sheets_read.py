@@ -53,9 +53,35 @@ def _sheet_like(width=6):
 
 def test_read_actual_fills_finds_ledger_below_banner():
     df = excel_sheets._read_actual_fills(_WB(_sheet_like()))
-    assert list(df.columns) == ["Fill Date", "Ticker", "Units"]
+    assert list(df.columns) == ["Fill Date", "Ticker", "Qty Confirmed", "Units"]
     assert len(df) == 2
     assert set(df["Ticker"]) == {"SMH", "VLUE.AX"}
+    assert df["Qty Confirmed"].all()          # this fixture has real Qty Filled
+
+
+def test_read_actual_fills_falls_back_to_requested_when_qty_filled_is_zero():
+    """IBKR leaves Qty Filled at 0 on this account for orders that DID fill.
+
+    Reading it literally produced Units=0 on every row, the `Units != 0` filter
+    dropped them all, and fill adherence reported 0/0 for its whole life. The
+    requested quantity is the honest stand-in — flagged, not disguised.
+    """
+    rows = _sheet_like()
+    rows[7][5] = 0          # SMH  Qty Filled -> 0, Qty Req stays 42
+    rows[8][5] = 0          # VLUE.AX             Qty Req stays 100
+    df = excel_sheets._read_actual_fills(_WB(rows))
+    assert len(df) == 2, "rows must survive a zero Qty Filled"
+    assert float(df[df["Ticker"] == "SMH"]["Units"].iloc[0]) == 42.0
+    assert float(df[df["Ticker"] == "VLUE.AX"]["Units"].iloc[0]) == -100.0
+    assert not df["Qty Confirmed"].any()      # and the fallback is flagged
+
+
+def test_read_actual_fills_drops_row_with_no_qty_at_all():
+    """Zero filled AND zero requested is not a fill — it must still drop."""
+    rows = _sheet_like()
+    rows[7][4] = 0; rows[7][5] = 0            # SMH: Qty Req and Qty Filled both 0
+    df = excel_sheets._read_actual_fills(_WB(rows))
+    assert set(df["Ticker"]) == {"VLUE.AX"}
 
 def test_read_actual_fills_signs_units_by_side():
     df = excel_sheets._read_actual_fills(_WB(_sheet_like()))
