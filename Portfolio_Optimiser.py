@@ -1751,6 +1751,55 @@ if _SHOW_METRICS_HISTORY_MODE:
     sys.exit(_exit_code)
 
 
+_ENGINE_MODULES = (
+    "metrics", "ensemble", "tlh", "brokerage", "drift", "factors", "dialogs",
+    "solvers", "lots", "nav", "excel_sheets", "fx", "ppt_utils", "ppt_export",
+    "oos_engine", "research_modes", "cgt", "jsonl_logs", "ibkr_statement",
+    "validation", "variant_store",
+)
+
+
+def _own_namespaces():
+    """[(label, namespace dict)] for the engine plus every module WE own.
+
+    Sweeping only the engine's own globals left a Workbook interface alive:
+    `_sync_ppt_export()` copies 66 engine globals into ppt_export before the
+    deck is built, and the extracted modules are handed engine state the same
+    way, so a COM handle can be reachable from a namespace the engine never
+    looks at. Deleting `wb` then dropped the count by nothing, while the same
+    sequence in isolation dropped it by one — that gap was the last fault.
+
+    Restricted to our own modules by NAME, not by __file__: under PyInstaller
+    every bundled module reports a path inside the _MEI temp dir, so a
+    path-based filter silently matches nothing in the frozen build that
+    actually runs in production.
+    """
+    import sys as _sys
+    out = [("engine", globals())]
+    for _n in _ENGINE_MODULES:
+        m = _sys.modules.get(_n)
+        d = getattr(m, "__dict__", None) if m is not None else None
+        if isinstance(d, dict) and d is not globals():
+            out.append((_n, d))
+    return out
+
+
+def _com_iface_count() -> int:
+    """Live COM interfaces held by pywin32, or -1 if unavailable.
+
+    The right instrument for the teardown faults, and the one that took three
+    rebuilds to reach for. gc.get_objects() cannot see raw COM pointers — they
+    are C-level and untracked — so a gc-based count read zero while 16 faults
+    were still firing. pythoncom counts the actual interfaces. Zero here means
+    zero faults; anything else is exactly how many are still to come.
+    """
+    try:
+        import pythoncom as _pyc
+        return int(_pyc._GetInterfaceCount())
+    except Exception:
+        return -1
+
+
 def _is_com_handle(obj) -> bool:
     """True for an xlwings wrapper or a raw COM proxy.
 
@@ -1786,31 +1835,64 @@ def _is_com_handle(obj) -> bool:
     }
 
 
-def _count_live_com_handles() -> dict:
-    """{type name: count} of COM handles still reachable anywhere.
+def _com_handle_report(limit: int = 8):
+    """One gc walk -> (counts by type, "who holds it" lines).
 
-    Diagnostic for the teardown faults. Module globals are only the easy half
-    of what holds a proxy — handles also hide in other modules' globals, in
-    containers, and in xlwings' own caches. Counting by type says which,
-    instead of leaving a bare fault number to be re-investigated every time.
-    Never dereferences an object (see `_is_com_handle`).
+    Counting and owner-resolution MUST share a single walk. Split across two
+    calls, the first `gc.get_objects()` temp list drops its refcounts on exit
+    and the cycle collector reclaims the handles before the second walk sees
+    them — which is why the owner lines printed nothing while the count said 5.
+
+    A bare count says a fault is coming; it does not say where to go. Resolving
+    referrer dicts back to their owning module turns "5 handles left" into
+    "held by win32com.client.gencache" — the difference between a fix and
+    another guess. Never dereferences a handle (see `_is_com_handle`).
     """
     import gc as _gc
-    out: dict = {}
+    import sys as _sys
+    counts: dict = {}
+    owners: list = []
     try:
-        for o in _gc.get_objects():
-            try:
-                if _is_com_handle(o):
-                    n = type(o).__name__
-                    out[n] = out.get(n, 0) + 1
-            except Exception:
-                continue
+        objs = [o for o in _gc.get_objects() if _is_com_handle(o)]
     except Exception:
-        return {}
-    return out
+        return {}, []
+    for o in objs:
+        n = type(o).__name__
+        counts[n] = counts.get(n, 0) + 1
+    mod_dicts = {}
+    for _m in list(_sys.modules.values()):
+        try:
+            d = getattr(_m, "__dict__", None)
+            if d is not None:
+                mod_dicts[id(d)] = getattr(_m, "__name__", "?")
+        except Exception:
+            continue
+    for o in objs[:limit]:
+        who = set()
+        try:
+            for r in _gc.get_referrers(o):
+                try:
+                    if r is objs:
+                        continue          # our own walk list, not a real holder
+                    if isinstance(r, dict):
+                        who.add("module:" + mod_dicts[id(r)]
+                                if id(r) in mod_dicts else "dict")
+                    elif type(r).__name__ == "frame":
+                        code = getattr(r, "f_code", None)
+                        who.add("frame:" + (getattr(code, "co_name", "?") or "?"))
+                    elif isinstance(r, (list, tuple, set)):
+                        who.add(type(r).__name__)
+                    else:
+                        who.add(f"{type(r).__module__}.{type(r).__name__}")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        owners.append(f"{type(o).__name__} <- {sorted(who)[:4]}")
+    return counts, owners
 
 
-def _release_com_refs(*names: str) -> int:
+def _release_com_refs(*names: str, skip: tuple = ()) -> int:
     """Drop lingering xlwings/COM handles and collect, while COM is still up.
 
     The live pipeline runs at MODULE scope, so `wb`, `app` and friends stay
@@ -1847,19 +1929,34 @@ def _release_com_refs(*names: str) -> int:
                 pass
     # Type sweep: anything at module scope that IS an xlwings/COM handle.
     # Runs after the Excel work is finished, so nothing downstream needs these.
-    for n in [k for k in list(g) if not k.startswith("__")]:
-        try:
-            obj = g.get(n)
-        except Exception:
-            continue
-        if _is_com_handle(obj):
+    #
+    # This sweep, not gc, is what finds them: raw COM proxies are C-level and
+    # NOT GC-tracked, so gc.get_objects() cannot see them however precise the
+    # matcher is. The globals dict can.
+    detail = []
+    for _ns_name, ns in _own_namespaces():
+        for n in [k for k in list(ns) if not k.startswith("__")]:
             try:
-                del g[n]
-                dropped += 1
+                obj = ns.get(n)
             except Exception:
-                pass
+                continue
+            if n in skip:
+                continue          # owned by a live `with`; let it quit first
+            if _is_com_handle(obj):
+                try:
+                    detail.append(f"{_ns_name}.{n}:{type(obj).__name__}")
+                    del ns[n]
+                    dropped += 1
+                except Exception:
+                    pass
+    g["_LAST_COM_RELEASED"] = detail
+    # Collect repeatedly: a handle freed in pass 1 can drop the last reference
+    # to a container that holds another, and a single pass leaves that one
+    # alive. Cheap, bounded, and it costs nothing when there is nothing left.
     try:
-        _gc.collect()
+        for _ in range(3):
+            if _gc.collect() == 0:
+                break
     except Exception:
         pass
     return dropped
@@ -7088,6 +7185,10 @@ fx_map_all = fx_to_aud_for_tickers(prices.columns, usd_aud)
 if USE_XLWINGS:
     try:
         _xl_pid = None
+        # Bound before the block: the release happens INSIDE the `with` now, so
+        # an exception before that point would otherwise leave this unbound and
+        # turn a workbook error into a NameError that hides it.
+        _n_rel = 0
         with xw.App(visible=False, add_book=False) as app:
             try:
                 _xl_pid = app.pid
@@ -9397,20 +9498,27 @@ if USE_XLWINGS:
                     ppt_path = export_to_ppt(results, trades, charts)
                 except Exception as e:
                     print(f"[pptx] Skipped PowerPoint generation: {e}")
-
             wb.save()
             wb.close()
+            # Release every COM pointer while the Excel server is STILL ALIVE.
+            # This line's INDENT is the fix. The `with` calls app.quit() on the
+            # dedent below, so a release placed after it hands each pointer a
+            # dead server — which is the entire 0x800706ba story. Releasing one
+            # line earlier, inside the block, releases into a live server and
+            # costs nothing.
+            #
+            # gc cannot help here and the earlier diagnostic proved it: after
+            # the sweep, ZERO COM handles were reachable and the faults stayed
+            # at 16. Raw PyIDispatch pointers are C-level and not GC-tracked,
+            # so they are invisible to gc.get_objects() no matter how precise
+            # the matcher gets. Timing is the only lever.
+            _n_rel = _release_com_refs("wb", "sht", "_tax_sht", skip=("app",))
         # Outside the context manager: Quit has run (or failed). Reap only if
         # the PID we spawned is still resident.
-        # Release BEFORE reaping. _reap_excel taskkills the server; releasing
-        # afterwards would hand every remaining proxy a corpse to talk to,
-        # which is precisely the 0x800706ba fault this is here to avoid. The
-        # order only matters on a run where Excel actually needs reaping — but
-        # that is the run where it matters most.
-        _n_rel = _release_com_refs("wb", "app", "sht", "_tax_sht")
         _reap_excel(_xl_pid, " (workbook write)")
         if _n_rel:
-            print(f"[xl] Released {_n_rel} COM handle(s) before teardown.")
+            print(f"[xl] Released {_n_rel} COM handle(s) before Excel quit "
+                  f"({_com_iface_count()} interface(s) still live).")
 
     except SanityViolation:
         # NEVER swallow a sanity violation here. The whole point of the
@@ -9544,6 +9652,7 @@ try:
         icon_path = APP_DIR / "icon.ico"
         sc.IconLocation = str(icon_path if icon_path.exists() else target)
         sc.save()
+        _release_com_refs("sc", "shell")     # see the paired site below
     else:
         print("[shortcut] pywin32 not available; skipping Desktop shortcut.")
 except Exception as e:
@@ -9601,8 +9710,10 @@ try:
 
                 _book.save()
                 _book.close()
+                # Same indent-is-the-fix as the main workbook block above:
+                # release while this App is alive, not after its `with` quits.
+                _release_com_refs("_book", "_ws", "_app")
             _reap_excel(_post_pid, " (OPT post-write)")
-            _release_com_refs("_book", "_ws", "_app")
             _written = True
             print(f"[post] Wrote OPT validation + layout fixes to: {_xl}")
         except Exception as _e_xlw:
@@ -9649,6 +9760,11 @@ try:
             _icon = _app_dir / "icon.ico"
             _sc.IconLocation = str(_icon if _icon.exists() else _target)
             _sc.save()
+            # Drop the shortcut proxies here, not at exit. These were the last
+            # two 0x800706ba faults: WScript.Shell has nothing to do with
+            # Excel, but a CDispatch finalised during interpreter teardown
+            # faults just the same. Released at the site, it costs nothing.
+            _release_com_refs("_sc", "_shell")
             print(f"[post] Desktop shortcut refreshed: {_shortcut}")
     except Exception as _e_sc:
         print(f"[post] Shortcut refresh skipped: {_e_sc}")
@@ -10014,18 +10130,23 @@ except Exception as _e_health:
 # after the health summary, so the engine cannot count them — the only proof
 # this works is the wrapper's own "N fatal-exception line(s)" scan.
 try:
+    # Report BEFORE releasing. Reporting afterwards finds nothing by
+    # construction and tells you only that the sweep ran, which is how the
+    # last straggler stayed anonymous for two rebuilds.
+    _counts, _owners = _com_handle_report()
     _n_final = _release_com_refs()
+    _ifc = _com_iface_count()
+    print(f"[xl] live COM interfaces at teardown: {_ifc}"
+          + ("  <- expect that many 0x800706ba faults" if _ifc > 0 else "  (clean)"))
     if _n_final:
         print(f"[xl] Released {_n_final} COM handle(s) in the final sweep.")
-    # Anything STILL reachable after the sweep is what the interpreter will
-    # finalise against a dead server. Naming it turns a mystery fault count
-    # into a list of types to go after — module globals were the easy half.
-    _stragglers = _count_live_com_handles()
-    if _stragglers:
-        print(f"[xl] {sum(_stragglers.values())} COM handle(s) still reachable "
-              f"after the sweep (expect that many teardown faults): "
+    if _counts:
+        print(f"[xl] {sum(_counts.values())} COM handle(s) still reachable "
+              f"after the sweep: "
               + ", ".join(f"{k}x{v}" for k, v in sorted(
-                  _stragglers.items(), key=lambda kv: -kv[1])[:6]))
+                  _counts.items(), key=lambda kv: -kv[1])[:6]))
+        for _row in _owners:
+            print(f"[xl][held-by] {_row}")
 except Exception as _e_final_com:
     print(f"[xl] final COM sweep skipped: {_e_final_com}")
 
