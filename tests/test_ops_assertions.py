@@ -501,3 +501,78 @@ def test_shipped_expectations_declare_the_logon_task_outside_jobs():
     assert task["action_contains"].startswith('"'), "path must be quoted"
     assert "Portfolio Optimiser Logon Check" not in cfg["jobs"]
     assert "logon" not in " ".join(cfg["jobs"]).lower()
+
+
+# === artifact freshness (2026-09-14) =========================================
+# The silent-divert failure: Excel holds the workbook open, the engine writes
+# Stock Analysis_AUTO.xlsm instead, and on a SKIP day no email goes out — so the
+# real workbook sat three days stale while every run reported success.
+
+def _fresh_env(tmp_path, name="Stock Analysis.xlsm"):
+    import os, time
+    p = tmp_path / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("x", encoding="utf-8")
+    return p
+
+
+def _ledger_ok(when="2026-09-14T10:29:21"):
+    return [{"job": "daily_auto", "finished": when, "outcome": "ok"}]
+
+
+def test_artifact_older_than_last_run_is_flagged(tmp_path):
+    import os, datetime as dt
+    p = _fresh_env(tmp_path)
+    stale = dt.datetime(2026, 9, 11, 18, 3).timestamp()
+    os.utime(p, (stale, stale))
+    f = ops.check_artifact_freshness(tmp_path, ["Stock Analysis.xlsm"], _ledger_ok())
+    assert len(f) == 1 and "STALE ARTIFACT" in f[0]
+    assert "diverted" in f[0]
+
+
+def test_artifact_newer_than_last_run_is_clean(tmp_path):
+    import os, datetime as dt
+    p = _fresh_env(tmp_path)
+    fresh = dt.datetime(2026, 9, 14, 10, 29, 30).timestamp()
+    os.utime(p, (fresh, fresh))
+    assert ops.check_artifact_freshness(
+        tmp_path, ["Stock Analysis.xlsm"], _ledger_ok()) == []
+
+
+def test_fridays_artifact_is_not_flagged_on_monday_before_the_run(tmp_path):
+    """The cry-wolf case a flat max-age gate would fail.
+
+    Friday 18:00 artifact, last ok run Friday 18:00 — 3 days old on Monday and
+    perfectly healthy, because it is not older than the last run.
+    """
+    import os, datetime as dt
+    p = _fresh_env(tmp_path)
+    fri = dt.datetime(2026, 9, 11, 18, 3, 30).timestamp()
+    os.utime(p, (fri, fri))
+    assert ops.check_artifact_freshness(
+        tmp_path, ["Stock Analysis.xlsm"],
+        _ledger_ok("2026-09-11T18:03:00")) == []
+
+
+def test_missing_artifact_is_flagged(tmp_path):
+    f = ops.check_artifact_freshness(tmp_path, ["Nope.xlsm"], _ledger_ok())
+    assert len(f) == 1 and "MISSING ARTIFACT" in f[0]
+
+
+def test_no_successful_run_yet_is_silent(tmp_path):
+    """Nothing to compare against; the heartbeat owns that case, not this."""
+    _fresh_env(tmp_path)
+    assert ops.check_artifact_freshness(tmp_path, ["Stock Analysis.xlsm"], []) == []
+    assert ops.check_artifact_freshness(
+        tmp_path, ["Stock Analysis.xlsm"],
+        [{"job": "daily_auto", "finished": "2026-09-14T10:00:00",
+          "outcome": "fail"}]) == []
+
+
+def test_shipped_expectations_declare_the_workbook_and_deck():
+    import json
+    from pathlib import Path
+    cfg = json.loads((Path(__file__).resolve().parent.parent
+                      / "ops_expected.json").read_text(encoding="utf-8"))
+    assert "Stock Analysis.xlsm" in cfg["fresh_artifacts"]
+    assert any("Portfolio_Report" in a for a in cfg["fresh_artifacts"])

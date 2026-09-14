@@ -124,5 +124,10 @@
       "oos_engine.py",
       "research_modes.py"
     ]
-  }
+  },
+  "fresh_artifacts": [
+    "Stock Analysis.xlsm",
+    "Reports/Portfolio_Report.pptx"
+  ],
+  "_why_fresh_artifacts": "Must be at least as new as the last ok daily_auto run. When Excel or PowerPoint holds one open the engine diverts to a sibling file and says so in the health summary, but a SKIP day sends no email - which is how the real workbook went three days stale in 2026-09 while every run reported success. Compared against the run ledger, not a fixed age, so Friday's artifacts are not flagged on Monday."
 }

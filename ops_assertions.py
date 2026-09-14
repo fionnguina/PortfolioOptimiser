@@ -225,6 +225,52 @@ def check_required_files(root: Path, names: list) -> list:
     return out
 
 
+def check_artifact_freshness(root: Path, names: list, ledger: list,
+                             job: str = "daily_auto") -> list:
+    """Assert each artifact is at least as new as the last successful `job` run.
+
+    Catches the silent-divert failure. When Excel holds Stock Analysis.xlsm
+    open, the engine writes Stock Analysis_AUTO.xlsm instead and says so in the
+    health summary — but on a SKIP day no email is sent at all, so on
+    2026-09-11 the real workbook sat three days stale while every run reported
+    success. The deck fails the same way when PowerPoint holds it.
+
+    Compared against the run LEDGER, not a fixed max age: a flat age gate would
+    cry wolf every Monday, when Friday's artifacts are legitimately 3 days old.
+    If the job ran and the artifact is older than that run, the write did not
+    land — which is the thing worth saying.
+    """
+    out = []
+    last = None
+    for r in ledger or []:
+        if str(r.get("job")) != job or str(r.get("outcome")) != "ok":
+            continue
+        try:
+            t = datetime.fromisoformat(str(r.get("finished")))
+        except (TypeError, ValueError):
+            continue
+        if last is None or t > last:
+            last = t
+    if last is None:
+        return out                     # never ran; the heartbeat covers that
+    for n in names or []:
+        p = Path(root) / n
+        if not p.exists():
+            out.append(f"MISSING ARTIFACT: {n} was never written.")
+            continue
+        try:
+            mtime = datetime.fromtimestamp(p.stat().st_mtime)
+        except OSError:
+            continue
+        if mtime < last:
+            age_h = (last - mtime).total_seconds() / 3600.0
+            out.append(
+                f"STALE ARTIFACT: {n} is {age_h:.1f}h older than the last "
+                f"'{job}' run ({last:%Y-%m-%d %H:%M}) — the write was diverted "
+                f"or failed. Close it in Excel/PowerPoint and re-run.")
+    return out
+
+
 def _digest(path) -> str | None:
     """SHA-256 of a file's bytes, or None if unreadable."""
     try:
@@ -457,6 +503,9 @@ def run_check(email: bool = False) -> int:
         cfg.get("jobs", {}) or {}, datetime.now())
     findings += check_required_files(_SCRIPT_DIR,
                                      cfg.get("required_files", []) or [])
+    findings += check_artifact_freshness(
+        _SCRIPT_DIR, cfg.get("fresh_artifacts", []) or [],
+        read_ledger(_SCRIPT_DIR / LEDGER_FILENAME))
     exe_cfg = cfg.get("exe", {}) or {}
     if exe_cfg.get("path"):
         findings += check_exe_freshness(
