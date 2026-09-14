@@ -235,7 +235,7 @@ def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame, *,
             "loss_carry_forward_tax_aud",
             "cost_paid_aud",
             "drift_vs_start_aud", "drift_vs_target_aud",
-            "unexplained_delta_aud",
+            "market_move_aud",
         ]
         present = [c for c in display_cols if c in ledger_df.columns]
         out_df = ledger_df[present].copy()
@@ -252,7 +252,7 @@ def _write_cash_ledger_sheet(wb, ledger_df: pd.DataFrame, *,
             "cost_paid_aud": "Cost PAID (AUD)",
             "drift_vs_start_aud": "Drift vs Start",
             "drift_vs_target_aud": "Drift vs Target",
-            "unexplained_delta_aud": "Unexplained Δ",
+            "market_move_aud": "Market Move (implied, AUD)",
         }, inplace=True)
         sht.range("A11").options(index=False).value = out_df
     except Exception as e:

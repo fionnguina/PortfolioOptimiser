@@ -1751,6 +1751,65 @@ if _SHOW_METRICS_HISTORY_MODE:
     sys.exit(_exit_code)
 
 
+def _is_com_handle(obj) -> bool:
+    """True for an xlwings wrapper or a raw COM proxy.
+
+    Deliberately matches on the TYPE's module rather than on any attribute of
+    the object: touching a dead COM proxy to interrogate it is the very thing
+    that raises 0x800706ba, so this must decide without dereferencing.
+    `.api.Left` returns a float and correctly does not match — only real
+    handles are dropped.
+
+    Matching the whole `xlwings` package was the first attempt and it was far
+    too broad: the diagnostic showed 563 "handles", of which 550 were
+    ObjectHandleIcons / Engine / *Expander — xlwings' own plain-Python helper
+    classes, holding no COM at all. Only the wrapper types below actually own
+    an Excel interface, so only those are worth dropping.
+    """
+    try:
+        t = type(obj)
+        m = (getattr(t, "__module__", "") or "")
+        n = (getattr(t, "__name__", "") or "")
+    except Exception:
+        return False
+    if m.split(".")[0] in ("win32com", "pythoncom", "pywintypes"):
+        return True
+    if n in ("PyIDispatch", "CDispatch", "DispatchBaseClass"):
+        return True
+    # xlwings: the COM-owning wrappers and the Windows impl layer beneath them.
+    if m == "xlwings._xlwindows":
+        return True
+    return m.startswith("xlwings") and n in {
+        "App", "Apps", "Book", "Books", "Sheet", "Sheets", "Range", "Ranges",
+        "Chart", "Charts", "Shape", "Shapes", "Picture", "Pictures",
+        "Name", "Names", "Table", "Tables",
+    }
+
+
+def _count_live_com_handles() -> dict:
+    """{type name: count} of COM handles still reachable anywhere.
+
+    Diagnostic for the teardown faults. Module globals are only the easy half
+    of what holds a proxy — handles also hide in other modules' globals, in
+    containers, and in xlwings' own caches. Counting by type says which,
+    instead of leaving a bare fault number to be re-investigated every time.
+    Never dereferences an object (see `_is_com_handle`).
+    """
+    import gc as _gc
+    out: dict = {}
+    try:
+        for o in _gc.get_objects():
+            try:
+                if _is_com_handle(o):
+                    n = type(o).__name__
+                    out[n] = out.get(n, 0) + 1
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return out
+
+
 def _release_com_refs(*names: str) -> int:
     """Drop lingering xlwings/COM handles and collect, while COM is still up.
 
@@ -1767,13 +1826,33 @@ def _release_com_refs(*names: str) -> int:
     gone is not an error, and nothing here may break a run that has already
     produced its artefacts.
 
-    Returns the number of names actually dropped (for the log line).
+    Named releases are kept for intent, but the sweep below is what actually
+    holds the line: the first version listed four names by hand, caught three
+    handles, and left 22 of the 26 faults in place — because `opt`, `co`,
+    `chart_obj`, the `.api` Range proxies and two `WScript.Shell` dispatches
+    were never in the list. A hand-maintained list of COM-holding globals rots
+    the moment someone adds a sheet. Matching on TYPE does not.
+
+    Returns the number of bindings actually dropped (for the log line).
     """
     import gc as _gc
-    dropped = 0
     g = globals()
+    dropped = 0
     for n in names:
         if n in g:
+            try:
+                del g[n]
+                dropped += 1
+            except Exception:
+                pass
+    # Type sweep: anything at module scope that IS an xlwings/COM handle.
+    # Runs after the Excel work is finished, so nothing downstream needs these.
+    for n in [k for k in list(g) if not k.startswith("__")]:
+        try:
+            obj = g.get(n)
+        except Exception:
+            continue
+        if _is_com_handle(obj):
             try:
                 del g[n]
                 dropped += 1
@@ -4529,15 +4608,24 @@ def _load_cash_ledger(ledger_path, actual_cost_by_date: dict | None = None) -> p
     df["drift_vs_target_aud"] = (
         pd.to_numeric(df["portfolio_value_aud"], errors="coerce") - TARGET_PORTFOLIO_VALUE_AUD
     ).round(2)
-    # Reconciliation: portfolio change between runs SHOULD equal
-    # (market_move) - (cost ACTUALLY PAID). So market_move = Δ_portfolio +
-    # cost_paid. If market_move is wildly different from what underlying
-    # prices actually did, that's unexplained drift (slippage, FX, math bug).
-    # Blank on the first row — there's no prior NAV to diff against.
+    # Between two runs: Δ_portfolio = market_move - (cost ACTUALLY PAID), so
+    # market_move = Δ_portfolio + cost_paid. That is exactly what the line
+    # below computes — the IMPLIED MARKET MOVE.
+    #
+    # It used to be called "unexplained_delta_aud", and it is not unexplained.
+    # On a no-trade day cost_paid is 0, so the column reduced to the day's P&L
+    # and reported a perfectly ordinary market move under a name that says
+    # something is wrong: 2026-09-14 showed "Unexplained Δ -$1,082" for a
+    # weekend in which the book simply fell $1,082. A column that cries wolf
+    # every normal day is a column that stops being read, so it now says what
+    # it is. Calling it "unexplained" would require an independent estimate of
+    # what the holdings actually did, which this frame does not have — the
+    # honest move is to name the quantity, not to imply a check we are not
+    # performing.
     #
     # The add-back is broker truth, not the plan: adding a SKIP day's
-    # recommended brokerage back inflated the residual on every day the
-    # engine correctly declined to trade.
+    # recommended brokerage back inflated the figure on every day the engine
+    # correctly declined to trade.
     paid = pd.Series(0.0, index=df.index)
     if actual_cost_by_date:
         day = df["date"].dt.strftime("%Y-%m-%d")
@@ -4548,7 +4636,7 @@ def _load_cash_ledger(ledger_path, actual_cost_by_date: dict | None = None) -> p
         paid = pd.to_numeric(day.map(actual_cost_by_date), errors="coerce").fillna(0.0)
         paid = paid.where(~day.duplicated(), other=0.0)
     df["cost_paid_aud"] = paid.round(2)
-    df["unexplained_delta_aud"] = (df["delta_vs_prev_aud"] + paid).round(2)
+    df["market_move_aud"] = (df["delta_vs_prev_aud"] + paid).round(2)
     return df
 
 
@@ -8270,17 +8358,17 @@ if USE_XLWINGS:
                 if not _ledger_df.empty:
                     _latest = _ledger_df.iloc[-1]
                     _runs = len(_ledger_df)
-                    _unex = _latest.get("unexplained_delta_aud")
-                    _unex_str = (f"${float(_unex):,.0f}"
-                                 if _unex is not None and not pd.isna(_unex)
-                                 else "(first run — no prior to compare)")
+                    _mkt = _latest.get("market_move_aud")
+                    _mkt_str = (f"${float(_mkt):,.0f}"
+                                if _mkt is not None and not pd.isna(_mkt)
+                                else "(first run — no prior to compare)")
                     _fmt = (lambda v: f"${v:,.0f}" if v is not None else "n/a")
                     print(f"[cash] ledger: {_runs} run(s) recorded. "
                           f"Drift vs ${TARGET_PORTFOLIO_VALUE_AUD:,.0f}: "
                           f"${float(_latest['drift_vs_target_aud']):,.0f} | "
                           f"Brokerage PAID {_fmt(_paid_brokerage)} | "
                           f"CGT realised {_fmt(_paid_cgt)} | "
-                          f"Unexplained Δ {_unex_str}")
+                          f"Market move {_mkt_str}")
             except Exception as _e_cash:
                 print(f"[cash] ledger skipped: {_e_cash}")
 
@@ -9314,10 +9402,13 @@ if USE_XLWINGS:
             wb.close()
         # Outside the context manager: Quit has run (or failed). Reap only if
         # the PID we spawned is still resident.
-        _reap_excel(_xl_pid, " (workbook write)")
-        # Then drop the COM handles this module-scope pipeline left bound, so
-        # they are released now rather than against a dead server at exit.
+        # Release BEFORE reaping. _reap_excel taskkills the server; releasing
+        # afterwards would hand every remaining proxy a corpse to talk to,
+        # which is precisely the 0x800706ba fault this is here to avoid. The
+        # order only matters on a run where Excel actually needs reaping — but
+        # that is the run where it matters most.
         _n_rel = _release_com_refs("wb", "app", "sht", "_tax_sht")
+        _reap_excel(_xl_pid, " (workbook write)")
         if _n_rel:
             print(f"[xl] Released {_n_rel} COM handle(s) before teardown.")
 
@@ -9915,6 +10006,29 @@ except Exception as _e_health:
 #
 # File is small (one JSON line) and overwritten each run. Wrapper
 # compares mtime > its own start time to filter out stale sentinels.
+# FINAL COM sweep, before the sentinel. The mid-pipeline release runs right
+# after the workbook closes, but the shortcut helpers and the OPT post-write
+# create fresh handles (`shell`, `_shell`, `_book`, `_ws`) AFTER that point.
+# Whatever is still bound here is finalised by the interpreter against a server
+# that has already gone, which is what emits the 0x800706ba blocks. They land
+# after the health summary, so the engine cannot count them — the only proof
+# this works is the wrapper's own "N fatal-exception line(s)" scan.
+try:
+    _n_final = _release_com_refs()
+    if _n_final:
+        print(f"[xl] Released {_n_final} COM handle(s) in the final sweep.")
+    # Anything STILL reachable after the sweep is what the interpreter will
+    # finalise against a dead server. Naming it turns a mystery fault count
+    # into a list of types to go after — module globals were the easy half.
+    _stragglers = _count_live_com_handles()
+    if _stragglers:
+        print(f"[xl] {sum(_stragglers.values())} COM handle(s) still reachable "
+              f"after the sweep (expect that many teardown faults): "
+              + ", ".join(f"{k}x{v}" for k, v in sorted(
+                  _stragglers.items(), key=lambda kv: -kv[1])[:6]))
+except Exception as _e_final_com:
+    print(f"[xl] final COM sweep skipped: {_e_final_com}")
+
 try:
     import json as _json_done
     from datetime import datetime as _dt_done
