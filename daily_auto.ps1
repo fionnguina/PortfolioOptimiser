@@ -867,6 +867,34 @@ if ($verdict -eq "RUN") {
     }
 }
 
+# --- Re-sync Holdings AND the NAV snapshot AFTER execution (2026-09-15) ---
+# The sheet is reconciled at the TOP of this run, before the engine and before
+# any order goes in. Fills then change the positions it describes, so from the
+# moment a rebalance executes the sheet is stale — and the engine's sanity layer
+# correctly refuses to plan against stale positions. On 2026-09-15 that cost the
+# evening evidence sample: fills at 10:46, Holdings written 10:22, the 18:00 run
+# halted with HOLDINGS STALE. Syncing again here closes the window. No-op on a
+# SKIP day, because nothing filled and the sheet already matches the broker.
+#
+# The NAV snapshot has the same ordering problem: taken at 10:28 it records
+# PRE-trade positions, so the lot book (rebuilt from the fills log, which
+# does include them) disagrees with it and the run emits [lots][WARN] about
+# a fill the log supposedly missed. Nothing was missed — the snapshot was
+# just older than the fills. It also gates the 6W cadence anchor, which
+# reads position-UNIT changes from that log.
+try {
+    $syncPy2 = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+    $syncScript2 = Join-Path $ScriptDir "ibkr_paper_exec.py"
+    if ((Test-Path $syncPy2) -and (Test-Path $syncScript2)) {
+        $navOut2 = & $syncPy2 $syncScript2 --snapshot-nav 2>&1 | Select-Object -Last 1
+        Write-Log "NAV snapshot (post-execution): $navOut2"
+        $syncOut2 = & $syncPy2 $syncScript2 --sync-holdings --execute --assume-yes 2>&1 | Select-Object -Last 3
+        Write-Log "Holdings re-sync (post-execution): $syncOut2"
+    }
+} catch {
+    Write-Log "Holdings re-sync failed (non-fatal): $($_.Exception.Message)"
+}
+
 # --- Evidence backup to OneDrive (2026-07-09) ---
 # The real-money track record + lot book live in gitignored local-only
 # files; mirror them to OneDrive each run so a disk failure can't erase the
@@ -890,7 +918,12 @@ try {
     $opsPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
     $opsScript = Join-Path $ScriptDir "ops_assertions.py"
     if ((Test-Path $opsPy) -and (Test-Path $opsScript)) {
-        & $opsPy $opsScript --record daily_auto --outcome ok --detail "verdict=$verdict" --started $RunStartIso | Out-Null
+        # A run that produced no verdict, or that the sanity layer HALTED, is not a
+        # healthy run — filing it as "ok" is the same silent-absence bug that let
+        # evidence_run record a halted engine as fine (2026-09-15). SKIP is ok: it
+        # is the correct ~9-in-10 outcome.
+        if ($verdict -eq "HALTED" -or $verdict -eq "UNKNOWN") { $opsOutcome = "fail" } else { $opsOutcome = "ok" }
+        & $opsPy $opsScript --record daily_auto --outcome $opsOutcome --detail "verdict=$verdict" --started $RunStartIso | Out-Null
         $opsOut = & $opsPy $opsScript --check --email 2>&1 | Select-Object -Last 10
         Write-Log "Ops assertions: $opsOut"
     } else {

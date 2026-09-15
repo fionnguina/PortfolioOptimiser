@@ -5367,8 +5367,16 @@ try:
             except Exception:
                 pass
             if _latest_fill_ts is not None:
-                _holdings_mtime = pd.Timestamp(_holdings_path_check.stat().st_mtime,
-                                                unit="s", tz=None)
+                # st_mtime is a UTC epoch. pd.Timestamp(epoch, unit="s") reads
+                # it as UTC, but exec_timestamp is naive LOCAL — so the two were
+                # compared across a whole UTC offset (10h in AEST), and Holdings
+                # had to be written 10h AFTER a fill to look fresh. In practice
+                # that meant the guard fired for ten hours after every fill: the
+                # 18:00 evidence run halted on 2026-09-15 with Holdings written
+                # at 18:33 and reported as 08:33, losing that evening's sample.
+                # fromtimestamp() gives naive LOCAL, matching the fill's clock.
+                _holdings_mtime = pd.Timestamp.fromtimestamp(
+                    _holdings_path_check.stat().st_mtime)
                 # Permit some clock skew. If holdings is at least 5 minutes
                 # older than the latest fill, that's a stale signal.
                 if _latest_fill_ts - _holdings_mtime > pd.Timedelta(minutes=5):
