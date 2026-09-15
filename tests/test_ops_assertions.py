@@ -516,8 +516,12 @@ def _fresh_env(tmp_path, name="Stock Analysis.xlsm"):
     return p
 
 
-def _ledger_ok(when="2026-09-14T10:29:21"):
-    return [{"job": "daily_auto", "finished": when, "outcome": "ok"}]
+def _ledger_ok(when="2026-09-14T10:29:21", started=None):
+    """A ledger row. `started` is the freshness floor — artifacts are written
+    mid-run, so the finish time is the wrong reference point."""
+    row = {"job": "daily_auto", "finished": when, "outcome": "ok"}
+    row["started"] = started or when[:11] + "10:20:01"
+    return [row]
 
 
 def test_artifact_older_than_last_run_is_flagged(tmp_path):
@@ -576,3 +580,44 @@ def test_shipped_expectations_declare_the_workbook_and_deck():
                       / "ops_expected.json").read_text(encoding="utf-8"))
     assert "Stock Analysis.xlsm" in cfg["fresh_artifacts"]
     assert any("Portfolio_Report" in a for a in cfg["fresh_artifacts"])
+
+
+def test_midrun_write_is_not_stale(tmp_path):
+    """THE 2026-09-15 false positive.
+
+    On the first real rebalance after this check shipped, the engine wrote both
+    artifacts at 10:22 and auto-execute ran until 10:46. Flooring on the run's
+    FINISH reported two perfectly good writes as STALE — a check that cries wolf
+    on every rebalance day is one that gets muted before it ever catches a real
+    divert.
+    """
+    import os, datetime as dt
+    p = _fresh_env(tmp_path)
+    written = dt.datetime(2026, 9, 15, 10, 22).timestamp()
+    os.utime(p, (written, written))
+    led = [{"job": "daily_auto", "outcome": "ok",
+            "started": "2026-09-15T10:20:01", "finished": "2026-09-15T10:46:43"}]
+    assert ops.check_artifact_freshness(tmp_path, ["Stock Analysis.xlsm"], led) == []
+
+
+def test_divert_still_fires_against_run_start(tmp_path):
+    """Same run, but the artifact is days old — that is a real divert."""
+    import os, datetime as dt
+    p = _fresh_env(tmp_path)
+    old_ts = dt.datetime(2026, 9, 11, 18, 3).timestamp()
+    os.utime(p, (old_ts, old_ts))
+    led = [{"job": "daily_auto", "outcome": "ok",
+            "started": "2026-09-15T10:20:01", "finished": "2026-09-15T10:46:43"}]
+    f = ops.check_artifact_freshness(tmp_path, ["Stock Analysis.xlsm"], led)
+    assert len(f) == 1 and "STALE ARTIFACT" in f[0]
+
+
+def test_row_without_started_is_silent(tmp_path):
+    """Historical rows predate --started; guessing would re-create the false
+    positive, so say nothing rather than something wrong."""
+    import os, datetime as dt
+    p = _fresh_env(tmp_path)
+    old_ts = dt.datetime(2026, 9, 11, 18, 3).timestamp()
+    os.utime(p, (old_ts, old_ts))
+    led = [{"job": "daily_auto", "outcome": "ok", "finished": "2026-09-15T10:46:43"}]
+    assert ops.check_artifact_freshness(tmp_path, ["Stock Analysis.xlsm"], led) == []

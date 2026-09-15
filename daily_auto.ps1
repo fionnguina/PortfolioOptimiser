@@ -260,6 +260,7 @@ if (-not (Test-Path $ExePath)) {
     exit 1
 }
 
+$RunStartIso = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
 Write-Log "Starting daily auto run."
 Write-Log "  Engine: $ExePath"
 Write-Log "  Log:    $LogPath"
@@ -889,7 +890,7 @@ try {
     $opsPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
     $opsScript = Join-Path $ScriptDir "ops_assertions.py"
     if ((Test-Path $opsPy) -and (Test-Path $opsScript)) {
-        & $opsPy $opsScript --record daily_auto --outcome ok --detail "verdict=$verdict" | Out-Null
+        & $opsPy $opsScript --record daily_auto --outcome ok --detail "verdict=$verdict" --started $RunStartIso | Out-Null
         $opsOut = & $opsPy $opsScript --check --email 2>&1 | Select-Object -Last 10
         Write-Log "Ops assertions: $opsOut"
     } else {

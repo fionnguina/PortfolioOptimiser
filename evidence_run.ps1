@@ -63,6 +63,7 @@ if (-not (Test-Path $ExePath)) {
     exit 1
 }
 
+$RunStartIso = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
 Write-Log "Starting evening evidence run (SCALE_SENSITIVITY=1)."
 
 # Block idle sleep for the run. The awake-budget logic below DIAGNOSES a slept
@@ -144,7 +145,14 @@ if ($sleptSec -gt 0) { $sleptNote = " (+${sleptSec}s machine sleep, excluded)" }
 
 if ($proc.HasExited) {
     $why = "finished (exit=$($proc.ExitCode), sentinel=$sentinel)"
-    $outcome = "ok"
+    # A process that EXITED is not automatically a run that WORKED. On
+    # 2026-09-15 the engine halted with exit=2 (sanity layer: HOLDINGS STALE,
+    # because the morning rebalance filled AFTER the workbook was written) and
+    # this branch filed it as "ok" — so the evening evidence sample was lost
+    # while the ledger reported a healthy night. That is the exact silent
+    # absence ops_assertions exists to catch, recorded by the thing meant to
+    # catch it. Exit 0 is ok; anything else is a failure and must say so.
+    if ($proc.ExitCode -eq 0) { $outcome = "ok" } else { $outcome = "fail" }
     Write-Log ("Evidence run $why after ${awakeSec}s awake / ${wall}s wall$sleptNote.")
 } else {
     # Kill the whole tree (multiprocessing workers) so it can't orphan and
@@ -190,7 +198,7 @@ try {
     $opsPy = Join-Path $ScriptDir ".venv\Scripts\python.exe"
     $opsScript = Join-Path $ScriptDir "ops_assertions.py"
     if ((Test-Path $opsPy) -and (Test-Path $opsScript)) {
-        & $opsPy $opsScript --record evidence_run --outcome $outcome --detail $why | Out-Null
+        & $opsPy $opsScript --record evidence_run --outcome $outcome --detail $why --started $RunStartIso | Out-Null
         $opsOut = & $opsPy $opsScript --check --email 2>&1 | Select-Object -Last 10
         Write-Log "Ops assertions: $opsOut"
     }

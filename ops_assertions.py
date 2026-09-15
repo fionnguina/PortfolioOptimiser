@@ -242,17 +242,29 @@ def check_artifact_freshness(root: Path, names: list, ledger: list,
     """
     out = []
     last = None
+    last_fin = None
     for r in ledger or []:
         if str(r.get("job")) != job or str(r.get("outcome")) != "ok":
             continue
         try:
-            t = datetime.fromisoformat(str(r.get("finished")))
+            fin = datetime.fromisoformat(str(r.get("finished")))
         except (TypeError, ValueError):
             continue
-        if last is None or t > last:
-            last = t
+        if last_fin is not None and fin <= last_fin:
+            continue
+        # Floor is the run's START. Artifacts are written early in a run and
+        # execution can add 20 minutes after them, so comparing against the
+        # finish flags a good write (2026-09-15: written 10:22, finished 10:46).
+        try:
+            started = datetime.fromisoformat(str(r.get("started")))
+        except (TypeError, ValueError):
+            started = None
+        last_fin, last = fin, started
     if last is None:
-        return out                     # never ran; the heartbeat covers that
+        # Either nothing ran, or the newest run predates --started. Stay silent
+        # rather than guess: a false STALE every rebalance day would mute the
+        # channel faster than a missed divert would hurt.
+        return out
     for n in names or []:
         p = Path(root) / n
         if not p.exists():
@@ -265,9 +277,10 @@ def check_artifact_freshness(root: Path, names: list, ledger: list,
         if mtime < last:
             age_h = (last - mtime).total_seconds() / 3600.0
             out.append(
-                f"STALE ARTIFACT: {n} is {age_h:.1f}h older than the last "
-                f"'{job}' run ({last:%Y-%m-%d %H:%M}) — the write was diverted "
-                f"or failed. Close it in Excel/PowerPoint and re-run.")
+                f"STALE ARTIFACT: {n} predates the start of the last '{job}' "
+                f"run by {age_h:.1f}h (run started {last:%Y-%m-%d %H:%M}) — the "
+                f"write was diverted or failed. Close it in Excel/PowerPoint "
+                f"and re-run.")
     return out
 
 
@@ -380,13 +393,23 @@ def read_ledger(path) -> list:
     return rows
 
 
-def record(job: str, outcome: str, detail: str = "") -> int:
+def record(job: str, outcome: str, detail: str = "", started: str = "") -> int:
     """Append one ledger line. Never fatal — a wrapper must not die because its
-    bookkeeping failed."""
+    bookkeeping failed.
+
+    `started` matters for artifact freshness: the engine writes the workbook and
+    deck EARLY in a run, then execution can add 20 minutes on a rebalance day.
+    Comparing an artifact against the run's FINISH therefore flags a perfectly
+    good write — which is exactly what happened on 2026-09-15, the first real
+    rebalance after the check shipped: artifacts written 10:22, run finished
+    10:46, both reported STALE.
+    """
     entry = {"job": str(job),
              "finished": datetime.now().isoformat(timespec="seconds"),
              "outcome": str(outcome or "").lower(),
              "detail": str(detail or "")[:500]}
+    if started:
+        entry["started"] = str(started)[:40]
     try:
         with open(_SCRIPT_DIR / LEDGER_FILENAME, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
@@ -551,10 +574,14 @@ def main() -> int:
                     help="With --record: ok | fail (default ok).")
     ap.add_argument("--detail", type=str, default="",
                     help="With --record: short free-text context.")
+    ap.add_argument("--started", type=str, default="",
+                    help="With --record: ISO timestamp the job STARTED. Used as "
+                         "the floor for artifact freshness, because artifacts "
+                         "are written mid-run.")
     args = ap.parse_args()
 
     if args.record:
-        return record(args.record, args.outcome, args.detail)
+        return record(args.record, args.outcome, args.detail, args.started)
     if args.check:
         return run_check(email=bool(args.email))
     ap.print_help()
